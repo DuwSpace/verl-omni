@@ -1,11 +1,13 @@
-FROM quay.io/ascend/cann:9.0.0-910b-ubuntu22.04-py3.12
+# vLLM-Ascend's pinned revision requires the CANN 9.1 / torch-npu 2.10.0.post4 stack.
+FROM quay.io/ascend/cann:9.1.0-910b-ubuntu22.04-py3.12
 
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 ARG ASCEND_PIP_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pypi"
 ARG PYTORCH_CPU_INDEX_URL="https://download.pytorch.org/whl/cpu/"
+ARG UBUNTU_MIRROR="http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports"
 
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_REF="v0.27.0"
+ARG VLLM_REF="v0.27.1"
 
 ARG VLLM_ASCEND_REPO="https://github.com/vllm-project/vllm-ascend.git"
 # Defaults to vllm-ascend main via vllm_ascend_pin.txt (no v0.27 release yet).
@@ -19,11 +21,14 @@ ARG VERL_REPO="https://github.com/verl-project/verl.git"
 # Override with: --build-arg VERL_REF=<commit-or-tag>
 ARG VERL_REF=""
 
-ARG VERL_OMNI_REPO="https://github.com/verl-project/verl-omni.git"
-ARG VERL_OMNI_REF="main"
-
+# 910B3 is an Atlas A2/910B target. CANN and vLLM-Ascend use ascend910b1
+# as the common A2 compilation target for the 910B family.
 ARG SOC_VERSION="ascend910b1"
 ARG COMPILE_CUSTOM_KERNELS=1
+ARG TORCH_VERSION="2.10.0+cpu"
+ARG TORCHVISION_VERSION="0.25.0+cpu"
+ARG TORCHAUDIO_VERSION="2.10.0+cpu"
+ARG TORCH_NPU_VERSION="2.10.0.post4"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -43,6 +48,11 @@ RUN mkdir -p /workspace/src /workspace/pins
 
 COPY .github/verl_pin.txt .github/vllm_ascend_pin.txt .github/vllm_omni_pin.txt /workspace/pins/
 
+RUN sed -i \
+        -e "s|http://ports.ubuntu.com/ubuntu-ports|${UBUNTU_MIRROR}|g" \
+        -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
+
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
         git \
@@ -60,14 +70,24 @@ RUN apt-get update -y && \
         libnuma-dev \
         libjemalloc2 \
         clang-15 \
-        ninja-build && \
+        ninja-build \
+        rustc \
+        cargo && \
     update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 && \
     update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip config set global.index-url ${PIP_INDEX_URL} && \
     python3 -m pip config set global.trusted-host "mirrors.tuna.tsinghua.edu.cn mirrors.huaweicloud.com download.pytorch.org download-r2.pytorch.org github.com raw.githubusercontent.com files.pythonhosted.org pypi.org" && \
-    python3 -m pip install --upgrade pip setuptools wheel packaging
+    python3 -m pip install --upgrade \
+        pip \
+        'setuptools>=77.0.3,<81.0.0' \
+        wheel \
+        packaging \
+        setuptools-rust>=1.9.0 \
+        setuptools-scm>=8.0 \
+        'cmake>=3.26' \
+        pybind11
 
 # Match useful runtime dependencies from the official vLLM-Ascend A3 Dockerfile.
 # modelscope is useful for model download, and ray is required by distributed workloads.
@@ -80,12 +100,12 @@ RUN python3 -m pip install \
 
 # Align torch stack for Ascend.
 RUN python3 -m pip install --force-reinstall \
-        torch==2.10.0+cpu \
-        torchvision==0.25.0+cpu \
-        torchaudio==2.10.0+cpu \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION} \
         --index-url ${PYTORCH_CPU_INDEX_URL} && \
     python3 -m pip install --force-reinstall \
-        torch-npu==2.10.0.post2 \
+        torch-npu==${TORCH_NPU_VERSION} \
         --extra-index-url ${ASCEND_PIP_INDEX_URL} \
         --extra-index-url ${PYTORCH_CPU_INDEX_URL}
 
@@ -94,9 +114,15 @@ RUN python3 -m pip install --force-reinstall \
 # Ascend backend is provided by vllm-ascend.
 RUN git clone --depth 1 -b ${VLLM_REF} ${VLLM_REPO} /workspace/src/vllm && \
     cd /workspace/src/vllm && \
-    VLLM_TARGET_DEVICE="empty" python3 -m pip install -e ".[audio]" \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+    VLLM_TARGET_DEVICE="empty" python3 -m pip install --no-build-isolation -e ".[audio]" \
         --extra-index-url ${PYTORCH_CPU_INDEX_URL} && \
-    python3 -m pip uninstall -y triton || true
+    python3 -m pip uninstall -y triton
+
+# arctic-inference is a transitive vLLM-Ascend dependency. Because the
+# vLLM-Ascend install below intentionally disables build isolation, its build
+# requirements must already exist in the image.
+RUN python3 -m pip install grpcio-tools nanobind
 
 # Install vLLM-Ascend.
 RUN VLLM_ASCEND_REF="${VLLM_ASCEND_REF:-$(tr -d '[:space:]' < /workspace/pins/vllm_ascend_pin.txt)}" && \
@@ -109,12 +135,9 @@ RUN VLLM_ASCEND_REF="${VLLM_ASCEND_REF:-$(tr -d '[:space:]' < /workspace/pins/vl
     export VLLM_BATCH_INVARIANT=1 && \
     . /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     . /usr/local/Ascend/nnal/atb/set_env.sh && \
-    python3 -m pip install -e /workspace/src/vllm-ascend \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 -m pip install --no-build-isolation -e /workspace/src/vllm-ascend \
         --extra-index-url ${ASCEND_PIP_INDEX_URL} \
-        --extra-index-url ${PYTORCH_CPU_INDEX_URL} && \
-    python3 -m pip uninstall -y triton triton-ascend || true && \
-    python3 -m pip install triton-ascend==3.2.1 \
-        --extra-index-url ${ASCEND_PIP_INDEX_URL}
+        --extra-index-url ${PYTORCH_CPU_INDEX_URL}
 
 # Install vLLM-Omni.
 RUN VLLM_OMNI_REF="${VLLM_OMNI_REF:-$(tr -d '[:space:]' < /workspace/pins/vllm_omni_pin.txt)}" && \
@@ -122,9 +145,12 @@ RUN VLLM_OMNI_REF="${VLLM_OMNI_REF:-$(tr -d '[:space:]' < /workspace/pins/vllm_o
     git clone ${VLLM_OMNI_REPO} /workspace/src/vllm-omni && \
     cd /workspace/src/vllm-omni && \
     git checkout ${VLLM_OMNI_REF} && \
-    VLLM_OMNI_TARGET_DEVICE=npu python3 -m pip install -e . \
+    sed '/^accelerate==/d' requirements/common.txt > /tmp/vllm-omni-common-npu.txt && \
+    sed '/^-r /d' requirements/npu.txt >> /tmp/vllm-omni-common-npu.txt && \
+    python3 -m pip install -r /tmp/vllm-omni-common-npu.txt \
         --extra-index-url ${ASCEND_PIP_INDEX_URL} \
-        --extra-index-url ${PYTORCH_CPU_INDEX_URL}
+        --extra-index-url ${PYTORCH_CPU_INDEX_URL} && \
+    VLLM_OMNI_TARGET_DEVICE=npu python3 -m pip install --no-build-isolation --no-deps -e .
 
 # Install verl from source.
 # If VERL_REF is empty, read the pinned commit from .github/verl_pin.txt.
@@ -137,27 +163,32 @@ RUN VERL_REF="${VERL_REF:-$(tr -d '[:space:]' < /workspace/pins/verl_pin.txt)}" 
         --extra-index-url ${ASCEND_PIP_INDEX_URL} \
         --extra-index-url ${PYTORCH_CPU_INDEX_URL}
 
-# Install verl-omni.
+# Install the verl-omni source from this build context. This avoids another
+# GitHub clone and guarantees that the image contains the checked-out revision.
 # Do NOT install the train extra here, because train installs verl again.
 # verl has already been installed from /workspace/src/verl using .github/verl_pin.txt.
-RUN git clone --depth 1 -b ${VERL_OMNI_REF} ${VERL_OMNI_REPO} /workspace/src/verl-omni && \
-    cd /workspace/src/verl-omni && \
-    python3 -m pip install -e ".[ocr]" \
+COPY . /workspace/src/verl-omni
+RUN python3 -m pip install --no-build-isolation -e "/workspace/src/verl-omni[ocr]" \
         --extra-index-url ${ASCEND_PIP_INDEX_URL} \
         --extra-index-url ${PYTORCH_CPU_INDEX_URL}
 
 # Re-align torch / torch-npu / numpy after dependency resolution.
 # This prevents downstream extras from upgrading torch/numpy to incompatible versions.
 RUN python3 -m pip install --force-reinstall \
-        torch==2.10.0+cpu \
-        torchvision==0.25.0+cpu \
-        torchaudio==2.10.0+cpu \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION} \
         --index-url ${PYTORCH_CPU_INDEX_URL} && \
-    python3 -m pip install --force-reinstall \
-        torch-npu==2.10.0.post2 \
+    python3 -m pip install --force-reinstall --no-deps \
+        torch-npu==${TORCH_NPU_VERSION} \
         --extra-index-url ${ASCEND_PIP_INDEX_URL} \
         --extra-index-url ${PYTORCH_CPU_INDEX_URL} && \
-    python3 -m pip install --force-reinstall numpy==1.26.4
+    python3 -m pip install --force-reinstall numpy==1.26.4 && \
+    python3 -m pip install --upgrade \
+        'accelerate>=1.14.0' \
+        'setuptools>=77.0.3,<81.0.0' \
+        'packaging>=26.2' \
+        'fsspec<=2026.6.0'
 
     
 RUN echo "export VLLM_WORKER_MULTIPROC_METHOD=spawn" >> /root/.bashrc && \
@@ -165,6 +196,11 @@ RUN echo "export VLLM_WORKER_MULTIPROC_METHOD=spawn" >> /root/.bashrc && \
     echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib' >> /root/.bashrc
 
 WORKDIR /workspace
+
+# Catch dependency-resolution mistakes during the image build itself.
+RUN . /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    . /usr/local/Ascend/nnal/atb/set_env.sh && \
+    python3 -c "import torch, torch_npu, vllm, vllm_omni, verl, verl_omni; print('verl-omni NPU image imports OK')"
 
 ENTRYPOINT ["/bin/bash", "-c", "source /usr/local/Ascend/ascend-toolkit/set_env.sh && source /usr/local/Ascend/nnal/atb/set_env.sh && exec \"$@\"", "--"]
 CMD ["/bin/bash"]
