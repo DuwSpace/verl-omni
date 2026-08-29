@@ -14,6 +14,7 @@
 """CPU contract tests for MultiModalRewardManager."""
 
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -36,19 +37,28 @@ def initialize(offset=0.0, invalid_case=None, model_revision="fake-model-v1", de
         "model_revision": model_revision,
         "definition_version": definition_version,
         "initialize_calls": 1,
+        "activate_calls": 0,
         "score_calls": 0,
+        "deactivate_calls": 0,
+        "finalize_calls": 0,
     }
 
 
 def activate(state, device):
-    """Declare the later lifecycle hook without exercising it in S3-1."""
-    del state, device
+    """Activate one fake reward on the supplied runtime device."""
+    state["activate_calls"] += 1
+    state["device"] = device
+    if state["invalid_case"] == "activate_error":
+        raise RuntimeError("fake activate failure")
 
 
 def score_batch(state, batch, micro_batch_size, **kwargs):
     """Return deterministic sample-aligned fake scores."""
-    del kwargs
+    if "device" not in state:
+        raise RuntimeError("fake reward is not active")
     state["score_calls"] += 1
+    if state["invalid_case"] == "score_error":
+        raise RuntimeError("fake score failure")
     batch_size = len(batch)
     result = {
         "scores": torch.arange(batch_size, dtype=torch.float64) + state["offset"],
@@ -70,13 +80,18 @@ def score_batch(state, batch, micro_batch_size, **kwargs):
 
 
 def deactivate(state):
-    """Declare the later lifecycle hook without exercising it in S3-1."""
-    del state
+    """Deactivate one fake reward and release its device reference."""
+    state["deactivate_calls"] += 1
+    state.pop("device", None)
+    if state["invalid_case"] == "deactivate_error":
+        raise RuntimeError("fake deactivate failure")
 
 
 def finalize(state):
-    """Declare the later lifecycle hook without exercising it in S3-1."""
-    del state
+    """Finalize fake reward state."""
+    state["finalize_calls"] += 1
+    if state["invalid_case"] == "finalize_error":
+        raise RuntimeError("fake finalize failure")
 
 
 def _reward_config(**overrides):
@@ -158,7 +173,93 @@ def test_run_batch_preserves_component_order_and_metadata():
         },
     }
     assert [entry.state["initialize_calls"] for entry in manager._reward_entries] == [1, 1]
+    assert [entry.state["activate_calls"] for entry in manager._reward_entries] == [1, 1]
     assert [entry.state["score_calls"] for entry in manager._reward_entries] == [1, 1]
+    assert [entry.state["deactivate_calls"] for entry in manager._reward_entries] == [1, 1]
+    assert all("device" not in entry.state for entry in manager._reward_entries)
+
+
+def test_routing_weights_are_reserved_manager_metadata():
+    routing_weights = {"video": 1.0, "audio": 0.0}
+    manager = _build_manager({"visual": _reward_config(routing_weights=routing_weights)})
+
+    assert manager._reward_entries[0].state["initialize_calls"] == 1
+    assert OmegaConf.to_container(manager.config.reward.reward_functions.visual.routing_weights) == routing_weights
+
+
+def test_run_batch_keeps_only_one_reward_active(monkeypatch):
+    reward_functions = {
+        "visual": _reward_config(offset=10.0),
+        "audio": _reward_config(offset=20.0),
+    }
+    manager = _build_manager(reward_functions)
+    active = set()
+    events = []
+
+    monkeypatch.setattr("verl_omni.reward_loop.reward_manager.multimodal.get_device_id", lambda: "cpu:fake")
+    for entry in manager._reward_entries:
+        original_score_batch = entry.score_batch
+
+        def activate_one(state, device, name=entry.name):
+            assert not active
+            active.add(name)
+            state["device"] = device
+            events.append(("activate", name, device))
+
+        def score_one(state, batch, micro_batch_size, name=entry.name, score_hook=original_score_batch):
+            assert active == {name}
+            events.append(("score", name, len(batch)))
+            return score_hook(state, batch, micro_batch_size)
+
+        def deactivate_one(state, name=entry.name):
+            assert active == {name}
+            active.remove(name)
+            state.pop("device", None)
+            events.append(("deactivate", name, None))
+
+        entry.activate = activate_one
+        entry.score_batch = score_one
+        entry.deactivate = deactivate_one
+
+    _run(manager, _make_batch())
+
+    assert not active
+    assert events == [
+        ("activate", "visual", "cpu:fake"),
+        ("score", "visual", 3),
+        ("deactivate", "visual", None),
+        ("activate", "audio", "cpu:fake"),
+        ("score", "audio", 3),
+        ("deactivate", "audio", None),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("invalid_case", "match", "expected_score_calls"),
+    [
+        ("activate_error", "fake activate failure", 0),
+        ("score_error", "fake score failure", 1),
+        ("deactivate_error", "fake deactivate failure", 1),
+    ],
+)
+def test_lifecycle_failure_cleans_current_reward_and_stops_dispatch(invalid_case, match, expected_score_calls):
+    reward_functions = {
+        "failing": _reward_config(invalid_case=invalid_case),
+        "pending": _reward_config(),
+    }
+    manager = _build_manager(reward_functions)
+
+    with pytest.raises(RuntimeError, match=match):
+        _run(manager, _make_batch())
+
+    failing, pending = manager._reward_entries
+    assert failing.state["activate_calls"] == 1
+    assert failing.state["score_calls"] == expected_score_calls
+    assert failing.state["deactivate_calls"] == 1
+    assert "device" not in failing.state
+    assert pending.state["activate_calls"] == 0
+    assert pending.state["score_calls"] == 0
+    assert pending.state["deactivate_calls"] == 0
 
 
 def test_run_single_uses_same_batch_contract():
@@ -171,6 +272,47 @@ def test_run_single_uses_same_batch_contract():
     assert result["reward_valid_mask"].shape == (1, 1)
     with pytest.raises(ValueError, match="batch size 1"):
         manager.loop.run_until_complete(manager.run_single(_make_batch(batch_size=2)))
+
+
+def test_shutdown_finalizes_every_reward_once_and_disables_scoring():
+    manager = _build_manager({"visual": _reward_config(), "audio": _reward_config()})
+
+    manager.shutdown()
+    manager.shutdown()
+
+    assert [entry.state["finalize_calls"] for entry in manager._reward_entries] == [1, 1]
+    with pytest.raises(RuntimeError, match="after shutdown"):
+        _run(manager, _make_batch())
+
+
+def test_shutdown_continues_after_finalize_failure():
+    manager = _build_manager(
+        {
+            "failing": _reward_config(invalid_case="finalize_error"),
+            "pending": _reward_config(),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="fake finalize failure"):
+        manager.shutdown()
+
+    assert [entry.state["finalize_calls"] for entry in manager._reward_entries] == [1, 1]
+    manager.shutdown()
+
+
+def test_finalize_hook_is_optional(monkeypatch):
+    module = SimpleNamespace(
+        initialize=initialize,
+        activate=activate,
+        score_batch=score_batch,
+        deactivate=deactivate,
+    )
+    monkeypatch.setattr("verl_omni.reward_loop.reward_manager.multimodal.load_module", lambda path: module)
+    manager = _build_manager()
+
+    manager.shutdown()
+
+    assert manager._shutdown
 
 
 @pytest.mark.parametrize(

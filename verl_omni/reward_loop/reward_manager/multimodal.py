@@ -19,6 +19,7 @@ from typing import Any, Callable, Protocol, runtime_checkable
 import numpy as np
 import torch
 from verl import DataProto
+from verl.utils.device import get_device_id
 from verl.utils.import_utils import load_module
 
 from .multi import MultiVisualRewardManager
@@ -40,7 +41,10 @@ class RewardRuntimeEntry:
 
     name: str
     state: Any
+    activate: Callable[..., Any]
     score_batch: Callable[..., Any]
+    deactivate: Callable[..., Any]
+    finalize: Callable[..., Any] | None
     micro_batch_size: int
 
 
@@ -61,6 +65,7 @@ class MultiModalRewardManager(MultiVisualRewardManager):
         self._reward_entries = [
             self._initialize_reward(name, config.reward.reward_functions[name]) for name in self.component_order
         ]
+        self._shutdown = False
 
     def _validate_config(self) -> list[str]:
         if self.config.reward.aggregation != "preserve_components":
@@ -88,19 +93,26 @@ class MultiModalRewardManager(MultiVisualRewardManager):
         if micro_batch_size <= 0:
             raise ValueError(f"Reward '{name}' micro_batch_size must be a positive integer.")
 
-        # Reserved for the controller-side modality router.
-        config.pop("routing_weights", None)
-
         # Reserved for the controller-side modality router. It remains in the
         # original OmegaConf entry but is not part of the scorer initializer.
         config.pop("routing_weights", None)
 
         module = load_module(path)
-        state = getattr(module, "initialize")(**config)
+        initialize = getattr(module, "initialize")
+        activate = getattr(module, "activate")
+        score_batch = getattr(module, "score_batch")
+        deactivate = getattr(module, "deactivate")
+        finalize = getattr(module, "finalize", None)
+        if finalize is not None and not callable(finalize):
+            raise TypeError(f"Reward '{name}' finalize hook must be callable.")
+        state = initialize(**config)
         return RewardRuntimeEntry(
             name=name,
             state=state,
-            score_batch=getattr(module, "score_batch"),
+            activate=activate,
+            score_batch=score_batch,
+            deactivate=deactivate,
+            finalize=finalize,
             micro_batch_size=micro_batch_size,
         )
 
@@ -150,6 +162,8 @@ class MultiModalRewardManager(MultiVisualRewardManager):
 
     async def run_batch(self, data: DataProto) -> dict[str, Any]:
         """Return sample-aligned reward components for one local batch."""
+        if self._shutdown:
+            raise RuntimeError("MultiModalRewardManager cannot score after shutdown.")
         sample_uids = self._validate_sample_uids(data)
         _validate_visual_response(
             data.batch["responses"], self.config, is_validate=bool(data.meta_info.get("validate", False))
@@ -158,9 +172,14 @@ class MultiModalRewardManager(MultiVisualRewardManager):
         score_columns = []
         mask_columns = []
         reward_extra_info = {}
+        device = get_device_id()
         for entry in self._reward_entries:
-            result = entry.score_batch(entry.state, data, micro_batch_size=entry.micro_batch_size)
-            scores, valid_mask, extra_info = self._validate_reward_result(entry, result, len(data))
+            try:
+                entry.activate(entry.state, device)
+                result = entry.score_batch(entry.state, data, micro_batch_size=entry.micro_batch_size)
+                scores, valid_mask, extra_info = self._validate_reward_result(entry, result, len(data))
+            finally:
+                entry.deactivate(entry.state)
             score_columns.append(scores.to(dtype=torch.float32))
             mask_columns.append(valid_mask)
             reward_extra_info[entry.name] = extra_info
@@ -178,3 +197,21 @@ class MultiModalRewardManager(MultiVisualRewardManager):
         if len(data) != 1:
             raise ValueError(f"run_single requires batch size 1, got {len(data)}.")
         return await self.run_batch(data)
+
+    def shutdown(self) -> None:
+        """Finalize every reward entry exactly once."""
+        if self._shutdown:
+            return
+        self._shutdown = True
+
+        first_error = None
+        for entry in self._reward_entries:
+            try:
+                if entry.finalize is not None:
+                    entry.finalize(entry.state)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+
+        if first_error is not None:
+            raise first_error
