@@ -13,9 +13,11 @@
 # limitations under the License.
 """Shared helpers for diffusion Ray trainers."""
 
+import asyncio
 from typing import Any
 
 from verl.trainer.distillation import is_distillation_enabled
+from verl.utils.ray_utils import auto_await
 
 OLD_POLICY_DECAY_SCHEDULES = {
     "copy": (0, 0.0, 0.0),
@@ -71,3 +73,17 @@ class NoOpCheckpointManager:
 
     def sleep_replicas(self) -> None:
         return None
+
+
+class SleepOnlyCheckpointManager:
+    """Sleep vLLM replicas without actor weight sync."""
+
+    def __init__(self, replicas):
+        self.replicas = replicas
+
+    @auto_await
+    async def sleep_replicas(self) -> None:
+        await asyncio.gather(*[replica.sleep() for replica in self.replicas])
+
+    def update_weights(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs

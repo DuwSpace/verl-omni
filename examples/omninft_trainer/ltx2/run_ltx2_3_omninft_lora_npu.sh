@@ -19,6 +19,7 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
 DATA_FILE=${DATA_FILE:-$REPO_ROOT/data/omninft/vggsound/train_metadata_20k.jsonl}
 
 if ! prerequisites=$(python3 - <<'PY' 2>&1
+import verl_omni.pipelines  # noqa: F401
 from verl_omni.pipelines.model_base import DiffusionModelBase, VllmOmniPipelineBase
 from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn
 

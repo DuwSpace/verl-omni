@@ -13,6 +13,12 @@
 # limitations under the License.
 
 from .agent_loop import LTX2OmniNFTAgentLoopWorker, LTX2OmniNFTSingleTurnAgentLoop
+from .diffusers_training_adapter import LTX23OmniNFT
 from .vllm_omni_rollout_adapter import LTX23OmniNFTPipeline
 
-__all__ = ["LTX2OmniNFTAgentLoopWorker", "LTX2OmniNFTSingleTurnAgentLoop", "LTX23OmniNFTPipeline"]
+__all__ = [
+    "LTX23OmniNFT",
+    "LTX2OmniNFTAgentLoopWorker",
+    "LTX2OmniNFTSingleTurnAgentLoop",
+    "LTX23OmniNFTPipeline",
+]

@@ -68,6 +68,7 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
 )
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
     NoOpCheckpointManager,
+    SleepOnlyCheckpointManager,
     old_policy_decay,
     validate_distillation_config,
 )
@@ -1752,3 +1753,234 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+
+class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
+    """Run OmniNFT generate + `[B,K]` rewards, then skip actor/loss."""
+
+    def __init__(self, config, *args, **kwargs):
+        BaseRayDiffusionTrainer.__init__(self, config, *args, **kwargs)
+        self.is_offline = config.algorithm.get("sample_source", "online") == "offline"
+        self.use_reference_policy = False
+        self._has_old_adapter = False
+        self._loss_fn = None
+        self.use_rm = True
+        self.reward_batch_coordinator = None
+
+    @staticmethod
+    def _maybe_wait(stage: str) -> None:
+        if os.environ.get(f"OMNIFT_WAIT_BEFORE_{stage.upper()}", "").lower() not in {"1", "true", "yes"}:
+            return
+        print(f"{stage.upper()}_READY: attach debugger, then press Enter.")
+        input()
+
+    def _init_colocated_workers(self):
+        """Create the hybrid global_pool and spawn workers without loading Actor weights."""
+        self.resource_pool_manager.create_resource_pool()
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+        if Role.Actor in self.role_worker_mapping:
+            actor_role = Role.Actor
+        elif Role.ActorRolloutRef in self.role_worker_mapping:
+            actor_role = Role.ActorRolloutRef
+        else:
+            actor_role = Role.ActorRollout
+        actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+        self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[actor_role],
+            config=self.config.actor_rollout_ref,
+            distillation_config=self.config.get("distillation"),
+            role=str(actor_role),
+        )
+        wg_kwargs = {"device_name": self.device_name}
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        all_wg = {}
+        for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            if not class_dict:
+                continue
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=resource_pool,
+                ray_cls_with_init=create_colocated_worker_cls(class_dict=class_dict),
+                **wg_kwargs,
+            )
+            all_wg.update(wg_dict.spawn(prefix_set=class_dict.keys()))
+        self.actor_rollout_wg = all_wg[str(actor_role)]
+        return actor_rollout_resource_pool
+
+    def init_workers(self):
+        """Create the shared pool, then rollout and native reward workers."""
+        try:
+            actor_rollout_resource_pool = self._init_colocated_workers()
+            if self.is_offline:
+                self.reward_loop_manager = None
+                self.llm_server_manager = None
+                self.enable_agent_reward_loop = False
+                self.checkpoint_manager = NoOpCheckpointManager()
+                return
+            self._init_online_rollout_stack(actor_rollout_resource_pool)
+        except BaseException:
+            self._shutdown_reward_loop()
+            raise
+
+    def fit(self):
+        """Run the inherited training loop and finalize Native Reward Workers."""
+        try:
+            return super().fit()
+        finally:
+            self._shutdown_reward_loop()
+
+    def _shutdown_reward_loop(self) -> None:
+        manager = getattr(self, "reward_loop_manager", None)
+        if manager is not None:
+            manager.shutdown()
+
+    def _init_online_rollout_stack(self, actor_rollout_resource_pool):
+        """Start vLLM rollout and colocated native Reward Workers on the shared pool."""
+        from verl.experimental.agent_loop import AgentLoopManager
+
+        from verl_omni.pipelines.ltx2_omni_nft.agent_loop import LTX2OmniNFTAgentLoopWorker
+        from verl_omni.reward_loop.multimodal_reward_loop import (
+            BatchRewardCoordinator,
+            MultiModalRewardLoopManager,
+        )
+
+        self.reward_loop_manager = MultiModalRewardLoopManager(
+            config=self.config,
+            resource_pool=actor_rollout_resource_pool,
+        )
+        self.reward_batch_coordinator = BatchRewardCoordinator(self.reward_loop_manager.reward_loop_workers)
+        self.async_rollout_mode = True
+        self.enable_agent_reward_loop = False
+
+        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
+        if manager_class_fqn:
+            agent_loop_manager_cls = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+        else:
+            agent_loop_manager_cls = AgentLoopManager
+            AgentLoopManager.agent_loop_workers_class = ray.remote(LTX2OmniNFTAgentLoopWorker)
+
+        self.llm_server_manager = LLMServerManager.create(
+            config=self.config,
+            worker_group=self.actor_rollout_wg,
+            rollout_resource_pool=actor_rollout_resource_pool,
+        )
+        self.async_rollout_manager = agent_loop_manager_cls.create(
+            config=self.config,
+            llm_client=self.llm_server_manager.get_client(),
+            reward_loop_worker_handles=None,
+        )
+        original_generate = self.async_rollout_manager.generate_sequences
+
+        def generate_sequences(prompts):
+            self._maybe_wait("generate")
+            result = original_generate(prompts)
+            self._save_rollout_replay(result)
+            self._dump_rollout_media(result)
+            return result
+
+        self.async_rollout_manager.generate_sequences = generate_sequences
+        self.checkpoint_manager = SleepOnlyCheckpointManager(self.llm_server_manager.get_replicas())
+
+    def _save_rollout_replay(self, batch: DataProto) -> None:
+        """Persist the generated DataProto when debug `trainer.replay_path` is set."""
+        replay_path = OmegaConf.select(self.config.trainer, "replay_path")
+        if not replay_path:
+            return
+        parent = os.path.dirname(replay_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        batch.save_to_disk(replay_path)
+        print("REPLAY_OK", f"artifact={replay_path}", f"samples={len(batch)}")
+
+    def _dump_rollout_media(self, batch: DataProto) -> None:
+        """Write mp4/jsonl immediately after generate so media exists if reward fails."""
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir")
+        if not rollout_data_dir:
+            return
+        prompts = batch.non_tensor_batch.get("prompt")
+        if prompts is None:
+            inputs = [""] * len(batch)
+        else:
+            inputs = [str(prompt) for prompt in np.asarray(prompts, dtype=object).tolist()]
+        extra = {}
+        sample_uids = batch.non_tensor_batch.get("sample_uid")
+        if sample_uids is not None:
+            extra["sample_uid"] = [str(uid) for uid in sample_uids]
+        fps = batch.batch.get("fps")
+        dump_fps = int(fps[0].item()) if fps is not None else int(self.config.trainer.get("video_fps", 24))
+        self._dump_generations(
+            inputs=inputs,
+            outputs=batch.batch["responses"],
+            gts=[None] * len(batch),
+            scores=[None] * len(batch),
+            reward_extra_infos_dict=extra,
+            dump_path=rollout_data_dir,
+            max_samples=self.config.trainer.get("rollout_data_max_samples", None),
+            fps=dump_fps,
+            audios=batch.batch.get("audio"),
+            audio_sample_rates=batch.batch.get("audio_sample_rate"),
+        )
+
+    def _log_rollout_data(
+        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
+    ):
+        """Dump OmniNFT decoded AV to mp4/jsonl using string prompts and `[B,K]` scores."""
+        prompts = batch.non_tensor_batch.get("prompt")
+        if prompts is None:
+            super()._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+            return
+        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+            inputs = [str(prompt) for prompt in np.asarray(prompts, dtype=object).tolist()]
+            scores = batch.batch.get("rm_scores", batch.batch["sample_level_scores"])
+            extra = {
+                key: (value.tolist() if isinstance(value, np.ndarray) else value)
+                for key, value in reward_extra_infos_dict.items()
+            }
+            sample_uids = batch.non_tensor_batch.get("sample_uid")
+            if sample_uids is not None:
+                extra.setdefault("sample_uid", [str(uid) for uid in sample_uids])
+            fps = batch.batch.get("fps")
+            dump_fps = int(fps[0].item()) if fps is not None else int(self.config.trainer.get("video_fps", 24))
+            self._dump_generations(
+                inputs=inputs,
+                outputs=batch.batch["responses"],
+                gts=[None] * len(batch),
+                scores=scores.detach().cpu().tolist(),
+                reward_extra_infos_dict=extra,
+                dump_path=rollout_data_dir,
+                max_samples=self.config.trainer.get("rollout_data_max_samples", None),
+                fps=dump_fps,
+                audios=batch.batch.get("audio"),
+                audio_sample_rates=batch.batch.get("audio_sample_rate"),
+            )
+
+    def _compute_reward_colocate(self, batch: DataProto) -> DataProto:
+        """Pause for debugger attach, then score the local batch."""
+        self._maybe_wait("score")
+        if self.reward_batch_coordinator is None:
+            raise RuntimeError("Batch Reward Coordinator is not initialized.")
+        return self.reward_batch_coordinator.compute(batch)
+
+    def _prepare_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> DataProto:
+        """Keep the `[B,K]` reward matrix; actor batching is not implemented."""
+        scores = batch.batch.get("rm_scores", reward_tensor)
+        print(
+            "REWARD_OK",
+            f"names={list(batch.meta_info.get('reward_names', []))}",
+            f"scores={list(scores.shape)}",
+        )
+        return batch
+
+    def _update_actor(self, batch: DataProto) -> DataProto:
+        """Skip optimizer and FSDP updates until the OmniNFT actor lands."""
+        del batch
+        return DataProto.from_single_dict(data={}, meta_info={"metrics": {}})
+
+    def _compute_ref_noise_pred(self, batch: DataProto) -> Optional[DataProto]:
+        """Skip reference forward until the OmniNFT actor lands."""
+        del batch
+        return None
+
+    def _update_old_policy(self) -> tuple[bool, float, Literal["none", "copy", "ema"]]:
+        """Skip old-policy copy/EMA until the OmniNFT actor lands."""
+        return False, 0.0, "none"

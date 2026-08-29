@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
+from verl.protocol import DataProto
 
 from verl_omni.utils.dataset.rl_dataset import create_rl_dataset, get_collate_fn
 from verl_omni.utils.dataset.omni_nft_dataset import OmniNFTPromptDataset, collate_omni_nft_prompt_groups
@@ -61,6 +62,7 @@ def test_dataset_skips_blank_lines_and_collates_without_candidate_expansion(tmp_
     batch = collate_omni_nft_prompt_groups([dataset[0], dataset[1]])
 
     assert batch["uid"].tolist() == ["1", "2"]
+    assert batch["idx"].tolist() == [1, 2]
     assert [source["index"] for source in batch["source"]] == [1, 2]
     assert batch["prompt"].tolist() == ["a joint prompt", "a joint prompt"]
     assert batch["raw_prompt"].tolist() == [
@@ -109,6 +111,7 @@ def test_dataset_supports_standard_custom_dataset_factory_and_max_samples(tmp_pa
 
     dataset = create_rl_dataset([str(path)], config, tokenizer=None, processor=None, max_samples=2)
     batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=get_collate_fn(config))))
+    data_proto = DataProto.from_single_dict(batch)
 
     assert len(dataset) == 2
     assert batch["uid"].tolist() == ["1", "2"]
@@ -116,6 +119,11 @@ def test_dataset_supports_standard_custom_dataset_factory_and_max_samples(tmp_pa
         [{"role": "user", "content": "a joint prompt"}],
         [{"role": "user", "content": "a joint prompt"}],
     ]
+    assert len(data_proto) == 2
+    assert data_proto.batch is not None
+    assert data_proto.batch["idx"].tolist() == [1, 2]
+    assert data_proto.non_tensor_batch["uid"].tolist() == ["1", "2"]
+    assert data_proto.non_tensor_batch["raw_prompt"].tolist() == batch["raw_prompt"].tolist()
     assert len(OmniNFTPromptDataset(path, max_samples=0)) == 0
 
 

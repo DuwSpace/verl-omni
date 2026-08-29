@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 
 
@@ -101,17 +102,22 @@ class OmniNFTPromptDataset(Dataset):
         return self._records[index]
 
 
-def collate_omni_nft_prompt_groups(batch: list[dict[str, Any]]) -> dict[str, np.ndarray]:
-    """Collate prompt-group records and add LTX chat-message `raw_prompt`."""
+def collate_omni_nft_prompt_groups(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate prompt-group records and add LTX chat-message `raw_prompt`.
+
+    Object columns stay in `DataProto.non_tensor_batch`. `idx` is an int64 tensor so
+    `DataProto.batch` has a batch size and can `union` rollout tensors.
+    """
 
     if not batch:
         raise ValueError("Cannot collate an empty OmniNFT prompt batch")
-    columns = {}
+    columns: dict[str, Any] = {}
     for key in batch[0]:
         columns[key] = np.empty(len(batch), dtype=object)
         columns[key][:] = [record[key] for record in batch]
     columns["raw_prompt"] = np.empty(len(batch), dtype=object)
     columns["raw_prompt"][:] = [[{"role": "user", "content": record["prompt"]}] for record in batch]
+    columns["idx"] = torch.tensor([int(record["uid"]) for record in batch], dtype=torch.long)
     return columns
 
 
