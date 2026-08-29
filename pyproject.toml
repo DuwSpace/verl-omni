@@ -58,6 +58,12 @@ vllm-omni = [
 audio = [
     "qwen-omni-utils>=0.0.9",
 ]
+audiobox = [
+    "audiobox_aesthetics==0.0.4",
+]
+desync = [
+    "timm==1.0.27",
+]
 # CUDA rollout backend (vllm) + actor FA3 (kernels) + liger-kernel. Install in step 1 on GPU.
 gpu = [
     "vllm==0.27.0",
