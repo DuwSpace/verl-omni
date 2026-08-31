@@ -28,7 +28,7 @@ from verl.utils.device import get_device_name, get_torch_device
 
 _DEFAULT_MODEL_REVISION = "zghhui/OmniNFT-Reward-Series@9e30061a1392d03bafdcf717e80a385ddf411b4d"
 _DEFAULT_SOURCE_REVISION = "fb9237f6e74edf0d0f2a683f4d975b79fde588fe"
-_DEFINITION_VERSION = "omninft-desync-synchformer-v2"
+_DEFINITION_VERSION = "omninft-desync-synchformer-v3"
 _TARGET_VIDEO_FPS = 25.0
 _TARGET_AUDIO_RATE = 16_000
 _MAX_SECONDS = 8
@@ -201,8 +201,10 @@ def _temporal_resample_video(video: torch.Tensor, source_fps: float) -> torch.Te
     if frame_count <= 0:
         raise ValueError("DeSync video is too short for 25 fps resampling.")
     frame_count = min(frame_count, _VIDEO_FRAMES)
-    indices = (torch.arange(frame_count, dtype=torch.float64) / _TARGET_VIDEO_FPS * source_fps).round().long()
-    return video[indices.clamp_max(video.shape[0] - 1)]
+    # ffmpeg `fps=25` (torio): sample each output slot at its center.
+    output_index = torch.arange(frame_count, dtype=torch.float64)
+    indices = torch.ceil((output_index + 0.5) * source_fps / _TARGET_VIDEO_FPS).long() - 1
+    return video[indices.clamp(0, video.shape[0] - 1)]
 
 
 def _resize_crop_video(video: torch.Tensor) -> torch.Tensor:

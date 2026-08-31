@@ -132,13 +132,22 @@ def test_local_batch_uses_av_segments_micro_batches_and_offset_reward(monkeypatc
         "source_revision": desync_native._DEFAULT_SOURCE_REVISION,
     }
     assert result["model_revision"] == desync_native._DEFAULT_MODEL_REVISION
-    assert result["definition_version"] == "omninft-desync-synchformer-v2"
+    assert result["definition_version"] == "omninft-desync-synchformer-v3"
 
 
 def test_video_resampling_resize_normalize_and_padding():
     frames = torch.arange(9, dtype=torch.uint8).view(9, 1, 1, 1).expand(-1, 3, 2, 2)
     sampled = desync_native._temporal_resample_video(frames, 48.0)
     assert sampled[:, 0, 0, 0].tolist() == [0, 2, 4, 6]
+
+    src24 = torch.arange(79, dtype=torch.uint8).view(79, 1, 1, 1).expand(-1, 3, 2, 2)
+    sampled24 = desync_native._temporal_resample_video(src24, 24.0)
+    values24 = sampled24[:, 0, 0, 0].tolist()
+    assert len(values24) == 82
+    assert values24[12] == 11
+    assert values24[37] == 35
+    assert values24[62] == 59
+    assert values24[-1] == 78
 
     constants = torch.stack((torch.zeros(3, 4, 8), torch.full((3, 4, 8), 255))).to(torch.uint8)
     resized = desync_native._resize_crop_video(constants)
