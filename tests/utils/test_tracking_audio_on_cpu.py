@@ -79,6 +79,7 @@ def test_export_video_muxes_audio(monkeypatch, tmp_path):
     assert output_path.read_bytes() == b"video-with-audio"
     codec_index = commands[0].index("-c:v")
     assert commands[0][codec_index : codec_index + 4] == ["-c:v", "copy", "-c:a", "aac"]
+    assert "-nostdin" in commands[0]
     assert "+faststart" in commands[0]
 
 
