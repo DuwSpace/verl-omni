@@ -28,6 +28,8 @@ from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.tensor import DTensor
+from torch.utils._pytree import tree_map
+from torch.utils.checkpoint import checkpoint
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -65,6 +67,7 @@ from verl_omni.pipelines.utils import (
     prepare_model_inputs,
     prepare_noisy_latents,
 )
+from verl_omni.utils.diffusers_npu import apply_diffusers_npu_rms_norm_patch
 from verl_omni.utils.fsdp_utils import collect_lora_params
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
@@ -73,6 +76,29 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _fsdp2_gradient_checkpointing_with_cast_func(param_dtype: torch.dtype) -> Callable:
+    """Match FSDP2 input casting inside both checkpoint forward executions."""
+
+    def cast_fp_tensor(value):
+        if (
+            not isinstance(value, torch.Tensor)
+            or not torch.is_floating_point(value)
+            or value.dtype == param_dtype
+        ):
+            return value
+        return value.to(param_dtype)
+
+    def gradient_checkpointing_func(module, *args, **kwargs):
+        def checkpointed_forward(*inner_args, **inner_kwargs):
+            cast_args = tree_map(cast_fp_tensor, inner_args)
+            cast_kwargs = tree_map(cast_fp_tensor, inner_kwargs)
+            return module.__call__(*cast_args, **cast_kwargs)
+
+        return checkpoint(checkpointed_forward, *args, use_reentrant=False, **kwargs)
+
+    return gradient_checkpointing_func
 
 
 class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
@@ -116,6 +142,21 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._is_lora = self.model_config.lora_rank > 0
+        self._uses_fsdp2_cpu_offload_policy = False
+
+    def _get_mixed_precision_dtypes(self) -> tuple[torch.dtype, torch.dtype, torch.dtype]:
+        from verl.utils.torch_dtypes import PrecisionType
+
+        mixed_precision_config = self.engine_config.mixed_precision
+        if mixed_precision_config is not None:
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
+            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
+        else:
+            param_dtype = torch.bfloat16
+            reduce_dtype = torch.float32
+            buffer_dtype = torch.float32
+        return param_dtype, reduce_dtype, buffer_dtype
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -225,7 +266,13 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
         if self.model_config.enable_gradient_checkpointing:
             try:
-                module.enable_gradient_checkpointing()
+                if self.engine_config.strategy == "fsdp2":
+                    param_dtype, _, _ = self._get_mixed_precision_dtypes()
+                    module.enable_gradient_checkpointing(
+                        gradient_checkpointing_func=_fsdp2_gradient_checkpointing_with_cast_func(param_dtype)
+                    )
+                else:
+                    module.enable_gradient_checkpointing()
             except AttributeError:
                 raise NotImplementedError(
                     f"Gradient checkpointing is enabled in config, but {type(module).__name__} "
@@ -241,6 +288,8 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         return module
 
     def _build_module(self):
+        apply_diffusers_npu_rms_norm_patch()
+
         from diffusers import AutoModel
         from verl.utils.torch_dtypes import PrecisionType
 
@@ -286,7 +335,13 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             module.to(torch_dtype)
 
             if self.model_config.enable_gradient_checkpointing:
-                module.enable_gradient_checkpointing()
+                if self.engine_config.strategy == "fsdp2":
+                    param_dtype, _, _ = self._get_mixed_precision_dtypes()
+                    module.enable_gradient_checkpointing(
+                        gradient_checkpointing_func=_fsdp2_gradient_checkpointing_with_cast_func(param_dtype)
+                    )
+                else:
+                    module.enable_gradient_checkpointing()
 
             # patch for checkpoint saving
             def save_config(self, save_directory: str | os.PathLike):
@@ -302,18 +357,8 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
     def _build_fsdp_module(self, module):
         # TODO(ziheng): need to improve
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from verl.utils.torch_dtypes import PrecisionType
 
-        mixed_precision_config = self.engine_config.mixed_precision
-        if mixed_precision_config is not None:
-            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
-            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
-            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
-        else:
-            param_dtype = torch.bfloat16
-            reduce_dtype = torch.float32
-            buffer_dtype = torch.float32
-
+        param_dtype, reduce_dtype, buffer_dtype = self._get_mixed_precision_dtypes()
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
         auto_wrap_policy = get_fsdp_wrap_policy(
@@ -366,6 +411,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
                 offload_policy = CPUOffloadPolicy(pin_memory=True)
+                self._uses_fsdp2_cpu_offload_policy = True
 
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,
@@ -682,7 +728,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         Save FSDP checkpoint, handling parameter offload as needed.
         """
         origin_module_device = next(self.module.parameters()).device.type
-        if self._is_offload_param or origin_module_device == "cpu":
+        if (self._is_offload_param or origin_module_device == "cpu") and not self._uses_fsdp2_cpu_offload_policy:
             load_fsdp_model_to_gpu(self.module)
 
         self.checkpoint_manager.save_checkpoint(
@@ -721,7 +767,12 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
     ):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
-        load_fsdp_model_to_gpu(self.module)
+        # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement. Calling
+        # ``model.to(device)`` here leaves the module half-moved and can
+        # fail while materializing the state dict (the per-DTensor
+        # ``to(device).full_tensor()`` below still yields GPU tensors).
+        if not self._uses_fsdp2_cpu_offload_policy:
+            load_fsdp_model_to_gpu(self.module)
 
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
@@ -1243,6 +1294,204 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
             "metrics": metrics,
         }
         return loss, output
+
+
+def _validate_omni_nft_fsdp2_config(engine_config: FSDPEngineConfig) -> None:
+    """Keep the first OmniNFT implementation on the verified FSDP2-only path."""
+    if engine_config.strategy != "fsdp2":
+        raise NotImplementedError(
+            f"OmniNFT currently supports only actor.strategy=fsdp2, got {engine_config.strategy!r}."
+        )
+    if engine_config.ulysses_sequence_parallel_size != 1:
+        raise NotImplementedError(
+            "OmniNFT FSDP2 does not implement Ulysses/context parallelism yet; "
+            "set actor.fsdp_config.ulysses_sequence_parallel_size=1."
+        )
+
+
+@EngineRegistry.register(model_type="omni_nft_model", backend=["fsdp2"], device=["cuda", "npu"])
+class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
+    """FSDP2 actor engine for joint LTX video/audio DiffusionNFT updates."""
+
+    def __init__(
+        self,
+        model_config: DiffusionModelConfig,
+        engine_config: FSDPEngineConfig,
+        optimizer_config: FSDPOptimizerConfig,
+        checkpoint_config: CheckpointConfig,
+    ):
+        _validate_omni_nft_fsdp2_config(engine_config)
+        super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
+
+    @staticmethod
+    def _select_forward_noise(micro_batch: TensorDict, key: str, x0: torch.Tensor, step: int) -> torch.Tensor:
+        noise = micro_batch.get(key, None)
+        if noise is None:
+            return torch.randn_like(x0.float())
+        return noise[:, step] if noise.ndim == x0.ndim + 1 else noise
+
+    def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
+        video_x0 = micro_batch["video_latents_clean"]
+        audio_x0 = micro_batch["audio_latents_clean"]
+        timestep = micro_batch["train_timesteps"][:, step]
+        t = timestep.float() / 1000.0
+        video_t = t.view(-1, *([1] * (video_x0.ndim - 1)))
+        audio_t = t.view(-1, *([1] * (audio_x0.ndim - 1)))
+
+        video_noise = self._select_forward_noise(micro_batch, "video_forward_noise", video_x0, step)
+        audio_noise = self._select_forward_noise(micro_batch, "audio_forward_noise", audio_x0, step)
+        video_xt = (1.0 - video_t) * video_x0 + video_t * video_noise
+        audio_xt = (1.0 - audio_t) * audio_x0 + audio_t * audio_noise
+
+        prompt_embeds = micro_batch["prompt_embeds"]
+        prompt_embeds_mask = micro_batch["prompt_embeds_mask"]
+        negative_prompt_embeds = micro_batch.get("negative_prompt_embeds", None)
+        negative_prompt_embeds_mask = micro_batch.get("negative_prompt_embeds_mask", None)
+        if prompt_embeds.is_nested:
+            prompt_embeds, prompt_embeds_mask = self._unpad_nested_embeds(prompt_embeds, prompt_embeds_mask)
+        if isinstance(negative_prompt_embeds, torch.Tensor) and negative_prompt_embeds.is_nested:
+            negative_prompt_embeds, negative_prompt_embeds_mask = self._unpad_nested_embeds(
+                negative_prompt_embeds, negative_prompt_embeds_mask
+            )
+
+        model_inputs, negative_model_inputs = prepare_model_inputs(
+            module=self.module,
+            model_config=self.model_config,
+            latents=torch.cat((video_xt, audio_xt), dim=1),
+            timesteps=timestep,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+            micro_batch=micro_batch,
+            step=step,
+        )
+        return (
+            model_inputs,
+            negative_model_inputs,
+            video_x0,
+            audio_x0,
+            video_xt,
+            audio_xt,
+            video_t,
+            audio_t,
+        )
+
+    def prepare_model_outputs(self, output, micro_batch: TensorDict):
+        del micro_batch
+        (
+            video_old,
+            audio_old,
+            video_forward,
+            audio_forward,
+            video_ref,
+            audio_ref,
+            video_x0,
+            audio_x0,
+            video_xt,
+            audio_xt,
+            video_t,
+            audio_t,
+        ) = output
+        return {
+            "video_old_prediction": video_old,
+            "audio_old_prediction": audio_old,
+            "video_forward_prediction": video_forward,
+            "audio_forward_prediction": audio_forward,
+            "video_ref_forward_prediction": video_ref,
+            "audio_ref_forward_prediction": audio_ref,
+            "video_x0": video_x0,
+            "audio_x0": audio_x0,
+            "video_xt": video_xt,
+            "audio_xt": audio_xt,
+            "video_t_expanded": video_t,
+            "audio_t_expanded": audio_t,
+        }
+
+    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
+        (
+            model_inputs,
+            negative_model_inputs,
+            video_x0,
+            audio_x0,
+            video_xt,
+            audio_xt,
+            video_t,
+            audio_t,
+        ) = self.prepare_model_inputs(micro_batch=micro_batch, step=step)
+
+        with self.use_adapter("old"), torch.no_grad():
+            video_old, audio_old = forward(
+                module=self.module,
+                model_config=self.model_config,
+                model_inputs=model_inputs,
+                negative_model_inputs=negative_model_inputs,
+            )
+            video_old, audio_old = video_old.detach(), audio_old.detach()
+
+        video_forward, audio_forward = forward(
+            module=self.module,
+            model_config=self.model_config,
+            model_inputs=model_inputs,
+            negative_model_inputs=negative_model_inputs,
+        )
+
+        with torch.no_grad(), self.disable_adapter():
+            video_ref, audio_ref = forward(
+                module=self.module,
+                model_config=self.model_config,
+                model_inputs=model_inputs,
+                negative_model_inputs=negative_model_inputs,
+            )
+            video_ref, audio_ref = video_ref.detach(), audio_ref.detach()
+        self._set_adapter("default")
+
+        model_output = self.prepare_model_outputs(
+            output=(
+                video_old,
+                audio_old,
+                video_forward,
+                audio_forward,
+                video_ref,
+                audio_ref,
+                video_x0,
+                audio_x0,
+                video_xt,
+                audio_xt,
+                video_t,
+                audio_t,
+            ),
+            micro_batch=micro_batch,
+        )
+        if loss_function is not None:
+            data = tu.get_tensordict(
+                {
+                    "video_reward_prob": micro_batch["video_reward_prob"][:, step],
+                    "audio_reward_prob": micro_batch["audio_reward_prob"][:, step],
+                }
+            )
+            tu.assign_non_tensor(
+                data,
+                gradient_accumulation_steps=tu.get_non_tensor_data(
+                    micro_batch, "gradient_accumulation_steps", default=None
+                ),
+                sp_size=1,
+            )
+            loss, metrics = loss_function(
+                model_output=model_output,
+                data=data,
+                dp_group=self.get_data_parallel_group(),
+            )
+        else:
+            assert forward_only, "forward_only must be True when loss_function is None"
+            loss = torch.tensor(1.0, device=video_x0.device)
+            metrics = {}
+
+        return loss, {
+            "model_output": model_output,
+            "loss": loss.detach().item(),
+            "metrics": metrics,
+        }
 
 
 class EngineEvalModeCtx(BaseEngineCtx):

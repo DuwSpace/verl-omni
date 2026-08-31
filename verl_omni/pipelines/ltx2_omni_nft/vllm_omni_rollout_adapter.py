@@ -211,9 +211,7 @@ class LTX23OmniNFTPipeline(LTXTokenIdPromptMixin, LTX2Pipeline):
                     (batch_size,), clean_state.audio.shape[1], device=device, dtype=torch.long
                 ),
                 "fps": torch.full((batch_size,), fps, device=device, dtype=torch.float32),
-                "audio_sample_rate": torch.full(
-                    (batch_size,), audio_sample_rate, device=device, dtype=torch.long
-                ),
+                "audio_sample_rate": audio_sample_rate,
             },
             to_cpu=True,
         )

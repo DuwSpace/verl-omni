@@ -41,6 +41,10 @@ class TestDiffusionLossConfig:
         assert cfg.adv_clip_max == pytest.approx(5.0)
         assert cfg.mix_beta == pytest.approx(0.5)
         assert cfg.ref_kl_coef == pytest.approx(0.0)
+        assert cfg.video_weight == pytest.approx(1.0)
+        assert cfg.audio_weight == pytest.approx(1.0)
+        assert cfg.video_ref_kl_coef == pytest.approx(0.0)
+        assert cfg.audio_ref_kl_coef == pytest.approx(0.0)
         assert cfg.adaptive_weight_min == pytest.approx(1e-5)
         assert cfg.kl_mask_threshold == pytest.approx(1e-5)
         assert cfg.add_kl_coefficient is True
@@ -76,6 +80,10 @@ class TestDiffusionLossConfig:
             ({"mix_beta": 0.0}, "mix_beta.*positive"),
             ({"adaptive_weight_min": 0.0}, "adaptive_weight_min.*positive"),
             ({"kl_mask_threshold": 0.0}, "kl_mask_threshold.*positive"),
+            ({"video_weight": -1.0}, "video_weight.*non-negative"),
+            ({"audio_weight": -1.0}, "audio_weight.*non-negative"),
+            ({"video_ref_kl_coef": -1.0}, "video_ref_kl_coef.*non-negative"),
+            ({"audio_ref_kl_coef": -1.0}, "audio_ref_kl_coef.*non-negative"),
         ],
     )
     def test_invalid_diffusion_nft_loss_values_raise(self, kwargs, match):
@@ -85,6 +93,10 @@ class TestDiffusionLossConfig:
     def test_dance_grpo_loss_mode(self):
         cfg = DiffusionLossConfig(loss_mode="dance_grpo")
         assert cfg.loss_mode == "dance_grpo"
+
+    def test_omni_nft_loss_mode(self):
+        cfg = DiffusionLossConfig(loss_mode="omni_nft")
+        assert cfg.loss_mode == "omni_nft"
 
 
 # ---------------------------------------------------------------------------

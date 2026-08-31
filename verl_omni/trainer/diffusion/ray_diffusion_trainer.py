@@ -68,7 +68,6 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
 )
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
     NoOpCheckpointManager,
-    SleepOnlyCheckpointManager,
     old_policy_decay,
     validate_distillation_config,
 )
@@ -773,8 +772,14 @@ class BaseRayDiffusionTrainer(ABC):
             from verl.experimental.agent_loop import AgentLoopManager
 
             from verl_omni.agent_loop import DiffusionAgentLoopWorker
+            from verl_omni.pipelines.ltx2_omni_nft.agent_loop import LTX2OmniNFTAgentLoopWorker
 
-            AgentLoopManager.agent_loop_workers_class = ray.remote(DiffusionAgentLoopWorker)
+            worker_cls = (
+                LTX2OmniNFTAgentLoopWorker
+                if self.config.actor_rollout_ref.model.algorithm == "omni_nft"
+                else DiffusionAgentLoopWorker
+            )
+            AgentLoopManager.agent_loop_workers_class = ray.remote(worker_cls)
 
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
@@ -979,6 +984,25 @@ class BaseRayDiffusionTrainer(ABC):
                 finally:
                     self._controller_nsys_profile_active = False
 
+    def _shutdown_dataloaders(self) -> None:
+        """Stop DataLoader worker processes before the Ray actor exits."""
+        for attr in ("train_dataloader", "val_dataloader"):
+            loader = getattr(self, attr, None)
+            if loader is None:
+                continue
+            iterator = getattr(loader, "_iterator", None) or getattr(loader, "_DataLoader__iterator", None)
+            shutdown = getattr(iterator, "_shutdown_workers", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception as exc:
+                    sys_logger.debug("Ignoring error shutting down %s workers: %s", attr, exc)
+            # Drop the iterator reference so its destructor does not race Ray teardown.
+            try:
+                loader._iterator = None
+            except Exception:
+                pass
+
     @abstractmethod
     def fit(self):
         """Run the trainer-type-specific training loop."""
@@ -1080,6 +1104,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_dataloaders()
                 return
 
         # add tqdm
@@ -1335,6 +1360,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
+                    self._shutdown_dataloaders()
                     return
 
                 # this is experimental and may be changed/removed in the future
@@ -1370,10 +1396,15 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
         actor_loss_cfg = self.config.actor_rollout_ref.actor.diffusion_loss
         if rollout_cfg.rollout_adapter != "old":
             raise ValueError("Old-adapter algorithms require actor_rollout_ref.rollout.rollout_adapter=old.")
-        if actor_loss_cfg.loss_mode != "diffusion_nft":
+        if actor_loss_cfg.loss_mode not in {"diffusion_nft", "omni_nft"}:
             raise ValueError(
-                "Old-adapter algorithms require actor_rollout_ref.actor.diffusion_loss.loss_mode=diffusion_nft."
+                "Old-adapter algorithms require actor_rollout_ref.actor.diffusion_loss.loss_mode "
+                "to be diffusion_nft or omni_nft."
             )
+
+    def _compute_data_metrics(self, batch: DataProto) -> dict:
+        """Collect batch reward/advantage stats for the training logger."""
+        return compute_data_metrics_diffusion(batch)
 
     def init_workers(self):
         """Initialize actor-only workers for offline, or full stack for online preference training."""
@@ -1523,6 +1554,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_dataloaders()
                 return
 
         # add tqdm
@@ -1723,7 +1755,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics_diffusion(batch=batch))
+                metrics.update(self._compute_data_metrics(batch))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 num_images = (
                     batch.batch["advantages"].shape[0]
@@ -1746,6 +1778,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
+                    self._shutdown_dataloaders()
                     return
 
                 # this is experimental and may be changed/removed in the future
@@ -1756,16 +1789,13 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
 
 
 class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
-    """Run OmniNFT generate + `[B,K]` rewards, then skip actor/loss."""
+    """Run the online OmniNFT rollout, reward routing, and actor update loop."""
 
     def __init__(self, config, *args, **kwargs):
-        BaseRayDiffusionTrainer.__init__(self, config, *args, **kwargs)
-        self.is_offline = config.algorithm.get("sample_source", "online") == "offline"
-        self.use_reference_policy = False
-        self._has_old_adapter = False
-        self._loss_fn = None
+        super().__init__(config, *args, **kwargs)
         self.use_rm = True
         self.reward_batch_coordinator = None
+        self._last_reward_names: list[str] | None = None
 
     @staticmethod
     def _maybe_wait(stage: str) -> None:
@@ -1775,37 +1805,8 @@ class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
         input()
 
     def _init_colocated_workers(self):
-        """Create the hybrid global_pool and spawn workers without loading Actor weights."""
-        self.resource_pool_manager.create_resource_pool()
-        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
-        if Role.Actor in self.role_worker_mapping:
-            actor_role = Role.Actor
-        elif Role.ActorRolloutRef in self.role_worker_mapping:
-            actor_role = Role.ActorRolloutRef
-        else:
-            actor_role = Role.ActorRollout
-        actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
-        self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = RayClassWithInitArgs(
-            cls=self.role_worker_mapping[actor_role],
-            config=self.config.actor_rollout_ref,
-            distillation_config=self.config.get("distillation"),
-            role=str(actor_role),
-        )
-        wg_kwargs = {"device_name": self.device_name}
-        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
-            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
-        all_wg = {}
-        for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            if not class_dict:
-                continue
-            wg_dict = self.ray_worker_group_cls(
-                resource_pool=resource_pool,
-                ray_cls_with_init=create_colocated_worker_cls(class_dict=class_dict),
-                **wg_kwargs,
-            )
-            all_wg.update(wg_dict.spawn(prefix_set=class_dict.keys()))
-        self.actor_rollout_wg = all_wg[str(actor_role)]
-        return actor_rollout_resource_pool
+        """Create the shared pool and initialize the OmniNFT actor worker group."""
+        return super()._init_colocated_workers()
 
     def init_workers(self):
         """Create the shared pool, then rollout and native reward workers."""
@@ -1827,6 +1828,7 @@ class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
         try:
             return super().fit()
         finally:
+            self._shutdown_dataloaders()
             self._shutdown_reward_loop()
 
     def _shutdown_reward_loop(self) -> None:
@@ -1873,16 +1875,72 @@ class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
 
         def generate_sequences(prompts):
             self._maybe_wait("generate")
+            loaded = self._maybe_load_stage("generate", prompts)
+            if loaded is not None:
+                return loaded
             result = original_generate(prompts)
-            self._save_rollout_replay(result)
-            self._dump_rollout_media(result)
+            if getattr(prompts, "meta_info", None):
+                result.meta_info = dict(result.meta_info or {})
+                result.meta_info["validate"] = bool(prompts.meta_info.get("validate", False))
+            self._last_generate_validate = bool((result.meta_info or {}).get("validate", False))
+            self._maybe_dump_stage("generate", result)
+            if OmegaConf.select(self.config.trainer, "replay_path", default=None):
+                self._save_rollout_replay(result)
             return result
 
         self.async_rollout_manager.generate_sequences = generate_sequences
-        self.checkpoint_manager = SleepOnlyCheckpointManager(self.llm_server_manager.get_replicas())
+        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        self.checkpoint_manager = CheckpointEngineManager(
+            config=checkpoint_engine_config,
+            actor_wg=self.actor_rollout_wg,
+            replicas=self.llm_server_manager.get_replicas(),
+        )
+        self.checkpoint_manager.sleep_replicas()
+
+    def _debug_dump_dir(self) -> str | None:
+        config = getattr(self, "config", None)
+        if config is None:
+            return None
+        dump_dir = OmegaConf.select(config, "trainer.debug_dump_dir", default=None)
+        return str(dump_dir) if dump_dir else None
+
+    def _debug_stage_path(self, stage: str, batch: DataProto | None = None) -> str | None:
+        dump_dir = self._debug_dump_dir()
+        if not dump_dir:
+            return None
+        step = int(getattr(self, "global_steps", 0) or 0)
+        validate = bool((getattr(batch, "meta_info", None) or {}).get("validate", False))
+        if not validate:
+            validate = bool(getattr(self, "_last_generate_validate", False) and stage == "reward")
+        split = "val" if validate else "train"
+        return os.path.join(dump_dir, f"{stage}_{split}_{step}.pkl")
+
+    def _maybe_load_stage(self, stage: str, batch: DataProto | None = None) -> DataProto | None:
+        config = getattr(self, "config", None)
+        if config is None or not bool(OmegaConf.select(config, "trainer.reuse_debug_dump", default=False)):
+            return None
+        path = self._debug_stage_path(stage, batch)
+        if not path or not os.path.isfile(path):
+            return None
+        loaded = DataProto.load_from_disk(path)
+        print("DEBUG_LOAD_OK", stage, path, f"samples={len(loaded)}")
+        return loaded
+
+    def _maybe_dump_stage(self, stage: str, batch: DataProto) -> None:
+        """Persist a staged DataProto when `trainer.debug_dump_dir` is set."""
+        path = self._debug_stage_path(stage, batch)
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            batch.save_to_disk(path)
+        except Exception as exc:
+            print("DEBUG_DUMP_FAILED", stage, path, exc)
+            return
+        print("DEBUG_DUMP_OK", stage, path, f"samples={len(batch)}")
 
     def _save_rollout_replay(self, batch: DataProto) -> None:
-        """Persist the generated DataProto when debug `trainer.replay_path` is set."""
+        """Debug-only DataProto dump when `trainer.replay_path` is set."""
         replay_path = OmegaConf.select(self.config.trainer, "replay_path")
         if not replay_path:
             return
@@ -1893,7 +1951,7 @@ class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
         print("REPLAY_OK", f"artifact={replay_path}", f"samples={len(batch)}")
 
     def _dump_rollout_media(self, batch: DataProto) -> None:
-        """Write mp4/jsonl immediately after generate so media exists if reward fails."""
+        """Debug-only generate dump. Not wired into the training generate path."""
         rollout_data_dir = self.config.trainer.get("rollout_data_dir")
         if not rollout_data_dir:
             return
@@ -1955,32 +2013,149 @@ class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
             )
 
     def _compute_reward_colocate(self, batch: DataProto) -> DataProto:
-        """Pause for debugger attach, then score the local batch."""
+        """Score the local batch and publish each `[B,K]` reward column as a numeric extra."""
         self._maybe_wait("score")
+        loaded = self._maybe_load_stage("reward", batch)
+        if loaded is not None:
+            reward_names = loaded.meta_info.get("reward_names")
+            self._last_reward_names = list(reward_names) if reward_names else None
+            return loaded
         if self.reward_batch_coordinator is None:
             raise RuntimeError("Batch Reward Coordinator is not initialized.")
-        return self.reward_batch_coordinator.compute(batch)
+        reward_batch = self.reward_batch_coordinator.compute(batch)
+        reward_names = reward_batch.meta_info.get("reward_names")
+        if not reward_names:
+            config = getattr(self, "config", None)
+            reward_names = getattr(getattr(config, "reward", None), "component_order", None)
+        if not reward_names:
+            self._last_reward_names = None
+            return reward_batch
+        self._last_reward_names = list(reward_names)
+        reward_batch = self._publish_component_reward_scores(reward_batch)
+        self._maybe_dump_stage("reward", reward_batch)
+        return reward_batch
 
-    def _prepare_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> DataProto:
-        """Keep the `[B,K]` reward matrix; actor batching is not implemented."""
-        scores = batch.batch.get("rm_scores", reward_tensor)
-        print(
-            "REWARD_OK",
-            f"names={list(batch.meta_info.get('reward_names', []))}",
-            f"scores={list(scores.shape)}",
-        )
-        return batch
+    def _publish_component_reward_scores(self, reward_batch: DataProto) -> DataProto:
+        names = self._last_reward_names
+        if not names:
+            return reward_batch
+        scores = reward_batch.batch.get("rm_scores")
+        if scores is None or scores.ndim != 2 or scores.shape[1] != len(names):
+            shape = None if scores is None else tuple(scores.shape)
+            raise ValueError(f"OmniNFT rm_scores must have shape (B, {len(names)}), got {shape}.")
+        extra_keys = list(reward_batch.meta_info.get("reward_extra_keys", []))
+        cpu_scores = scores.detach().cpu().float()
+        for index, name in enumerate(names):
+            reward_batch.non_tensor_batch[name] = cpu_scores[:, index].numpy()
+            if name not in extra_keys:
+                extra_keys.append(name)
+        reward_batch.meta_info["reward_extra_keys"] = extra_keys
+        return reward_batch
+
+    def _numeric_reward_extras(self, reward_extra_infos_dict: dict) -> dict:
+        extras = {}
+        for key, values in reward_extra_infos_dict.items():
+            if isinstance(values, np.ndarray):
+                if values.size == 0 or not np.issubdtype(values.dtype, np.number):
+                    continue
+                extras[key] = values
+            elif isinstance(values, list) and values and isinstance(values[0], int | float | np.integer | np.floating):
+                extras[key] = values
+        return extras
+
+    def _summarize_component_rewards(self, scores: torch.Tensor, names: list[str], split: str) -> dict[str, float]:
+        """Build wandb keys ``{split}/reward/{name}/{mean,std,min,max}`` and ``{split}/reward/sum/*``."""
+        if scores.ndim != 2 or scores.shape[1] != len(names) or not names:
+            raise ValueError(f"OmniNFT {split} scores must have shape (B, {len(names)}), got {tuple(scores.shape)}.")
+        cpu_scores = scores.detach().cpu().float()
+        metrics = {}
+        prefix = f"{split}/reward"
+        per_sample_sum = cpu_scores.sum(dim=1)
+        metrics[f"{prefix}/sum/mean"] = float(per_sample_sum.mean())
+        metrics[f"{prefix}/sum/std"] = float(per_sample_sum.std(unbiased=False))
+        for index, name in enumerate(names):
+            column = cpu_scores[:, index]
+            metrics[f"{prefix}/{name}/mean"] = float(column.mean())
+            metrics[f"{prefix}/{name}/std"] = float(column.std(unbiased=False))
+            metrics[f"{prefix}/{name}/min"] = float(column.min())
+            metrics[f"{prefix}/{name}/max"] = float(column.max())
+        return metrics
+
+    def _reward_component_wandb_metrics(self, batch: DataProto, split: str) -> dict[str, float]:
+        names = None
+        if getattr(batch, "meta_info", None):
+            names = batch.meta_info.get("reward_names")
+        names = list(names or getattr(self, "_last_reward_names", None) or [])
+        scores = None if getattr(batch, "batch", None) is None else batch.batch.get("rm_scores")
+        if not names or scores is None:
+            return {}
+        return self._summarize_component_rewards(scores, names, split)
+
+    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+        """Log each OmniNFT reward for wandb as ``val/reward/<name>/*``; skip metadata dicts."""
+        extras = self._numeric_reward_extras(reward_extra_infos_dict)
+        names = [name for name in (getattr(self, "_last_reward_names", None) or []) if name in extras]
+        metrics = {}
+        if names:
+            stacked = torch.tensor(np.stack([np.asarray(extras[name], dtype=np.float32) for name in names], axis=1))
+            metrics.update(self._summarize_component_rewards(stacked, names, split="val"))
+        parent_extras = {key: extras[key] for key in ("reward",) if key in extras}
+        metrics.update(super()._val_metrics_update(data_sources, sample_uids, parent_extras, sample_turns))
+        return metrics
 
     def _update_actor(self, batch: DataProto) -> DataProto:
-        """Skip optimizer and FSDP updates until the OmniNFT actor lands."""
-        del batch
-        return DataProto.from_single_dict(data={}, meta_info={"metrics": {}})
+        """Attach per-reward train wandb metrics, then run the inherited actor update."""
+        output = super()._update_actor(batch)
+        reward_metrics = self._reward_component_wandb_metrics(batch, split="train")
+        if not reward_metrics:
+            return output
+        meta_info = getattr(output, "meta_info", None)
+        if not isinstance(meta_info, dict):
+            return output
+        merged = dict(meta_info.get("metrics") or {})
+        merged.update({key: [value] for key, value in reward_metrics.items()})
+        meta_info["metrics"] = merged
+        return output
+
+    def _compute_data_metrics(self, batch: DataProto) -> dict:
+        """Keep advantage/return stats, but reduce OmniNFT `[B,K]` rewards by unweighted sum."""
+        metrics = super()._compute_data_metrics(batch)
+        names = None
+        if getattr(batch, "meta_info", None):
+            names = batch.meta_info.get("reward_names")
+        names = list(names or getattr(self, "_last_reward_names", None) or [])
+        scores = None if getattr(batch, "batch", None) is None else batch.batch.get("rm_scores")
+        if scores is None:
+            scores = batch.batch.get("sample_level_rewards") if getattr(batch, "batch", None) is not None else None
+        if not names or scores is None or scores.ndim != 2 or scores.shape[1] != len(names):
+            return metrics
+        per_sample = scores.detach().float().sum(dim=1)
+        metrics["critic/rewards/mean"] = float(per_sample.mean())
+        metrics["critic/rewards/max"] = float(per_sample.max())
+        metrics["critic/rewards/min"] = float(per_sample.min())
+        if "uid" not in batch.non_tensor_batch:
+            return metrics
+        rewards_np = per_sample.detach().cpu().numpy()
+        uid_array = np.array(batch.non_tensor_batch["uid"])
+        unique_uids = np.unique(uid_array)
+        per_prompt_stds = np.array([np.std(rewards_np[uid_array == uid]) for uid in unique_uids])
+        metrics["critic/rewards/zero_std_ratio"] = float(np.mean(per_prompt_stds == 0))
+        metrics["critic/rewards/std_mean"] = float(np.mean(per_prompt_stds))
+        metrics["critic/rewards/group_size"] = float(len(rewards_np) / len(unique_uids))
+        return metrics
+
+    def _prepare_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> DataProto:
+        """Route the preserved `[B,K]` reward matrix into the OmniNFT actor batch."""
+        if "reward_names" not in batch.meta_info:
+            if not self._last_reward_names:
+                raise ValueError("OmniNFT actor batch requires reward_names in meta_info.")
+            batch.meta_info["reward_names"] = list(self._last_reward_names)
+        return self._loss_fn.prepare_actor_batch(batch, reward_tensor.float(), self.config)
 
     def _compute_ref_noise_pred(self, batch: DataProto) -> Optional[DataProto]:
-        """Skip reference forward until the OmniNFT actor lands."""
-        del batch
-        return None
+        """Reuse the trainer-side reference hook when the configured loss requests it."""
+        return super()._compute_ref_noise_pred(batch)
 
     def _update_old_policy(self) -> tuple[bool, float, Literal["none", "copy", "ema"]]:
-        """Skip old-policy copy/EMA until the OmniNFT actor lands."""
-        return False, 0.0, "none"
+        """Refresh the rollout adapter from the trained default adapter."""
+        return super()._update_old_policy()

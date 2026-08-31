@@ -112,7 +112,7 @@ def _sample_uids(data: DataProto) -> list[str]:
 def assemble_batch_reward(
     data: DataProto, chunks: list[DataProto], outputs: list[dict[str, Any]]
 ) -> DataProto:
-    """Validate local reward matrices and restore the global input order."""
+    """Restore worker results to the input order."""
     expected_uids = _sample_uids(data)
     if len(chunks) != len(outputs):
         raise ValueError(f"Expected {len(chunks)} Worker outputs, got {len(outputs)}.")
@@ -120,48 +120,11 @@ def assemble_batch_reward(
     names = None
     rows: dict[str, tuple[torch.Tensor, torch.Tensor, dict[str, Any]]] = {}
     for chunk, output in zip(chunks, outputs, strict=True):
-        if not isinstance(output, dict):
-            raise TypeError("Batch-capable Worker output must be a dict.")
-        local_uids = output.get("sample_uid")
-        if local_uids is None:
-            raise ValueError("Batch reward output is missing sample_uid.")
-        local_uids = [str(value) for value in np.asarray(local_uids, dtype=object).tolist()]
-        if len(local_uids) != len(chunk) or len(set(local_uids)) != len(local_uids):
-            raise ValueError("Batch reward output sample_uid must be unique and match the local chunk size.")
-        if set(local_uids) != set(_sample_uids(chunk)):
-            raise ValueError("Batch reward output sample_uid does not match its local chunk.")
-
-        reward_names = output.get("reward_names")
-        if not isinstance(reward_names, (list, tuple)) or not reward_names:
-            raise ValueError("Batch reward output reward_names must be a non-empty list.")
-        reward_names = list(reward_names)
-        if any(not isinstance(name, str) for name in reward_names) or len(set(reward_names)) != len(reward_names):
-            raise ValueError("Batch reward output reward_names must contain unique strings.")
+        local_uids, reward_names, scores, mask, extra_info = _unpack_worker_output(chunk, output)
         if names is None:
             names = reward_names
         elif reward_names != names:
             raise ValueError("Batch reward output reward_names disagree across Workers.")
-
-        scores = output.get("rm_scores")
-        mask = output.get("reward_valid_mask")
-        if (
-            not isinstance(scores, torch.Tensor)
-            or scores.dtype != torch.float32
-            or scores.shape != (len(chunk), len(names))
-        ):
-            raise ValueError("Batch reward output rm_scores must be float32 with shape (B_local, K).")
-        if not torch.isfinite(scores).all():
-            raise ValueError("Batch reward output rm_scores must contain only finite values.")
-        if not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool or mask.shape != scores.shape:
-            raise ValueError("Batch reward output reward_valid_mask must be bool with shape (B_local, K).")
-        if not mask.all():
-            raise ValueError("Batch reward output contains invalid required reward samples.")
-
-        extra_info = output.get("reward_extra_info")
-        if not isinstance(extra_info, dict) or set(extra_info) != set(names):
-            raise ValueError("Batch reward output reward_extra_info must be keyed by reward_names.")
-        if any(not isinstance(extra_info[name], dict) for name in names):
-            raise ValueError("Batch reward output reward metadata values must be dicts.")
 
         for row, sample_uid in enumerate(local_uids):
             if sample_uid in rows:
@@ -185,6 +148,31 @@ def assemble_batch_reward(
     )
 
 
+def _unpack_worker_output(
+    chunk: DataProto, output: dict[str, Any]
+) -> tuple[list[str], list[str], torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Read a worker result and verify only the fields needed for alignment."""
+    if not isinstance(output, dict):
+        raise TypeError("Batch-capable Worker output must be a dict.")
+
+    values = output.get("sample_uid")
+    if values is None:
+        raise ValueError("Batch reward output is missing sample_uid.")
+    local_uids = [str(value) for value in np.asarray(values, dtype=object).tolist()]
+    if len(local_uids) != len(chunk) or len(set(local_uids)) != len(local_uids):
+        raise ValueError("Batch reward output sample_uid must be unique and match the local chunk size.")
+    if set(local_uids) != set(_sample_uids(chunk)):
+        raise ValueError("Batch reward output sample_uid does not match its local chunk.")
+
+    return (
+        local_uids,
+        list(output["reward_names"]),
+        output["rm_scores"],
+        output["reward_valid_mask"],
+        output["reward_extra_info"],
+    )
+
+
 class BatchRewardCoordinator:
     """Shard a global batch, dispatch local scoring, and assemble ``[B, K]``."""
 
@@ -194,11 +182,19 @@ class BatchRewardCoordinator:
             raise ValueError("Batch reward requires at least one Worker.")
 
     def compute(self, data: DataProto) -> DataProto:
-        chunks = data.chunk(len(self.worker_handles))
+        batch_size = len(data)
+        if batch_size == 0:
+            raise ValueError("Cannot compute batch rewards for an empty DataProto.")
+
+        # ``DataProto.chunk`` requires an equal split.  Validation can contain
+        # fewer samples than the configured worker pool, so dispatch one sample
+        # per worker in that case and leave the remaining workers idle.
+        num_workers = min(batch_size, len(self.worker_handles))
+        chunks = data.chunk(num_workers)
         outputs = ray.get(
             [
                 worker.compute_score_batch.remote(chunk)
-                for worker, chunk in zip(self.worker_handles, chunks, strict=True)
+                for worker, chunk in zip(self.worker_handles[:num_workers], chunks, strict=True)
             ]
         )
         return assemble_batch_reward(data, chunks, outputs)

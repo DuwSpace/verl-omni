@@ -76,6 +76,10 @@ actor_rollout_ref:
       adv_clip_max: 5.0
       mix_beta: 0.5
       ref_kl_coef: 0.0
+      video_weight: 1.0
+      audio_weight: 1.0
+      video_ref_kl_coef: 0.0
+      audio_ref_kl_coef: 0.0
       adaptive_weight_min: 1.0e-05
       dpo_beta: 2000.0
       kl_mask_threshold: 1.0e-05

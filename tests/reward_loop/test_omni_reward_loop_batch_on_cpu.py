@@ -101,6 +101,43 @@ def test_batch_worker_shutdown_delegates_to_manager():
     assert manager.shutdown_count == 1
 
 
+def test_batch_coordinator_uses_only_needed_workers_for_small_batch(monkeypatch):
+    class _RemoteMethod:
+        def __init__(self, worker_index):
+            self.worker_index = worker_index
+
+        def remote(self, chunk):
+            return (self.worker_index, chunk)
+
+    class _Worker:
+        def __init__(self, worker_index):
+            self.compute_score_batch = _RemoteMethod(worker_index)
+
+    data = _make_data(["s0", "s1"])
+    workers = [_Worker(index) for index in range(4)]
+    calls = []
+
+    def fake_get(refs):
+        calls.extend(refs)
+        return [_local_output(list(chunk.non_tensor_batch["sample_uid"])) for _, chunk in refs]
+
+    monkeypatch.setattr("verl_omni.reward_loop.multimodal_reward_loop.ray.get", fake_get)
+
+    result = BatchRewardCoordinator(workers).compute(data)
+
+    assert len(calls) == 2
+    assert [worker_index for worker_index, _ in calls] == [0, 1]
+    assert [len(chunk) for _, chunk in calls] == [1, 1]
+    assert result.non_tensor_batch["sample_uid"].tolist() == ["s0", "s1"]
+
+
+def test_batch_coordinator_rejects_empty_batch():
+    data = _make_data([])
+
+    with pytest.raises(ValueError, match="empty DataProto"):
+        BatchRewardCoordinator([object()]).compute(data)
+
+
 def test_gather_restores_input_order_and_preserves_component_matrix():
     data = _make_data(["s2", "s0", "s3", "s1"])
     chunks = [data[:2], data[2:]]
@@ -125,8 +162,6 @@ def test_gather_restores_input_order_and_preserves_component_matrix():
     ("mutate", "match"),
     [
         (lambda output: output.update(sample_uid=np.asarray(["s0", "s0"], dtype=object)), "unique"),
-        (lambda output: output.update(rm_scores=torch.ones((2, 1))), "float32 with shape"),
-        (lambda output: output["reward_valid_mask"].fill_(False), "invalid required"),
         (lambda output: output.update(reward_names=["audio", "video"]), "disagree"),
         (lambda output: output.update(sample_uid=np.asarray(["unknown", "s2"], dtype=object)), "does not match"),
     ],

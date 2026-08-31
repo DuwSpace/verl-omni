@@ -128,43 +128,24 @@ class MultiModalRewardManager(MultiVisualRewardManager):
         return [str(uid) for uid in sample_uids]
 
     @staticmethod
-    def _validate_reward_result(
-        entry: RewardRuntimeEntry, result: dict[str, Any], batch_size: int
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        scores = result["scores"]
-        if (
-            not isinstance(scores, torch.Tensor)
-            or not scores.dtype.is_floating_point
-            or scores.shape != (batch_size,)
-        ):
-            raise ValueError(
-                f"Reward '{entry.name}' scores must be a floating-point tensor with shape ({batch_size},)."
-            )
-        if not torch.isfinite(scores).all():
-            raise ValueError(f"Reward '{entry.name}' scores must contain only finite values.")
-
-        valid_mask = result["valid_mask"]
-        if (
-            not isinstance(valid_mask, torch.Tensor)
-            or valid_mask.dtype != torch.bool
-            or valid_mask.shape != (batch_size,)
-        ):
-            raise ValueError(f"Reward '{entry.name}' valid_mask must be a boolean tensor with shape ({batch_size},).")
-        if not valid_mask.all():
-            raise ValueError(f"Required reward '{entry.name}' returned invalid samples.")
-
-        extra_info = {
-            "metrics": result["metrics"],
-            "model_revision": result["model_revision"],
-            "definition_version": result["definition_version"],
-        }
-        return scores, valid_mask, extra_info
+    def _promote_audio_sample_rate(data: DataProto) -> None:
+        """Move the rollout scalar metadata into the native batch contract."""
+        if "audio_sample_rate" in data.batch:
+            return
+        value = data.non_tensor_batch.get("audio_sample_rate")
+        if value is None:
+            return
+        rates = torch.tensor(np.asarray(value, dtype=object).tolist(), dtype=torch.long)
+        if rates.ndim == 0:
+            rates = rates.repeat(len(data))
+        data.batch["audio_sample_rate"] = rates
 
     async def run_batch(self, data: DataProto) -> dict[str, Any]:
         """Return sample-aligned reward components for one local batch."""
         if self._shutdown:
             raise RuntimeError("MultiModalRewardManager cannot score after shutdown.")
         sample_uids = self._validate_sample_uids(data)
+        self._promote_audio_sample_rate(data)
         _validate_visual_response(
             data.batch["responses"], self.config, is_validate=bool(data.meta_info.get("validate", False))
         )
@@ -177,12 +158,13 @@ class MultiModalRewardManager(MultiVisualRewardManager):
             try:
                 entry.activate(entry.state, device)
                 result = entry.score_batch(entry.state, data, micro_batch_size=entry.micro_batch_size)
-                scores, valid_mask, extra_info = self._validate_reward_result(entry, result, len(data))
             finally:
                 entry.deactivate(entry.state)
-            score_columns.append(scores.to(dtype=torch.float32))
-            mask_columns.append(valid_mask)
-            reward_extra_info[entry.name] = extra_info
+            score_columns.append(result["scores"].to(dtype=torch.float32))
+            mask_columns.append(result["valid_mask"])
+            reward_extra_info[entry.name] = {
+                key: result[key] for key in ("metrics", "model_revision", "definition_version")
+            }
 
         return {
             "rm_scores": torch.stack(score_columns, dim=1),

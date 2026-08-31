@@ -332,8 +332,11 @@ class TaskRunner:
         # Initialize the workers of the trainer.
         trainer.init_workers()
 
-        # Start the training process.
-        trainer.fit()
+        # Start the training process and stop DataLoader workers before the Ray actor exits.
+        try:
+            trainer.fit()
+        finally:
+            trainer._shutdown_dataloaders()
 
 
 if __name__ == "__main__":

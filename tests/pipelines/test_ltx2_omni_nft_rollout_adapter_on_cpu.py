@@ -143,7 +143,7 @@ def test_ltx2_omni_nft_forward_runs_native_model_and_returns_contract(output_typ
     assert metadata["rl"]["audio_latent_shape"].tolist() == [[7, 8]]
     assert metadata["rl"]["train_timesteps"].tolist() == [[1000.0, 500.0]]
     assert metadata["rl"]["fps"].item() == 24.0
-    assert metadata["rl"]["audio_sample_rate"].item() == 24000
+    assert metadata["rl"]["audio_sample_rate"] == 24000
     prompt_embeddings = metadata["prompt_embeddings"]
     expected_conditions = {
         "prompt_embeds": prompt_context.positive_connector_prompt_embeds,
@@ -203,7 +203,7 @@ def test_ltx2_omni_nft_forward_records_vocoder_sample_rate() -> None:
         vocoder=SimpleNamespace(config=SimpleNamespace(output_sampling_rate=48000)),
         request_inputs=SimpleNamespace(frame_rate=24.0),
     )
-    assert output.output["metadata"]["rl"]["audio_sample_rate"].item() == 48000
+    assert output.output["metadata"]["rl"]["audio_sample_rate"] == 48000
 
 
 @pytest.mark.parametrize(

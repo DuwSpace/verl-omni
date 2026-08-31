@@ -18,7 +18,7 @@ FSDP utilities for verl-omni
 import json
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -85,6 +85,14 @@ def fsdp_summon_full_params(module, *, writeback: bool = False, with_grads: bool
 
 def _param_to_cpu(param):
     if hasattr(param, "full_tensor"):
+        # FSDP2 CPUOffloadPolicy leaves the local DTensor shard on CPU. Move
+        # that shard back to the accelerator before the device-mesh all-gather;
+        # HCCL/NCCL cannot all-gather CPU tensors.
+        mesh_device_type = getattr(getattr(param, "device_mesh", None), "device_type", None)
+        if param.device.type == "cpu" and mesh_device_type not in (None, "cpu"):
+            from verl.utils.device import get_device_id
+
+            param = param.to(get_device_id(), non_blocking=True)
         return param.full_tensor().detach().cpu()
     return param.detach().cpu()
 
@@ -404,18 +412,50 @@ def _layered_summon_lora_params_diffusers(
             block_prefix = name.replace("_fsdp_wrapped_module.", "")
             if name.endswith(".model") or name.endswith(".layers"):
                 continue
-            if fsdp_version(submodule) > 0:
-                with FSDP.summon_full_params(submodule, writeback=False):
-                    sub_lora_params = get_peft_model_state_dict(
-                        peft_model, state_dict=submodule.state_dict(), adapter_name=adapter_name
-                    )
-                    sub_lora_params = {
-                        f"{block_prefix}.{param_name}": _param_to_cpu(param)
-                        for param_name, param in sub_lora_params.items()
+            version = fsdp_version(submodule)
+            if version == 0:
+                continue
+
+            # Do not collect parameters owned by nested FSDP units. They are
+            # gathered when their own unit is visited, avoiding duplicate
+            # collectives and keeping peak memory bounded by one FSDP unit.
+            nested_fsdp_names = {n for n, m in submodule.named_modules() if n and fsdp_version(m) > 0}
+            if not any(
+                "lora_" in param_name
+                for param_name, _ in submodule.named_parameters()
+                if not any(param_name.startswith(f"{nested_name}.") for nested_name in nested_fsdp_names)
+            ):
+                continue
+
+            # FSDP1 requires summon_full_params. FSDP2 parameters are DTensors
+            # and must instead be materialized with full_tensor(); summoning an
+            # FSDP2 CPU-offloaded parameter makes its CPU tensor wrapper point at
+            # NPU/CUDA storage, so state_dict().detach() fails with a device
+            # mismatch.
+            is_fsdp1 = version == 1
+            if is_fsdp1:
+                submodule._is_root = True
+            summon_ctx = FSDP.summon_full_params(submodule, writeback=False) if is_fsdp1 else nullcontext()
+            try:
+                with summon_ctx:
+                    sub_state_dict = {
+                        param_name: param
+                        for param_name, param in submodule.named_parameters()
+                        if not any(param_name.startswith(f"{nested_name}.") for nested_name in nested_fsdp_names)
                     }
-                    lora_params.update(sub_lora_params)
+                    sub_lora_params = get_peft_model_state_dict(
+                        peft_model, state_dict=sub_state_dict, adapter_name=adapter_name
+                    )
+                    lora_params.update(
+                        {
+                            f"{block_prefix}.{param_name}": _param_to_cpu(param)
+                            for param_name, param in sub_lora_params.items()
+                        }
+                    )
+            finally:
+                if is_fsdp1:
                     submodule._is_root = False
-                get_torch_device().empty_cache()
+            get_torch_device().empty_cache()
     return lora_params
 
 

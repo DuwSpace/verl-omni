@@ -23,3 +23,15 @@ those stages are complete, provide a separate validation JSONL with
 - `actor_rollout_ref.rollout.rollout_adapter=old`
 
 The recipe uses `OmniNFTPromptDataset` for prompt-group records.
+
+## Reward checkpoints
+
+The five-reward checkpoint inventory, pinned download commands, host/container
+paths, and SHA-256 verification results are recorded in
+[reward_models.md](reward_models.md).
+
+## Architecture
+
+The rollout/reward call chains, class diagrams, sequence diagrams, and the data
+fields crossing the rollout → reward → trainer-adapter boundary are documented
+in [architecture.md](architecture.md).

@@ -179,6 +179,24 @@ def test_run_batch_preserves_component_order_and_metadata():
     assert all("device" not in entry.state for entry in manager._reward_entries)
 
 
+def test_run_batch_promotes_scalar_audio_sample_rate_metadata():
+    manager = _build_manager()
+    data = _make_batch(batch_size=2)
+    data.non_tensor_batch["audio_sample_rate"] = np.asarray([24_000, 48_000], dtype=object)
+    seen = []
+
+    original_score_batch = manager._reward_entries[0].score_batch
+
+    def score_and_check(state, batch, micro_batch_size):
+        seen.append(batch.batch["audio_sample_rate"].clone())
+        return original_score_batch(state, batch, micro_batch_size)
+
+    manager._reward_entries[0].score_batch = score_and_check
+    _run(manager, data)
+
+    torch.testing.assert_close(seen[0], torch.tensor([24_000, 48_000], dtype=torch.long))
+
+
 def test_routing_weights_are_reserved_manager_metadata():
     routing_weights = {"video": 1.0, "audio": 0.0}
     manager = _build_manager({"visual": _reward_config(routing_weights=routing_weights)})
@@ -341,20 +359,12 @@ def test_invalid_reward_config_fails_closed(overrides, match):
         _build_manager({"visual": _reward_config(**overrides)})
 
 
-@pytest.mark.parametrize(
-    ("invalid_case", "match"),
-    [
-        ("bad_score_shape", "floating-point tensor with shape"),
-        ("nonfinite_score", "finite values"),
-        ("bad_mask_dtype", "boolean tensor with shape"),
-        ("invalid_required", "Required reward"),
-    ],
-)
-def test_invalid_hook_result_fails_closed(invalid_case, match):
+@pytest.mark.parametrize("invalid_case", ["bad_score_shape", "nonfinite_score", "bad_mask_dtype", "invalid_required"])
+def test_run_batch_trusts_reward_hook_result_contract(invalid_case):
     manager = _build_manager({"visual": _reward_config(invalid_case=invalid_case)})
 
-    with pytest.raises((TypeError, ValueError), match=match):
-        _run(manager, _make_batch())
+    result = _run(manager, _make_batch())
+    assert set(result) == {"rm_scores", "reward_valid_mask", "reward_names", "sample_uid", "reward_extra_info"}
 
 
 def test_invalid_sample_uids_fail_closed():
