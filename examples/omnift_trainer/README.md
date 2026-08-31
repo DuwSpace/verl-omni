@@ -32,3 +32,13 @@ components, per-component group normalization, and explicit video/audio routing.
 The reward order is `video_align`, `hpsv3`, `audiobox`, `clap`, `desync`. Video receives weights `1.0`, `1.5`, and `1.0`
 from VideoAlign, HPSv3, and DeSync. Audio receives weights `0.5`, `1.0`, and `1.0` from AudioBox, CLAP, and DeSync.
 
+## Reward checkpoints
+
+Pinned downloads, host/container paths, and SHA-256 checks are in
+[reward_models.md](reward_models.md).
+
+## Architecture
+
+Rollout/reward call chains and the fields crossing the rollout → reward →
+trainer-adapter boundary are in [architecture.md](architecture.md).
+

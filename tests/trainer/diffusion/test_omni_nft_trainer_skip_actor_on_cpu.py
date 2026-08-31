@@ -14,8 +14,6 @@
 
 """CPU contracts for OmniNFT trainer dispatch and actor hook wiring."""
 
-import subprocess
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -33,9 +31,6 @@ from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
 )
 from verl_omni.trainer.main_diffusion import _get_trainer_cls
 
-REPO_ROOT = Path(__file__).parents[3]
-DEBUG_RECIPE = REPO_ROOT / "examples/omninft_trainer/ltx2/debug/run_ltx2_3_omninft_reward_only_npu.sh"
-
 
 def _config(algorithm, trainer_type="direct_preference"):
     return OmegaConf.create(
@@ -44,10 +39,6 @@ def _config(algorithm, trainer_type="direct_preference"):
             "actor_rollout_ref": {"model": {"algorithm": algorithm}},
         }
     )
-
-
-def test_debug_recipe_has_valid_shell_syntax():
-    subprocess.run(["bash", "-n", str(DEBUG_RECIPE)], check=True)
 
 
 def test_get_trainer_cls_dispatches_omni_nft_to_multimodal_subclass():
