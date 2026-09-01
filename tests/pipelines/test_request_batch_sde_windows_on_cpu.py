@@ -16,7 +16,7 @@
 
 import torch
 
-from verl_omni.pipelines.request_batch import sample_per_sample_sde_windows
+from verl_omni.pipelines.request_batch import collate_prompt_mask, collate_prompt_rows, sample_per_sample_sde_windows
 
 
 def _advanced_generator(seed: int, latent_numel: int = 8) -> torch.Generator:
@@ -49,3 +49,30 @@ def test_per_sample_sde_windows_match_serial_and_ignore_pack_order():
         device="cpu",
     )
     assert packed == [serial[i] for i in packed_order]
+
+
+def test_collate_prompt_rows_left_pads_to_target_len() -> None:
+    prompts = [{"prompt_token_ids": [10, 20]}, {"prompt_token_ids": [30]}]
+    ids, lengths = collate_prompt_rows(
+        prompts,
+        ("prompt_token_ids",),
+        None,
+        device=torch.device("cpu"),
+        field_name="prompt_token_ids",
+        pad_value=0,
+        pad_side="left",
+        target_len=4,
+    )
+    assert ids.tolist() == [[0, 0, 10, 20], [0, 0, 0, 30]]
+    assert lengths == [2, 1]
+    mask = collate_prompt_mask(
+        prompts,
+        ("prompt_mask",),
+        None,
+        device=torch.device("cpu"),
+        field_name="prompt_mask",
+        token_lengths=lengths,
+        target_seq_len=4,
+        pad_side="left",
+    )
+    assert mask.tolist() == [[False, False, True, True], [False, False, False, True]]

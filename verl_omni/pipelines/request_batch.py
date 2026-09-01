@@ -105,6 +105,8 @@ def collate_prompt_rows(
     device: torch.device,
     field_name: str,
     pad_value: int = 0,
+    pad_side: str = "right",
+    target_len: int | None = None,
 ) -> tuple[torch.Tensor | None, list[int] | None]:
     """Pad and stack per-request 1D prompt fields into a batched ``(N, L)`` tensor.
 
@@ -113,6 +115,8 @@ def collate_prompt_rows(
     the whole batch instead. Returns ``(None, None)`` if no request provides
     the field.
     """
+    if pad_side not in {"left", "right"}:
+        raise ValueError(f"pad_side must be 'left' or 'right', got {pad_side!r}.")
     default_rows, default_lengths = _rows_from_default(default_value, device=device, field_name=field_name)
     if default_rows is not None:
         if len(prompts) > 1 and default_rows.shape[0] != len(prompts):
@@ -136,17 +140,22 @@ def collate_prompt_rows(
         raise ValueError(f"Cannot batch requests with a mix of provided and missing {field_name}.")
 
     typed_rows = [row for row in rows if row is not None]
-    target_len = max(int(row.shape[0]) for row in typed_rows)
+    max_row_len = max(int(row.shape[0]) for row in typed_rows)
+    seq_len = max_row_len if target_len is None else int(target_len)
     result = torch.full(
-        (len(typed_rows), target_len),
+        (len(typed_rows), seq_len),
         pad_value,
         dtype=typed_rows[0].dtype,
         device=typed_rows[0].device,
     )
     lengths: list[int] = []
     for idx, row in enumerate(typed_rows):
+        row = row[:seq_len]
         row_len = int(row.shape[0])
-        result[idx, :row_len] = row
+        if pad_side == "left":
+            result[idx, seq_len - row_len :] = row
+        else:
+            result[idx, :row_len] = row
         lengths.append(row_len)
     return result, lengths
 
@@ -160,11 +169,12 @@ def collate_prompt_mask(
     field_name: str,
     token_lengths: list[int] | None,
     target_seq_len: int | None,
+    pad_side: str = "right",
 ) -> torch.Tensor | None:
     """Build a boolean attention mask for a packed request batch.
 
     Prefers an explicit mask field from ``prompts`` / ``default_value``. If
-    that is missing, synthesizes a left-aligned mask from ``token_lengths``
+    that is missing, synthesizes a padding mask from ``token_lengths``
     and ``target_seq_len``. Returns ``None`` when neither source is available.
     """
     mask, _ = collate_prompt_rows(
@@ -174,24 +184,22 @@ def collate_prompt_mask(
         device=device,
         field_name=field_name,
         pad_value=0,
+        pad_side=pad_side,
+        target_len=target_seq_len,
     )
     if mask is not None:
-        mask = mask != 0
-        if target_seq_len is not None:
-            if mask.shape[1] < target_seq_len:
-                padded = torch.zeros((mask.shape[0], target_seq_len), dtype=torch.bool, device=mask.device)
-                padded[:, : mask.shape[1]] = mask
-                mask = padded
-            elif mask.shape[1] > target_seq_len:
-                mask = mask[:, :target_seq_len]
-        return mask
+        return mask != 0
 
     if token_lengths is None or target_seq_len is None:
         return None
 
     mask = torch.zeros((len(token_lengths), target_seq_len), dtype=torch.bool, device=device)
     for idx, row_len in enumerate(token_lengths):
-        mask[idx, :row_len] = True
+        valid = min(int(row_len), int(target_seq_len))
+        if pad_side == "left":
+            mask[idx, int(target_seq_len) - valid :] = True
+        else:
+            mask[idx, :valid] = True
     return mask
 
 
