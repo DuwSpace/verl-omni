@@ -331,6 +331,9 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         if getattr(self.config, "step_execution", False):
             engine_args["step_execution"] = True
 
+        self._bridge_diffusion_parallel_args(engine_args)
+        self._bridge_diffusion_batch_size(engine_args)
+
         diffusion_master_port, diffusion_master_sock = get_free_port("127.0.0.1", with_alive_sock=True)
         diffusion_master_sock.close()
 
@@ -359,6 +362,39 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
         self.engine = engine_client
         self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+
+    def _bridge_diffusion_parallel_args(self, engine_args: dict[str, Any]) -> None:
+        """Forward orchestrator-owned diffusion SP args from the rollout config.
+
+        vLLM-Omni pin 44448565 keeps ``ulysses_degree``/``ulysses_mode``/
+        ``ring_degree``/``allgather_degree`` on ``OrchestratorArgs``:
+        ``OmniEngineArgs.from_cli_args`` drops them, and verl's
+        ``FlexibleArgumentParser`` namespace has no explicit-key tracking, so
+        CLI values never reach ``AsyncOmni``. The Hydra-injected
+        ``engine_kwargs.vllm_omni`` dict is the authoritative record of
+        user-specified settings, so bridge from there.
+        """
+        if self._ar_mode:
+            return
+
+        engine_kwargs = getattr(self.config, "engine_kwargs", None) or {}
+        omni_kwargs = engine_kwargs.get("vllm_omni", {}) or {}
+        bridged = {}
+        for key in ("ulysses_degree", "ulysses_mode", "ring_degree", "allgather_degree"):
+            value = omni_kwargs.get(key)
+            if value is not None:
+                bridged[key] = value
+        if bridged:
+            engine_args.update(bridged)
+            logger.info("Bridged diffusion SP args from rollout config: %s", bridged)
+
+    def _bridge_diffusion_batch_size(self, engine_args: dict[str, Any]) -> None:
+        max_batch_size = int(engine_args.get("max_num_seqs") or 1)
+        if self._ar_mode or getattr(self.config, "step_execution", False):
+            return
+
+        # Pin 44448565 overwrites od_config.max_num_seqs with this AsyncOmni-level value.
+        engine_args["diffusion_batch_size"] = max_batch_size
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
