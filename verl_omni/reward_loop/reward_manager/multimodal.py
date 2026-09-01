@@ -13,13 +13,15 @@
 # limitations under the License.
 """Batch-preserving reward manager for multimodal training."""
 
+import asyncio
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol, runtime_checkable
 
 import numpy as np
 import torch
 from verl import DataProto
-from verl.utils.device import get_device_id
+from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.import_utils import load_module
 
 from .multi import MultiVisualRewardManager
@@ -62,8 +64,15 @@ class MultiModalRewardManager(MultiVisualRewardManager):
             reward_model_tokenizer,
         )
         self.component_order = self._validate_config()
+        self._parallel_groups = self._validate_parallel_groups()
         self._reward_entries = [
             self._initialize_reward(name, config.reward.reward_functions[name]) for name in self.component_order
+        ]
+        entries_by_name = {entry.name: entry for entry in self._reward_entries}
+        grouped_names = {name for names in self._parallel_groups.values() for name in names}
+        self._schedule_units = [
+            tuple(entries_by_name[name] for name in names)
+            for names in self._build_schedule_names(grouped_names)
         ]
         self._shutdown = False
 
@@ -80,6 +89,78 @@ class MultiModalRewardManager(MultiVisualRewardManager):
         ):
             raise ValueError("reward.component_order must be non-empty, unique, and match reward.reward_functions.")
         return component_order
+
+    def _validate_parallel_groups(self) -> dict[str, tuple[str, ...]]:
+        reward_config = self.config.reward
+        native_config = (
+            reward_config.get("native", {})
+            if isinstance(reward_config, Mapping)
+            else getattr(reward_config, "native", {})
+        )
+        if native_config is None:
+            native_config = {}
+        if not isinstance(native_config, Mapping):
+            raise ValueError("reward.native must be a mapping.")
+
+        parallel_groups = native_config.get("parallel_groups", {})
+        if parallel_groups is None:
+            parallel_groups = {}
+        if not isinstance(parallel_groups, Mapping):
+            raise ValueError("reward.native.parallel_groups must be a mapping.")
+
+        member_to_group = {}
+        validated = {}
+        for group_name, group_config in parallel_groups.items():
+            if not isinstance(group_name, str) or not group_name:
+                raise ValueError("parallel group names must be non-empty strings.")
+            if not isinstance(group_config, Mapping):
+                raise ValueError(f"Parallel group '{group_name}' must be a mapping.")
+            members = group_config.get("rewards")
+            if isinstance(members, (str, bytes)) or not isinstance(members, Sequence):
+                raise ValueError(f"Parallel group '{group_name}' rewards must be a list.")
+            members = list(members)
+            if len(members) < 2:
+                raise ValueError(f"Parallel group '{group_name}' must contain at least two rewards.")
+            if any(not isinstance(name, str) or not name for name in members):
+                raise ValueError(f"Parallel group '{group_name}' rewards must be non-empty strings.")
+            if len(set(members)) != len(members):
+                raise ValueError(f"Parallel group '{group_name}' contains duplicate rewards.")
+
+            unknown = [name for name in members if name not in self.component_order]
+            if unknown:
+                raise ValueError(f"Parallel group '{group_name}' contains unknown rewards: {unknown}.")
+            positions = sorted(self.component_order.index(name) for name in members)
+            expected = list(range(positions[0], positions[0] + len(positions)))
+            if positions != expected:
+                raise ValueError(
+                    f"Parallel group '{group_name}' rewards must be a contiguous component_order subsequence."
+                )
+            canonical_members = tuple(self.component_order[index] for index in expected)
+            for name in canonical_members:
+                if name in member_to_group:
+                    raise ValueError(f"Reward '{name}' belongs to multiple parallel groups.")
+                member_to_group[name] = group_name
+            validated[group_name] = canonical_members
+        return validated
+
+    def _build_schedule_names(self, grouped_names: set[str]) -> list[tuple[str, ...]]:
+        group_by_reward = {
+            reward_name: group_name
+            for group_name, reward_names in self._parallel_groups.items()
+            for reward_name in reward_names
+        }
+        units = []
+        seen_groups = set()
+        for reward_name in self.component_order:
+            group_name = group_by_reward.get(reward_name)
+            if group_name is None:
+                units.append((reward_name,))
+            elif group_name not in seen_groups:
+                units.append(self._parallel_groups[group_name])
+                seen_groups.add(group_name)
+        if grouped_names != set(group_by_reward):
+            raise RuntimeError("Parallel group schedule does not match its validated members.")
+        return units
 
     def _initialize_reward(self, name: str, entry_config) -> RewardRuntimeEntry:
         config = dict(entry_config)
@@ -140,6 +221,58 @@ class MultiModalRewardManager(MultiVisualRewardManager):
             rates = rates.repeat(len(data))
         data.batch["audio_sample_rate"] = rates
 
+    @staticmethod
+    def _synchronize_device(device) -> None:
+        synchronize = getattr(get_torch_device(), "synchronize", None)
+        if synchronize is None:
+            return
+        try:
+            synchronize(device)
+        except TypeError:
+            synchronize()
+
+    @staticmethod
+    def _run_sequential_entry(entry: RewardRuntimeEntry, data: DataProto, device):
+        try:
+            entry.activate(entry.state, device)
+            return entry.score_batch(entry.state, data, micro_batch_size=entry.micro_batch_size)
+        finally:
+            entry.deactivate(entry.state)
+
+    async def _run_parallel_unit(self, entries, data: DataProto, device):
+        activated = []
+        results = None
+        failure = None
+        try:
+            for entry in entries:
+                activated.append(entry)
+                entry.activate(entry.state, device)
+
+            gathered = await asyncio.gather(
+                *(
+                    asyncio.to_thread(entry.score_batch, entry.state, data, micro_batch_size=entry.micro_batch_size)
+                    for entry in entries
+                ),
+                return_exceptions=True,
+            )
+            errors = [result for result in gathered if isinstance(result, BaseException)]
+            if errors:
+                raise errors[0]
+            results = gathered
+            self._synchronize_device(device)
+        except BaseException as exc:
+            failure = exc
+        finally:
+            for entry in activated:
+                try:
+                    entry.deactivate(entry.state)
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+        if failure is not None:
+            raise failure
+        return results
+
     async def run_batch(self, data: DataProto) -> dict[str, Any]:
         """Return sample-aligned reward components for one local batch."""
         if self._shutdown:
@@ -154,17 +287,17 @@ class MultiModalRewardManager(MultiVisualRewardManager):
         mask_columns = []
         reward_extra_info = {}
         device = get_device_id()
-        for entry in self._reward_entries:
-            try:
-                entry.activate(entry.state, device)
-                result = entry.score_batch(entry.state, data, micro_batch_size=entry.micro_batch_size)
-            finally:
-                entry.deactivate(entry.state)
-            score_columns.append(result["scores"].to(dtype=torch.float32))
-            mask_columns.append(result["valid_mask"])
-            reward_extra_info[entry.name] = {
-                key: result[key] for key in ("metrics", "model_revision", "definition_version")
-            }
+        for entries in self._schedule_units:
+            if len(entries) == 1:
+                results = [self._run_sequential_entry(entries[0], data, device)]
+            else:
+                results = await self._run_parallel_unit(entries, data, device)
+            for entry, result in zip(entries, results, strict=True):
+                score_columns.append(result["scores"].to(dtype=torch.float32))
+                mask_columns.append(result["valid_mask"])
+                reward_extra_info[entry.name] = {
+                    key: result[key] for key in ("metrics", "model_revision", "definition_version")
+                }
 
         return {
             "rm_scores": torch.stack(score_columns, dim=1),

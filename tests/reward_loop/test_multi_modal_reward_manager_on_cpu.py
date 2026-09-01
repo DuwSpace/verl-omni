@@ -14,6 +14,8 @@
 """CPU contract tests for MultiModalRewardManager."""
 
 import os
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -107,7 +109,9 @@ def _reward_config(**overrides):
     return entry
 
 
-def _make_config(reward_functions=None, component_order=None, aggregation="preserve_components"):
+def _make_config(
+    reward_functions=None, component_order=None, aggregation="preserve_components", parallel_groups=None
+):
     if reward_functions is None:
         reward_functions = {"visual": _reward_config()}
     if component_order is None:
@@ -119,6 +123,13 @@ def _make_config(reward_functions=None, component_order=None, aggregation="prese
     config.reward.component_order = component_order
     config.reward.reward_functions = OmegaConf.create(reward_functions)
     config.reward.reward_model.enable = False
+    if parallel_groups is not None:
+        OmegaConf.update(
+            config,
+            "reward.native",
+            {"parallel_groups": parallel_groups},
+            force_add=True,
+        )
     return config
 
 
@@ -129,9 +140,11 @@ def _make_batch(batch_size=3):
     )
 
 
-def _build_manager(reward_functions=None, component_order=None, aggregation="preserve_components"):
+def _build_manager(
+    reward_functions=None, component_order=None, aggregation="preserve_components", parallel_groups=None
+):
     return MultiModalRewardManager(
-        _make_config(reward_functions, component_order, aggregation),
+        _make_config(reward_functions, component_order, aggregation, parallel_groups),
         MagicMock(),
         compute_score=None,
     )
@@ -250,6 +263,126 @@ def test_run_batch_keeps_only_one_reward_active(monkeypatch):
         ("score", "audio", 3),
         ("deactivate", "audio", None),
     ]
+
+
+def test_parallel_group_scores_overlap_and_preserve_component_order(monkeypatch):
+    reward_functions = {
+        "visual": _reward_config(offset=10.0),
+        "audio": _reward_config(offset=20.0),
+        "pending": _reward_config(offset=30.0),
+    }
+    manager = _build_manager(
+        reward_functions,
+        component_order=["visual", "audio", "pending"],
+        parallel_groups={"small": {"rewards": ["audio", "visual"]}},
+    )
+    events = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+    sync_calls = []
+
+    class _Accelerator:
+        def synchronize(self, device):
+            sync_calls.append(device)
+
+    monkeypatch.setattr("verl_omni.reward_loop.reward_manager.multimodal.get_device_id", lambda: "cpu:fake")
+    monkeypatch.setattr("verl_omni.reward_loop.reward_manager.multimodal.get_torch_device", lambda: _Accelerator())
+    for entry in manager._reward_entries[:2]:
+        original_activate = entry.activate
+        original_score_batch = entry.score_batch
+        original_deactivate = entry.deactivate
+
+        def activate_parallel(state, device, name=entry.name, activate_hook=original_activate):
+            with lock:
+                events.append(("activate", name))
+            activate_hook(state, device)
+
+        def deactivate_parallel(state, name=entry.name, deactivate_hook=original_deactivate):
+            with lock:
+                events.append(("deactivate", name))
+            deactivate_hook(state)
+
+        def score_parallel(state, batch, micro_batch_size, name=entry.name, score_hook=original_score_batch):
+            with lock:
+                events.append(("score_start", name))
+            barrier.wait(timeout=2)
+            time.sleep(0.01)
+            result = score_hook(state, batch, micro_batch_size)
+            with lock:
+                events.append(("score_end", name))
+            return result
+
+        entry.activate = activate_parallel
+        entry.score_batch = score_parallel
+        entry.deactivate = deactivate_parallel
+
+    result = _run(manager, _make_batch())
+
+    assert result["reward_names"] == ["visual", "audio", "pending"]
+    torch.testing.assert_close(
+        result["rm_scores"],
+        torch.tensor([[10.0, 20.0, 30.0], [11.0, 21.0, 31.0], [12.0, 22.0, 32.0]]),
+    )
+    assert sync_calls == ["cpu:fake"]
+    assert [event[0] for event in events] == [
+        "activate",
+        "activate",
+        "score_start",
+        "score_start",
+        "score_end",
+        "score_end",
+        "deactivate",
+        "deactivate",
+    ]
+    assert manager._reward_entries[0].state["activate_calls"] == 1
+    assert manager._reward_entries[1].state["activate_calls"] == 1
+    assert manager._reward_entries[2].state["activate_calls"] == 1
+
+
+@pytest.mark.parametrize(
+    ("parallel_groups", "match"),
+    [
+        ({"single": {"rewards": ["visual"]}}, "at least two"),
+        ({"unknown": {"rewards": ["visual", "missing"]}}, "unknown rewards"),
+        ({"duplicate": {"rewards": ["visual", "visual"]}}, "duplicate"),
+        (
+            {"first": {"rewards": ["visual", "audio"]}, "second": {"rewards": ["audio", "pending"]}},
+            "multiple",
+        ),
+        ({"non_contiguous": {"rewards": ["visual", "pending"]}}, "contiguous"),
+    ],
+)
+def test_invalid_parallel_group_config_fails_closed(parallel_groups, match):
+    reward_functions = {
+        "visual": _reward_config(),
+        "audio": _reward_config(),
+        "pending": _reward_config(),
+    }
+    with pytest.raises(ValueError, match=match):
+        _build_manager(reward_functions, parallel_groups=parallel_groups)
+
+
+@pytest.mark.parametrize("failing_name", ["audio", "visual"])
+def test_parallel_group_failure_deactivates_all_started_members_and_stops_dispatch(failing_name):
+    reward_functions = {
+        "visual": _reward_config(invalid_case="score_error" if failing_name == "visual" else None),
+        "audio": _reward_config(invalid_case="activate_error" if failing_name == "audio" else None),
+        "pending": _reward_config(),
+    }
+    manager = _build_manager(
+        reward_functions,
+        component_order=["visual", "audio", "pending"],
+        parallel_groups={"small": {"rewards": ["visual", "audio"]}},
+    )
+
+    with pytest.raises(RuntimeError):
+        _run(manager, _make_batch())
+
+    visual, audio, pending = manager._reward_entries
+    assert visual.state["deactivate_calls"] == 1
+    assert audio.state["deactivate_calls"] == 1
+    assert pending.state["activate_calls"] == 0
+    assert pending.state["score_calls"] == 0
 
 
 @pytest.mark.parametrize(
