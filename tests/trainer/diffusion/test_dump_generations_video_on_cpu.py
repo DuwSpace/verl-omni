@@ -25,14 +25,16 @@ import os
 import subprocess
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
+from verl import DataProto
 
 # ``export_to_video`` (and its ffmpeg backend) is only needed for the video
 # branch; skip the whole module rather than hard-fail where it is absent.
 pytest.importorskip("diffusers")
 
-from verl_omni.trainer.diffusion.ray_diffusion_trainer import BaseRayDiffusionTrainer
+from verl_omni.trainer.diffusion.ray_diffusion_trainer import BaseRayDiffusionTrainer, _generation_audio_fields
 
 
 def _dump(dump_path, outputs, *, max_samples=None, global_steps=0, audios=None, audio_sample_rates=None):
@@ -127,3 +129,48 @@ class TestDumpGenerations:
         rows = _read_jsonl(tmp_path)
         assert len(rows) == 1
         assert rows[0]["reward"] == 0.0
+
+
+class TestGenerationAudioFields:
+    def test_reads_tensor_sample_rate_from_batch(self):
+        batch = DataProto.from_dict(
+            tensors={
+                "audio": torch.zeros(2, 1, 8),
+                "audio_sample_rate": torch.tensor([24_000, 48_000], dtype=torch.long),
+            }
+        )
+        audios, rates = _generation_audio_fields(batch)
+        assert audios.shape == (2, 1, 8)
+        assert rates.tolist() == [24_000, 48_000]
+
+    def test_reads_python_sample_rate_from_non_tensor_batch(self):
+        batch = DataProto.from_dict(
+            tensors={"audio": torch.zeros(2, 1, 8)},
+            non_tensors={"audio_sample_rate": np.asarray([24_000, 48_000], dtype=object)},
+        )
+        audios, rates = _generation_audio_fields(batch)
+        assert audios.shape == (2, 1, 8)
+        assert list(rates) == [24_000, 48_000]
+
+    def test_does_not_invent_a_sample_rate(self):
+        batch = DataProto.from_dict(tensors={"audio": torch.zeros(1, 1, 8)})
+        audios, rates = _generation_audio_fields(batch)
+        assert audios.shape == (1, 1, 8)
+        assert rates is None
+
+    def test_dump_muxes_audio_when_sample_rate_is_a_batch_tensor(self, tmp_path):
+        from imageio_ffmpeg import get_ffmpeg_exe
+
+        outputs = torch.randint(256, (1, 8, 3, 16, 16), dtype=torch.uint8)
+        batch = DataProto.from_dict(
+            tensors={
+                "audio": torch.sin(torch.linspace(0, 100, 48_000)).reshape(1, 1, -1),
+                "audio_sample_rate": torch.tensor([48_000], dtype=torch.long),
+            }
+        )
+        audios, rates = _generation_audio_fields(batch)
+        _dump(tmp_path, outputs, audios=audios, audio_sample_rates=rates)
+
+        path = os.path.join(str(tmp_path), "0", "0.mp4")
+        probe = subprocess.run([get_ffmpeg_exe(), "-i", path], capture_output=True, text=True)
+        assert "Video:" in probe.stderr and "Audio: aac" in probe.stderr

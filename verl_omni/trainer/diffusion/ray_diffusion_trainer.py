@@ -133,6 +133,16 @@ def compute_advantage(
     return data
 
 
+def _generation_audio_fields(batch: DataProto) -> tuple[Any, Any]:
+    """Read audio and sample rate from tensor or non-tensor generation fields."""
+    audio = batch.batch.get("audio") if "audio" in batch.batch else batch.non_tensor_batch.get("audio")
+    if "audio_sample_rate" in batch.non_tensor_batch:
+        return audio, batch.non_tensor_batch.get("audio_sample_rate")
+    if "audio_sample_rate" in batch.batch:
+        return audio, batch.batch.get("audio_sample_rate")
+    return audio, None
+
+
 class BaseRayDiffusionTrainer(ABC):
     """Common Ray trainer infrastructure for diffusion training.
 
@@ -401,6 +411,7 @@ class BaseRayDiffusionTrainer(ABC):
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
 
+            audios, audio_sample_rates = _generation_audio_fields(batch)
             self._dump_generations(
                 inputs=inputs,
                 outputs=outputs,
@@ -410,10 +421,8 @@ class BaseRayDiffusionTrainer(ABC):
                 dump_path=rollout_data_dir,
                 max_samples=self.config.trainer.get("rollout_data_max_samples", None),
                 fps=int(self.config.trainer.get("video_fps", 24)),
-                audios=batch.batch.get("audio", batch.non_tensor_batch.get("audio")),
-                audio_sample_rates=batch.non_tensor_batch.get(
-                    "audio_sample_rate", batch.batch.get("audio_sample_rate")
-                ),
+                audios=audios,
+                audio_sample_rates=audio_sample_rates,
             )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores, audios=None, audio_sample_rates=None):
@@ -551,14 +560,9 @@ class BaseRayDiffusionTrainer(ABC):
             output_images = test_output_gen_batch.batch["responses"]
             sample_outputs.append(output_images)
             batch_size = len(output_images)
-            sample_audios.extend(batch_items(test_output_gen_batch.batch.get("audio"), batch_size, "audio"))
-            sample_audio_sample_rates.extend(
-                batch_items(
-                    test_output_gen_batch.non_tensor_batch.get("audio_sample_rate"),
-                    batch_size,
-                    "audio_sample_rate",
-                )
-            )
+            audios, audio_sample_rates = _generation_audio_fields(test_output_gen_batch)
+            sample_audios.extend(batch_items(audios, batch_size, "audio"))
+            sample_audio_sample_rates.extend(batch_items(audio_sample_rates, batch_size, "audio_sample_rate"))
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -1966,6 +1970,7 @@ class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
             extra["sample_uid"] = [str(uid) for uid in sample_uids]
         fps = batch.batch.get("fps")
         dump_fps = int(fps[0].item()) if fps is not None else int(self.config.trainer.get("video_fps", 24))
+        audios, audio_sample_rates = _generation_audio_fields(batch)
         self._dump_generations(
             inputs=inputs,
             outputs=batch.batch["responses"],
@@ -1975,8 +1980,8 @@ class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
             dump_path=rollout_data_dir,
             max_samples=self.config.trainer.get("rollout_data_max_samples", None),
             fps=dump_fps,
-            audios=batch.batch.get("audio"),
-            audio_sample_rates=batch.batch.get("audio_sample_rate"),
+            audios=audios,
+            audio_sample_rates=audio_sample_rates,
         )
 
     def _log_rollout_data(
@@ -1999,6 +2004,7 @@ class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
                 extra.setdefault("sample_uid", [str(uid) for uid in sample_uids])
             fps = batch.batch.get("fps")
             dump_fps = int(fps[0].item()) if fps is not None else int(self.config.trainer.get("video_fps", 24))
+            audios, audio_sample_rates = _generation_audio_fields(batch)
             self._dump_generations(
                 inputs=inputs,
                 outputs=batch.batch["responses"],
@@ -2008,8 +2014,8 @@ class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
                 dump_path=rollout_data_dir,
                 max_samples=self.config.trainer.get("rollout_data_max_samples", None),
                 fps=dump_fps,
-                audios=batch.batch.get("audio"),
-                audio_sample_rates=batch.batch.get("audio_sample_rate"),
+                audios=audios,
+                audio_sample_rates=audio_sample_rates,
             )
 
     def _compute_reward_colocate(self, batch: DataProto) -> DataProto:
