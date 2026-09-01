@@ -14,6 +14,7 @@
 """CPU contract tests for the staged LTX-2.3 OmniNFT recipe."""
 
 import asyncio
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,49 +30,67 @@ REPO_ROOT = Path(__file__).parents[2]
 RECIPE = REPO_ROOT / "examples/omnift_trainer/ltx2/run_ltx2_3_omninft_lora_npu.sh"
 
 
+def _run_recipe_launcher(tmp_path, reward_parallel_groups=None):
+    ascend_home = tmp_path / "ascend-toolkit"
+    nnal_home = tmp_path / "nnal" / "atb"
+    fake_bin = tmp_path / "bin"
+    for directory in (ascend_home, nnal_home, fake_bin):
+        directory.mkdir(parents=True)
+    for env_script in (ascend_home / "set_env.sh", nnal_home / "set_env.sh"):
+        env_script.write_text("", encoding="utf-8")
+
+    captured_args = tmp_path / "python-args.txt"
+    python_stub = fake_bin / "python3"
+    python_stub.write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' "$@" > "$CAPTURED_ARGS"\n', encoding="utf-8")
+    python_stub.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "ASCEND_HOME_PATH": str(ascend_home),
+            "CAPTURED_ARGS": str(captured_args),
+            "OUTPUT_DIR": str(tmp_path / "outputs"),
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+        }
+    )
+    if reward_parallel_groups is None:
+        env.pop("REWARD_PARALLEL_GROUPS", None)
+    else:
+        env["REWARD_PARALLEL_GROUPS"] = reward_parallel_groups
+
+    result = subprocess.run([str(RECIPE)], cwd=REPO_ROOT, env=env, text=True, capture_output=True)
+    args = captured_args.read_text(encoding="utf-8").splitlines() if captured_args.exists() else []
+    return result, args
+
+
 def test_recipe_has_valid_shell_syntax():
     subprocess.run(["bash", "-n", str(RECIPE)], check=True)
 
 
-def test_recipe_freezes_omninft_direct_preference_contract():
-    recipe = RECIPE.read_text(encoding="utf-8")
-    required = (
-        "python3 -m verl_omni.trainer.main_diffusion",
-        "DATA_DIR=",
-        "train.parquet",
-        "test.parquet",
-        "algorithm.trainer_type=direct_preference",
-        "algorithm.sample_source=online",
-        "algorithm.paired_preference=false",
-        "actor_rollout_ref.model.algorithm=omni_nft",
-        "actor_rollout_ref.model.model_type=omni_nft_model",
-        "actor_rollout_ref.actor.strategy=fsdp2",
-        "actor_rollout_ref.actor.diffusion_loss.loss_mode=omni_nft",
-        "actor_rollout_ref.actor.diffusion_loss.video_weight=1.0",
-        "actor_rollout_ref.actor.diffusion_loss.audio_weight=1.0",
-        "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1",
-        "actor_rollout_ref.rollout.n=8",
-        "actor_rollout_ref.rollout.calculate_log_probs=False",
-        "actor_rollout_ref.rollout.rollout_adapter=old",
-        "actor_rollout_ref.rollout.agent.default_agent_loop=ltx2_omni_nft_single_turn_agent",
-        "reward.reward_manager.name=MultiModalRewardManager",
-        "reward.aggregation=preserve_components",
-        "reward.component_order=[video_align,hpsv3,audiobox,clap,desync]",
-        "reward.reward_functions.video_align.routing_weights.video=1.0",
-        "reward.reward_functions.hpsv3.routing_weights.video=1.5",
-        "reward.reward_functions.audiobox.routing_weights.audio=0.5",
-        "reward.reward_functions.clap.routing_weights.audio=1.0",
-        "reward.reward_functions.desync.routing_weights.video=1.0",
-        "reward.reward_functions.desync.routing_weights.audio=1.0",
-    )
-    forbidden = (
-        "calculate_log_probs=True",
-        "algorithm=diffusion_nft",
-        "rollout.algo.sde_",
-    )
+def test_recipe_defaults_to_sequential_native_rewards(tmp_path):
+    result, args = _run_recipe_launcher(tmp_path)
 
-    assert all(setting in recipe for setting in required)
-    assert all(setting not in recipe for setting in forbidden)
+    assert result.returncode == 0, result.stderr
+    assert "reward.component_order=[video_align,hpsv3,audiobox,clap,desync]" in args
+    assert not any("reward.native.parallel_groups" in arg for arg in args)
+
+
+def test_recipe_opt_in_adds_only_audiobox_clap_parallel_group(tmp_path):
+    result, args = _run_recipe_launcher(tmp_path, reward_parallel_groups="audiobox_clap")
+
+    assert result.returncode == 0, result.stderr
+    assert "reward.component_order=[video_align,hpsv3,audiobox,clap,desync]" in args
+    assert [arg for arg in args if "reward.native.parallel_groups" in arg] == [
+        "+reward.native.parallel_groups.audiobox_clap.rewards=[audiobox,clap]"
+    ]
+
+
+def test_recipe_rejects_unapproved_parallel_group_values(tmp_path):
+    result, args = _run_recipe_launcher(tmp_path, reward_parallel_groups="video_align_hpsv3")
+
+    assert result.returncode == 2
+    assert args == []
+    assert "expected empty or audiobox_clap" in result.stderr
 
 
 def test_omninft_worker_reuses_shared_run_and_postprocess():

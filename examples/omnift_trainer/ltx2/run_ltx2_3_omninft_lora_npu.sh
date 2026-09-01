@@ -18,9 +18,10 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
 DATA_DIR=${DATA_DIR:-$REPO_ROOT/data/omninft/vggsound/verl_omni}
 TRAIN_FILE=${TRAIN_FILE:-$DATA_DIR/train.parquet}
-VAL_FILE=${VAL_FILE:-$DATA_DIR/train.parquet}
+VAL_FILE=${VAL_FILE:-$DATA_DIR/test.parquet}
 
 export WANDB_MODE=${WANDB_MODE:-offline}
+export OMNIFT_ROLLOUT_PROGRESS=${OMNIFT_ROLLOUT_PROGRESS:-1}
 ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit}
 set +u
 source "$ASCEND_HOME_PATH/set_env.sh"
@@ -33,7 +34,26 @@ DESYNC_SOURCE_ROOT=${DESYNC_SOURCE_ROOT:-$REWARD_ROOT/OmniNFT-reference}
 NUM_GPUS=${NUM_GPUS:-8}
 ROLLOUT_TP=${ROLLOUT_TP:-8}
 REWARD_NUM_WORKERS=${REWARD_NUM_WORKERS:-$NUM_GPUS}
-TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-500}
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-4}
+REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-100}
+ROLLOUT_DATA_SAVE_FREQ=${ROLLOUT_DATA_SAVE_FREQ:-3}
+ROLLOUT_DATA_MAX_SAMPLES=${ROLLOUT_DATA_MAX_SAMPLES:-null}
+REWARD_PARALLEL_GROUPS=${REWARD_PARALLEL_GROUPS:-}
+
+reward_parallel_group_overrides=()
+case "$REWARD_PARALLEL_GROUPS" in
+    "") ;;
+    audiobox_clap)
+        reward_parallel_group_overrides=(
+            '+reward.native.parallel_groups.audiobox_clap.rewards=[audiobox,clap]'
+        )
+        ;;
+    *)
+        echo "Unsupported REWARD_PARALLEL_GROUPS=$REWARD_PARALLEL_GROUPS (expected empty or audiobox_clap)" >&2
+        exit 2
+        ;;
+esac
 ltx_lora_targets="['attn1.to_q','attn1.to_k','attn1.to_v','attn1.to_out.0','attn2.to_q','attn2.to_k','attn2.to_v','attn2.to_out.0','audio_attn1.to_q','audio_attn1.to_k','audio_attn1.to_v','audio_attn1.to_out.0','audio_attn2.to_q','audio_attn2.to_k','audio_attn2.to_v','audio_attn2.to_out.0','audio_to_video_attn.to_q','audio_to_video_attn.to_k','audio_to_video_attn.to_v','audio_to_video_attn.to_out.0','video_to_audio_attn.to_q','video_to_audio_attn.to_k','video_to_audio_attn.to_v','video_to_audio_attn.to_out.0','ff.net.0.proj','ff.net.2','audio_ff.net.0.proj','audio_ff.net.2']"
 
 script_path=$(readlink -f "$0")
@@ -52,6 +72,7 @@ checkpoint_dir=$output_dir/checkpoints
 run_timestamp=$(date +"%Y%m%d_%H%M")
 log_file=$output_dir/logs/$run_timestamp/${NODE_RANK:-0}.log
 rollout_data_dir=$output_dir/logs/$run_timestamp/rollout_videos
+validation_data_dir=$output_dir/logs/$run_timestamp/validation_videos
 mkdir -p "$checkpoint_dir" "$(dirname "$log_file")"
 exec > >(tee -a "$log_file") 2>&1
 
@@ -64,6 +85,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     data.return_multi_modal_inputs=False \
     data.train_batch_size=1 \
     data.val_max_samples=8 \
+    data.val_batch_size=4 \
     data.max_prompt_length=1024 \
     data.truncation=error \
     data.seed=42 \
@@ -115,6 +137,8 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.calculate_log_probs=False \
     actor_rollout_ref.rollout.rollout_adapter=old \
+    ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.max_num_seqs=${MAX_NUM_SEQS} \
+    ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.request_batch_max_wait_ms=${REQUEST_BATCH_MAX_WAIT_MS} \
     actor_rollout_ref.rollout.pipeline.height=256 \
     actor_rollout_ref.rollout.pipeline.width=384 \
     actor_rollout_ref.rollout.pipeline.num_frames=121 \
@@ -137,6 +161,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     reward.reward_manager.name=MultiModalRewardManager \
     reward.aggregation=preserve_components \
     'reward.component_order=[video_align,hpsv3,audiobox,clap,desync]' \
+    "${reward_parallel_group_overrides[@]}" \
     +reward.reward_functions.video_align.path=pkg://verl_omni.utils.reward_score.videoalign_native \
     +reward.reward_functions.video_align.required=true \
     +reward.reward_functions.video_align.micro_batch_size=2 \
@@ -174,7 +199,10 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.project_name=omni_nft \
     trainer.experiment_name=ltx2_3_omninft_lora_npu \
     trainer.default_local_dir=$checkpoint_dir \
-    trainer.validation_data_dir=$rollout_data_dir \
+    trainer.rollout_data_dir="$rollout_data_dir" \
+    trainer.rollout_data_save_freq="$ROLLOUT_DATA_SAVE_FREQ" \
+    trainer.rollout_data_max_samples="$ROLLOUT_DATA_MAX_SAMPLES" \
+    trainer.validation_data_dir=$validation_data_dir \
     trainer.validation_data_max_samples=8 \
     trainer.resume_mode=disable \
     trainer.log_val_generations=0 \
