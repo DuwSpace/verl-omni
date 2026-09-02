@@ -26,6 +26,8 @@ import torch
 import torch.nn.functional as F
 from verl.utils.device import get_device_name, get_torch_device
 
+from .reward_utils import load_torch_state_dict
+
 _DEFAULT_MODEL_REVISION = "zghhui/OmniNFT-Reward-Series@9e30061a1392d03bafdcf717e80a385ddf411b4d"
 _DEFAULT_SOURCE_REVISION = "fb9237f6e74edf0d0f2a683f4d975b79fde588fe"
 _DEFINITION_VERSION = "omninft-desync-synchformer-v3"
@@ -141,7 +143,7 @@ def _load_components(model_path: str, source_root: str, source_revision: str) ->
         raise RuntimeError("Imported Synchformer does not belong to the configured source_root.")
 
     model = module.Synchformer()
-    state_dict = torch.load(model_path, map_location="cpu", weights_only=True, mmap=True)
+    state_dict = load_torch_state_dict(model_path)
     if not isinstance(state_dict, dict) or not all(isinstance(value, torch.Tensor) for value in state_dict.values()):
         raise ValueError("DeSync checkpoint must be a tensor state dict.")
     model.load_state_dict(state_dict, strict=True)

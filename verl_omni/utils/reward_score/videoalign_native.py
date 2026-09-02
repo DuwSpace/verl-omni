@@ -24,6 +24,7 @@ from verl.utils.device import get_device_name, get_torch_device
 
 from .hpsv3_native import ensure_omninft_qwen2vl_layout, omninft_qwen2vl_reward_forward
 from .hpsv3_reward import _Qwen2VLRewardModelBT, _smart_resize
+from .reward_utils import load_torch_state_dict
 
 _DEFAULT_MODEL_REVISION = "KlingTeam/VideoReward@4f26600130683e6f1de9f5d463887f28e8ef995c"
 _DEFAULT_BASE_MODEL_REVISION = "Qwen/Qwen2-VL-2B-Instruct@895c3a49bc3fa70a340399125c650a463535e71c"
@@ -175,7 +176,7 @@ def _load_components(model_path: str, base_model_path: str) -> tuple[Any, Any]:
             ),
         )
 
-    state_dict = torch.load(model_path, map_location="cpu", weights_only=True, mmap=True)
+    state_dict = load_torch_state_dict(model_path)
     if not isinstance(state_dict, dict) or not all(isinstance(value, torch.Tensor) for value in state_dict.values()):
         raise ValueError("VideoAlign checkpoint must be a tensor state dict.")
     state_dict = _remap_checkpoint_state_dict(state_dict)
