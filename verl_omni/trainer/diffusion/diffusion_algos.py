@@ -1128,12 +1128,11 @@ class OmniNFTLoss(DiffusionNFTLoss):
             config=config,
         )
         loss_cfg = config.diffusion_loss
+        modality_weight_sum = max(loss_cfg.video_weight + loss_cfg.audio_weight, 1e-8)
         total_loss = (
-            loss_cfg.video_weight * video_policy
-            + loss_cfg.audio_weight * audio_policy
-            + loss_cfg.video_ref_kl_coef * video_ref
-            + loss_cfg.audio_ref_kl_coef * audio_ref
-        )
+            loss_cfg.video_weight * (video_policy + loss_cfg.video_ref_kl_coef * video_ref)
+            + loss_cfg.audio_weight * (audio_policy + loss_cfg.audio_ref_kl_coef * audio_ref)
+        ) / modality_weight_sum
 
         metrics = {
             "actor/video/policy_loss": video_policy.detach().item(),

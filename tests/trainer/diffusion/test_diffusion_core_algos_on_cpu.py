@@ -608,6 +608,12 @@ def test_compute_omni_nft_joint_av_loss_backpropagates_both_modalities() -> None
     ):
         assert key in metrics
 
+    expected_loss = (
+        2.0 * (metrics["actor/video/policy_loss"] + 0.1 * metrics["actor/video/ref_kl_loss"])
+        + 3.0 * (metrics["actor/audio/policy_loss"] + 0.2 * metrics["actor/audio/ref_kl_loss"])
+    ) / 5.0
+    assert loss.detach().item() == pytest.approx(expected_loss)
+
 
 def test_compute_policy_loss_grpo_guard() -> None:
     from hydra import compose, initialize_config_dir
