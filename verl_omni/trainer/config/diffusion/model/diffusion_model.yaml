@@ -109,6 +109,12 @@ pipeline:
   # Distilled guidance scale
   guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
 
+  # LTX video text CFG scale; null falls back to guidance_scale
+  video_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_cfg_scale,null}
+
+  # LTX audio text CFG scale; null falls back to guidance_scale
+  audio_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_cfg_scale,null}
+
   # Wan2.2 video number of frames
   num_frames: ${oc.select:actor_rollout_ref.rollout.pipeline.num_frames,1}
 
