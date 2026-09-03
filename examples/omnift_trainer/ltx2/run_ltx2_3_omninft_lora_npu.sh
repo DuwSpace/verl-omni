@@ -93,6 +93,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     algorithm.sample_source=online \
     algorithm.paired_preference=false \
     algorithm.timestep_fraction=0.4 \
+    algorithm.timestep_selection=top_sigma \
     algorithm.old_policy_decay_schedule=linear_to_0_5 \
     algorithm.old_policy_update_interval=1 \
     algorithm.norm_adv_by_std_in_grpo=true \

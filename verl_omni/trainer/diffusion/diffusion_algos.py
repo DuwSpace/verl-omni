@@ -949,11 +949,26 @@ class DiffusionNFTLoss(DiffusionLossFn):
         train_timesteps: torch.Tensor,
         timestep_fraction: float,
         seed: int | None = None,
+        selection: str = "random",
     ) -> torch.Tensor:
+        """Select per-sample training timesteps from the rollout grid.
+
+        - ``"random"``: shuffle each row of ``train_timesteps`` and keep the first
+          ``num_train`` entries; ``seed`` controls the shuffle (deterministic when set).
+        - ``"top_sigma"``: keep the ``num_train`` largest values of each row, i.e. the
+          highest-noise prefix of the sigma grid (official OmniNFT semantics); ``seed``
+          is ignored and the result is deterministic.
+        """
         if train_timesteps.ndim != 2:
             raise ValueError(f"`train_timesteps` must have shape [B, T], got {train_timesteps.shape}.")
         num_timesteps = train_timesteps.shape[1]
         num_train = max(1, int(num_timesteps * timestep_fraction))
+        if selection == "top_sigma":
+            # Official DiffusionNFT trains only the highest-noise prefix of the sigma grid
+            # (sigmas_train = sigmas_all[:num_train_t]); sorting by value keeps the
+            # semantics independent of the grid's storage order.
+            sorted_idx = train_timesteps.argsort(dim=1, descending=True)
+            return torch.gather(train_timesteps, 1, sorted_idx[:, :num_train]).long()
         generator = None
         if seed is not None:
             generator = torch.Generator(device=train_timesteps.device)
@@ -999,6 +1014,7 @@ class DiffusionNFTLoss(DiffusionLossFn):
             rollout_batch["train_timesteps"],
             timestep_fraction=algorithm_cfg.timestep_fraction,
             seed=timestep_shuffle_seed,
+            selection=algorithm_cfg.timestep_selection,
         )
         if reward_prob.ndim == 1 and train_timesteps.ndim == 2:
             reward_prob = reward_prob[:, None].expand(-1, train_timesteps.shape[1])
@@ -1210,6 +1226,7 @@ class OmniNFTLoss(DiffusionNFTLoss):
             batch.batch["train_timesteps"],
             timestep_fraction=algorithm_cfg.timestep_fraction,
             seed=actor_cfg.data_loader_seed,
+            selection=algorithm_cfg.timestep_selection,
         )
         num_steps = train_timesteps.shape[1]
         timestep_modality_reward_probs = modality_reward_probs[:, None, :].expand(-1, num_steps, -1)

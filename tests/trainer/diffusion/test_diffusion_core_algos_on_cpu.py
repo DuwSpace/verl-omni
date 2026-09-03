@@ -348,6 +348,7 @@ def test_prepare_diffusion_nft_actor_batch() -> None:
         global_std=True,
         adv_mode="continuous",
         timestep_fraction=0.5,
+        timestep_selection="random",
     )
     config = SimpleNamespace(
         algorithm=algorithm_config,
@@ -487,6 +488,7 @@ def test_prepare_omni_nft_actor_batch_routes_component_rewards() -> None:
             global_std=False,
             adv_mode="continuous",
             timestep_fraction=0.5,
+            timestep_selection="random",
         ),
         actor_rollout_ref=SimpleNamespace(
             actor=SimpleNamespace(
@@ -522,6 +524,86 @@ def test_prepare_omni_nft_actor_batch_routes_component_rewards() -> None:
     torch.testing.assert_close(result.batch["modality_reward_probs"], expected_probabilities)
     torch.testing.assert_close(result.batch["video_reward_prob"], expected_probabilities[:, :1].expand(-1, 3))
     torch.testing.assert_close(result.batch["audio_reward_prob"], expected_probabilities[:, 1:].expand(-1, 3))
+
+
+def test_select_train_timesteps_top_sigma() -> None:
+    # Two rows share the same value multiset in different storage order; ties (950, 950)
+    # are compared via sorted values.
+    grid = torch.tensor(
+        [
+            [300.0, 950.0, 700.0, 950.0, 120.0, 880.0],
+            [120.0, 880.0, 950.0, 300.0, 950.0, 700.0],
+        ]
+    )
+
+    top_half = diffusion_algos.DiffusionNFTLoss._select_train_timesteps(grid, 0.5, seed=7, selection="top_sigma")
+    assert top_half.shape == (2, 3)
+    assert top_half.dtype == torch.long
+    expected_half = torch.tensor([[950.0, 950.0, 880.0], [950.0, 950.0, 880.0]])
+    torch.testing.assert_close(top_half.sort(dim=1, descending=True).values.float(), expected_half)
+
+    full = diffusion_algos.DiffusionNFTLoss._select_train_timesteps(grid, 1.0, selection="top_sigma")
+    assert full.dtype == torch.long
+    expected_full = torch.tensor(
+        [
+            [950.0, 950.0, 880.0, 700.0, 300.0, 120.0],
+            [950.0, 950.0, 880.0, 700.0, 300.0, 120.0],
+        ]
+    )
+    torch.testing.assert_close(full.float(), expected_full)
+
+    # seed must not influence the deterministic top_sigma mode
+    repeat = diffusion_algos.DiffusionNFTLoss._select_train_timesteps(grid, 0.5, seed=99, selection="top_sigma")
+    assert torch.equal(top_half, repeat)
+
+
+def test_prepare_omni_nft_actor_batch_top_sigma_selection() -> None:
+    from types import SimpleNamespace
+
+    from verl import DataProto
+
+    batch_size, steps = 2, 6
+    scores = torch.tensor([[1.0, 1.0], [2.0, 2.0]])
+    batch = DataProto.from_dict(
+        tensors={
+            "video_latents_clean": torch.randn(batch_size, 12, 8),
+            "audio_latents_clean": torch.randn(batch_size, 5, 8),
+            "train_timesteps": torch.arange(steps).expand(batch_size, -1),
+            "rm_scores": scores,
+            "reward_valid_mask": torch.ones_like(scores, dtype=torch.bool),
+        },
+        non_tensors={"uid": np.array(["p0", "p0"], dtype=object)},
+        meta_info={"reward_names": ["video_align", "clap"]},
+    )
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(
+            norm_adv_by_std_in_grpo=True,
+            global_std=False,
+            adv_mode="continuous",
+            timestep_fraction=0.5,
+            timestep_selection="top_sigma",
+        ),
+        actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(
+                diffusion_loss=SimpleNamespace(adv_clip_max=5.0),
+                data_loader_seed=42,
+            )
+        ),
+        reward=SimpleNamespace(
+            component_order=["video_align", "clap"],
+            reward_functions={
+                "video_align": {"routing_weights": {"video": 1.0, "audio": 0.0}},
+                "clap": {"routing_weights": {"video": 0.0, "audio": 1.0}},
+            },
+        ),
+    )
+
+    result = diffusion_algos.OmniNFTLoss.prepare_actor_batch(batch, scores, config)
+
+    assert result.batch["train_timesteps"].shape == (batch_size, 3)
+    # ascending grid 0..5 with fraction 0.5 keeps the descending top-3 prefix [5, 4, 3]
+    expected = torch.tensor([[5, 4, 3], [5, 4, 3]], dtype=result.batch["train_timesteps"].dtype)
+    torch.testing.assert_close(result.batch["train_timesteps"], expected)
 
 
 def test_modality_advantage_router_rejects_invalid_reward_contracts() -> None:

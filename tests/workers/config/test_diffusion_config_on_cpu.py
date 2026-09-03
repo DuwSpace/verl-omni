@@ -134,6 +134,10 @@ class TestDiffusionAlgoConfig:
         assert cfg.timestep_fraction == pytest.approx(0.5)
         assert cfg.adv_mode == "binary"
 
+    def test_timestep_selection_top_sigma(self):
+        cfg = DiffusionAlgoConfig(timestep_selection="top_sigma")
+        assert cfg.timestep_selection == "top_sigma"
+
     @pytest.mark.parametrize(
         "kwargs, match",
         [
@@ -143,6 +147,7 @@ class TestDiffusionAlgoConfig:
             ({"old_policy_update_interval": 0}, "old_policy_update_interval.*positive"),
             ({"timestep_fraction": 0.0}, "timestep_fraction.*\\(0, 1\\]"),
             ({"timestep_fraction": 1.1}, "timestep_fraction.*\\(0, 1\\]"),
+            ({"timestep_selection": "bogus"}, "Invalid timestep_selection"),
         ],
     )
     def test_invalid_diffusion_nft_algo_values_raise(self, kwargs, match):
