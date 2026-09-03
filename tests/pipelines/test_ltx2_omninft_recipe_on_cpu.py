@@ -18,6 +18,7 @@ import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -273,6 +274,37 @@ def test_omninft_training_adapter_builds_one_shot_joint_av_inputs():
     torch.testing.assert_close(inputs["audio_hidden_states"], latents[:, 5:])
     torch.testing.assert_close(inputs["timestep"], timesteps)
     assert negative_inputs is None
+
+
+def test_omninft_training_adapter_applies_independent_video_audio_cfg_scales():
+    from verl_omni.pipelines.ltx2_omni_nft.diffusers_training_adapter import LTX23OmniNFT
+
+    video_sample = torch.zeros(1, 2, 1)
+    audio_sample = torch.zeros(1, 1, 1)
+    video_positive = torch.full_like(video_sample, 2.0)
+    audio_positive = torch.full_like(audio_sample, 4.0)
+    video_negative = torch.full_like(video_sample, 1.0)
+    audio_negative = torch.full_like(audio_sample, 1.0)
+    module = Mock(side_effect=[(video_positive, audio_positive), (video_negative, audio_negative)])
+    model_config = SimpleNamespace(
+        pipeline=SimpleNamespace(guidance_scale=None, video_cfg_scale=2.0, audio_cfg_scale=3.0)
+    )
+    model_inputs = {
+        "hidden_states": video_sample,
+        "audio_hidden_states": audio_sample,
+        "timestep": torch.tensor([500.0]),
+    }
+
+    video_prediction, audio_prediction = LTX23OmniNFT.forward(
+        module,
+        model_config,
+        model_inputs,
+        negative_model_inputs={},
+    )
+
+    torch.testing.assert_close(video_prediction, torch.full_like(video_sample, 3.0))
+    torch.testing.assert_close(audio_prediction, torch.full_like(audio_sample, 10.0))
+    assert module.call_count == 2
 
 
 def test_omninft_training_adapter_rejects_reverse_transition_api():

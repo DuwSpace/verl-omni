@@ -122,8 +122,16 @@ class LTX23OmniNFT(DiffusionModelBase):
             "audio_encoder_attention_mask": prompt_embeds_mask,
         }
 
-        guidance_scale = model_config.pipeline.guidance_scale or 1.0
-        if guidance_scale <= 1.0:
+        common_guidance_scale = getattr(model_config.pipeline, "guidance_scale", None)
+        video_guidance_scale = getattr(model_config.pipeline, "video_cfg_scale", None)
+        audio_guidance_scale = getattr(model_config.pipeline, "audio_cfg_scale", None)
+        if video_guidance_scale is None:
+            video_guidance_scale = common_guidance_scale
+        if audio_guidance_scale is None:
+            audio_guidance_scale = common_guidance_scale
+        video_guidance_scale = video_guidance_scale or 1.0
+        audio_guidance_scale = audio_guidance_scale or 1.0
+        if video_guidance_scale <= 1.0 and audio_guidance_scale <= 1.0:
             return model_inputs, None
         if negative_prompt_embeds is None or negative_prompt_embeds_mask is None:
             raise ValueError("LTX-2.3 OmniNFT CFG requires negative prompt embeddings and attention masks.")
@@ -154,26 +162,36 @@ class LTX23OmniNFT(DiffusionModelBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         video_prediction, audio_prediction = cls._predict(module, model_inputs)
 
-        guidance_scale = model_config.pipeline.guidance_scale or 1.0
-        if guidance_scale > 1.0:
+        common_guidance_scale = getattr(model_config.pipeline, "guidance_scale", None)
+        video_guidance_scale = getattr(model_config.pipeline, "video_cfg_scale", None)
+        audio_guidance_scale = getattr(model_config.pipeline, "audio_cfg_scale", None)
+        if video_guidance_scale is None:
+            video_guidance_scale = common_guidance_scale
+        if audio_guidance_scale is None:
+            audio_guidance_scale = common_guidance_scale
+        video_guidance_scale = video_guidance_scale or 1.0
+        audio_guidance_scale = audio_guidance_scale or 1.0
+        if video_guidance_scale > 1.0 or audio_guidance_scale > 1.0:
             if negative_model_inputs is None:
                 raise ValueError("LTX-2.3 OmniNFT CFG requires negative model inputs.")
             negative_video_prediction, negative_audio_prediction = cls._predict(module, negative_model_inputs)
             sigma = (model_inputs["timestep"].float() / 1000.0).view(-1, 1, 1)
-            video_prediction = apply_x0_cfg(
-                model_inputs["hidden_states"].float(),
-                video_prediction,
-                negative_video_prediction,
-                sigma,
-                guidance_scale,
-            )
-            audio_prediction = apply_x0_cfg(
-                model_inputs["audio_hidden_states"].float(),
-                audio_prediction,
-                negative_audio_prediction,
-                sigma,
-                guidance_scale,
-            )
+            if video_guidance_scale > 1.0:
+                video_prediction = apply_x0_cfg(
+                    model_inputs["hidden_states"].float(),
+                    video_prediction,
+                    negative_video_prediction,
+                    sigma,
+                    video_guidance_scale,
+                )
+            if audio_guidance_scale > 1.0:
+                audio_prediction = apply_x0_cfg(
+                    model_inputs["audio_hidden_states"].float(),
+                    audio_prediction,
+                    negative_audio_prediction,
+                    sigma,
+                    audio_guidance_scale,
+                )
 
         return video_prediction, audio_prediction
 

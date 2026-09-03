@@ -98,7 +98,8 @@ python3 -m verl_omni.trainer.main_diffusion \
     algorithm.norm_adv_by_std_in_grpo=true \
     algorithm.global_std=true \
     algorithm.adv_mode=continuous \
-    actor_rollout_ref.model.pipeline.guidance_scale=1.0 \
+    actor_rollout_ref.model.pipeline.video_cfg_scale=1 \
+    actor_rollout_ref.model.pipeline.audio_cfg_scale=1 \
     actor_rollout_ref.model.path="$MODEL_PATH" \
     actor_rollout_ref.model.algorithm=omni_nft \
     actor_rollout_ref.model.model_type=omni_nft_model \
@@ -144,7 +145,8 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.pipeline.num_frames=121 \
     actor_rollout_ref.rollout.pipeline.frame_rate=24.0 \
     actor_rollout_ref.rollout.pipeline.num_inference_steps=30 \
-    actor_rollout_ref.rollout.pipeline.guidance_scale=4.0 \
+    actor_rollout_ref.rollout.pipeline.video_cfg_scale=1.5 \
+    actor_rollout_ref.rollout.pipeline.audio_cfg_scale=3.0 \
     actor_rollout_ref.rollout.pipeline.max_sequence_length=1024 \
     +actor_rollout_ref.rollout.pipeline.output_type=pt \
     actor_rollout_ref.rollout.val_kwargs.pipeline.height=256 \
@@ -152,7 +154,8 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_frames=121 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.frame_rate=24.0 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=30 \
-    actor_rollout_ref.rollout.val_kwargs.pipeline.guidance_scale=4.0 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.video_cfg_scale=3.0 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.audio_cfg_scale=7.0 \
     +actor_rollout_ref.rollout.val_kwargs.pipeline.output_type=pt \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
     reward.num_workers="$REWARD_NUM_WORKERS" \
