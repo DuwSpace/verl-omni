@@ -333,6 +333,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
         self._bridge_diffusion_parallel_args(engine_args)
         self._bridge_diffusion_batch_size(engine_args)
+        self._bridge_diffusion_memory_flags(engine_args)
 
         diffusion_master_port, diffusion_master_sock = get_free_port("127.0.0.1", with_alive_sock=True)
         diffusion_master_sock.close()
@@ -395,6 +396,33 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
         # Pin 44448565 overwrites od_config.max_num_seqs with this AsyncOmni-level value.
         engine_args["diffusion_batch_size"] = max_batch_size
+
+    def _bridge_diffusion_memory_flags(self, engine_args: dict[str, Any]) -> None:
+        """Forward rollout memory flags from the rollout config.
+
+        vLLM-Omni pin 44448565 models ``enable_cpu_offload``/``vae_use_tiling``
+        only on ``OrchestratorArgs``, so ``OmniEngineArgs.from_cli_args`` drops
+        the CLI values and ``AsyncOmni`` never receives them; the diffusion
+        default stage config then falls back to ``kwargs.get(..., False)`` and
+        the LTX loader keeps every weight device-resident (observed as an
+        unchanged ~36 GiB "Model loading" footprint and rollout OOM). The
+        Hydra-injected ``engine_kwargs.vllm_omni`` dict is the authoritative
+        record of user-specified settings, so bridge from there — the same
+        seam as ``_bridge_diffusion_parallel_args``.
+        """
+        if self._ar_mode:
+            return
+
+        engine_kwargs = getattr(self.config, "engine_kwargs", None) or {}
+        omni_kwargs = engine_kwargs.get("vllm_omni", {}) or {}
+        bridged = {}
+        for key in ("enable_cpu_offload", "vae_use_tiling"):
+            value = omni_kwargs.get(key)
+            if value is not None:
+                bridged[key] = value
+        if bridged:
+            engine_args.update(bridged)
+            logger.info("Bridged diffusion memory flags from rollout config: %s", bridged)
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""

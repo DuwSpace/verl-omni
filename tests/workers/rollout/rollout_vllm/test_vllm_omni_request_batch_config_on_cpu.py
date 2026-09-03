@@ -97,3 +97,58 @@ def test_non_request_batch_modes_do_not_set_diffusion_batch_size(ar_mode, step_e
     server._bridge_diffusion_batch_size(engine_args)
 
     assert "diffusion_batch_size" not in engine_args
+
+
+def test_diffusion_memory_flags_reach_async_omni():
+    # Mirror the production recipe: the flags live in the Hydra-injected
+    # engine_kwargs.vllm_omni dict, but pin 44448565 models them only on
+    # OrchestratorArgs, so OmniEngineArgs.from_cli_args drops the CLI values
+    # and they never reach AsyncOmni unbridged.
+    server = _make_server({"enable_cpu_offload": True, "vae_use_tiling": True})
+    engine_args = {"max_num_seqs": 8}
+
+    server._bridge_diffusion_memory_flags(engine_args)
+
+    assert engine_args == {
+        "max_num_seqs": 8,
+        "enable_cpu_offload": True,
+        "vae_use_tiling": True,
+    }
+
+
+def test_bridged_memory_flags_override_parsed_cli_values():
+    # The user-specified engine_kwargs value is authoritative: it must win
+    # over any stale value left in engine_args by the CLI conversion.
+    server = _make_server({"enable_cpu_offload": True})
+
+    engine_args = {"enable_cpu_offload": False}
+    server._bridge_diffusion_memory_flags(engine_args)
+
+    assert engine_args["enable_cpu_offload"] is True
+
+
+def test_diffusion_memory_flags_absent_are_not_injected():
+    server = _make_server({"max_num_seqs": 4})
+    engine_args = {"max_num_seqs": 4}
+
+    server._bridge_diffusion_memory_flags(engine_args)
+
+    assert engine_args == {"max_num_seqs": 4}
+
+
+def test_diffusion_memory_flags_none_values_are_not_injected():
+    server = _make_server({"enable_cpu_offload": None, "vae_use_tiling": None})
+    engine_args = {}
+
+    server._bridge_diffusion_memory_flags(engine_args)
+
+    assert engine_args == {}
+
+
+def test_diffusion_memory_flags_skipped_in_ar_mode():
+    server = _make_server({"enable_cpu_offload": True}, ar_mode=True)
+    engine_args = {}
+
+    server._bridge_diffusion_memory_flags(engine_args)
+
+    assert engine_args == {}
