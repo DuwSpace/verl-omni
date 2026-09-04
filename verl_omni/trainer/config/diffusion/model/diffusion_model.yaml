@@ -115,6 +115,18 @@ pipeline:
   # LTX audio text CFG scale; null falls back to guidance_scale
   audio_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_cfg_scale,null}
 
+  # LTX video modality guidance scale; null uses the pipeline default
+  video_modality_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_modality_scale,null}
+
+  # LTX audio modality guidance scale; null uses the pipeline default
+  audio_modality_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_modality_scale,null}
+
+  # LTX video guidance rescale factor; null uses the pipeline default
+  video_rescale_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_rescale_scale,null}
+
+  # LTX audio guidance rescale factor; null uses the pipeline default
+  audio_rescale_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_rescale_scale,null}
+
   # Wan2.2 video number of frames
   num_frames: ${oc.select:actor_rollout_ref.rollout.pipeline.num_frames,1}
 

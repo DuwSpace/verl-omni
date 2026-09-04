@@ -228,6 +228,10 @@ actor_rollout_ref:
         guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
         video_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_cfg_scale,null}
         audio_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_cfg_scale,null}
+        video_modality_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_modality_scale,null}
+        audio_modality_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_modality_scale,null}
+        video_rescale_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_rescale_scale,null}
+        audio_rescale_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_rescale_scale,null}
         num_frames: ${oc.select:actor_rollout_ref.rollout.pipeline.num_frames,1}
         frame_rate: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_rate,24.0}
       algo:
@@ -257,6 +261,10 @@ actor_rollout_ref:
       guidance_scale: null
       video_cfg_scale: null
       audio_cfg_scale: null
+      video_modality_scale: null
+      audio_modality_scale: null
+      video_rescale_scale: null
+      audio_rescale_scale: null
       num_frames: 1
       frame_rate: 24.0
     calculate_log_probs: false
@@ -327,6 +335,10 @@ actor_rollout_ref:
       guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
       video_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_cfg_scale,null}
       audio_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_cfg_scale,null}
+      video_modality_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_modality_scale,null}
+      audio_modality_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_modality_scale,null}
+      video_rescale_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_rescale_scale,null}
+      audio_rescale_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_rescale_scale,null}
       num_frames: ${oc.select:actor_rollout_ref.rollout.pipeline.num_frames,1}
       frame_rate: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_rate,24.0}
     algo:

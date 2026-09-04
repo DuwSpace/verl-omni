@@ -185,8 +185,56 @@ class TestDiffusionSamplingConfig:
         assert cfg.seed == 42
         assert isinstance(cfg.algo, DiffusionRolloutAlgoConfig)
 
+    def test_ltx_modality_guidance_and_rescale_values(self):
+        cfg = DiffusionPipelineConfig(
+            video_modality_scale=3.0,
+            audio_modality_scale=2.5,
+            video_rescale_scale=0.7,
+            audio_rescale_scale=0.3,
+        )
+
+        assert cfg.video_modality_scale == pytest.approx(3.0)
+        assert cfg.audio_modality_scale == pytest.approx(2.5)
+        assert cfg.video_rescale_scale == pytest.approx(0.7)
+        assert cfg.audio_rescale_scale == pytest.approx(0.3)
+
 
 class TestDiffusionRolloutConfig:
+    def test_ltx_modality_guidance_and_rescale_via_hydra(self):
+        import os
+
+        from hydra import compose, initialize_config_dir
+        from verl.utils.config import omega_conf_to_dataclass
+
+        import verl_omni
+
+        config_dir = os.path.join(os.path.dirname(verl_omni.__file__), "trainer/config/diffusion/rollout")
+        with initialize_config_dir(config_dir=config_dir, version_base=None):
+            cfg = compose(
+                config_name="diffusion_rollout",
+                overrides=[
+                    "name=vllm_omni",
+                    "pipeline.video_modality_scale=3.0",
+                    "pipeline.audio_modality_scale=2.5",
+                    "pipeline.video_rescale_scale=0.7",
+                    "pipeline.audio_rescale_scale=0.3",
+                    "val_kwargs.pipeline.video_modality_scale=4.0",
+                    "val_kwargs.pipeline.audio_modality_scale=3.5",
+                    "val_kwargs.pipeline.video_rescale_scale=0.6",
+                    "val_kwargs.pipeline.audio_rescale_scale=0.2",
+                ],
+            )
+
+        rollout: DiffusionRolloutConfig = omega_conf_to_dataclass(cfg)
+        assert rollout.pipeline.video_modality_scale == pytest.approx(3.0)
+        assert rollout.pipeline.audio_modality_scale == pytest.approx(2.5)
+        assert rollout.pipeline.video_rescale_scale == pytest.approx(0.7)
+        assert rollout.pipeline.audio_rescale_scale == pytest.approx(0.3)
+        assert rollout.val_kwargs.pipeline.video_modality_scale == pytest.approx(4.0)
+        assert rollout.val_kwargs.pipeline.audio_modality_scale == pytest.approx(3.5)
+        assert rollout.val_kwargs.pipeline.video_rescale_scale == pytest.approx(0.6)
+        assert rollout.val_kwargs.pipeline.audio_rescale_scale == pytest.approx(0.2)
+
     def test_prompt_embed_length_is_independent_from_encoder_length(self):
         pipeline = DiffusionPipelineConfig(max_sequence_length=256)
         cfg = DiffusionRolloutConfig(
