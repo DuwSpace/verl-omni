@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -21,6 +21,7 @@ from tensordict import TensorDict
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import LTXPromptContext
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.ltx2_flow_grpo.agent_loop import _messages_to_text
@@ -29,7 +30,10 @@ from verl_omni.pipelines.ltx2_flow_grpo.common import (
     apply_x0_cfg,
     calculate_shift,
 )
-from verl_omni.pipelines.ltx2_flow_grpo.diffusers_training_adapter import LTX23FlowGRPO
+from verl_omni.pipelines.ltx2_flow_grpo.diffusers_training_adapter import (
+    LTX23FlowGRPO,
+    _eager_rms_norm_forward,
+)
 from verl_omni.pipelines.ltx2_flow_grpo.vllm_omni_rollout_adapter import LTX23PipelineWithLogProb
 from verl_omni.pipelines.model_base import DiffusionModelBase, VllmOmniPipelineBase
 
@@ -100,6 +104,21 @@ def test_ltx2_training_adapter_splits_joint_latents() -> None:
     assert positive["audio_hidden_states"].shape == (batch_size, 7, 128)
     assert positive["timestep"].tolist() == [700.0, 700.0]
     assert negative is None
+
+
+def test_ltx2_eager_rms_norm_matches_reference() -> None:
+    norm = SimpleNamespace(
+        eps=1e-6,
+        weight=torch.tensor([0.5, 1.0, 1.5], dtype=torch.bfloat16),
+        bias=None,
+    )
+    hidden_states = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.bfloat16)
+    actual = _eager_rms_norm_forward(norm, hidden_states)
+    hidden_fp32 = hidden_states.float()
+    variance = hidden_fp32.pow(2).mean(-1, keepdim=True)
+    expected = (hidden_fp32 * torch.rsqrt(variance + norm.eps) * norm.weight.float()).to(hidden_states.dtype)
+    torch.testing.assert_close(actual, expected)
+    assert actual.dtype == hidden_states.dtype
 
 
 def test_ltx2_non_contiguous_sde_step_selection_is_seeded() -> None:
@@ -175,6 +194,49 @@ def test_ltx2_rollout_adapter_inject_precomputed_prompt_embeds() -> None:
     assert "negative_prompt_attention_mask" in req.prompt
     assert req.prompt["prompt_embeds"].shape == (128, 64)
     assert req.prompt["negative_prompt_embeds"].shape == (128, 64)
+
+
+def test_ltx2_rollout_phase_forwards_recipe_sampler() -> None:
+    pipeline = object.__new__(LTX23PipelineWithLogProb)
+    pipeline.device = torch.device("cpu")
+    pipeline.scheduler = MagicMock()
+    pipeline.scheduler.config = {}
+    pipeline._check_forward_inputs = MagicMock()
+    pipeline._setup_forward_runtime = MagicMock(return_value=False)
+    pipeline._resolve_video_latent_dimensions = MagicMock(return_value=(2, 3, 4))
+    pipeline._prepare_video_latents_stage = MagicMock(return_value=(torch.zeros(1), None))
+    pipeline._prepare_audio_latents_stage = MagicMock(return_value=(torch.zeros(1), 5, 6, 7))
+
+    request_inputs = SimpleNamespace(num_inference_steps=2)
+    phase_recipe = SimpleNamespace(sampler="euler")
+    prompt_context = MagicMock()
+    timesteps = torch.tensor([1.0, 0.5])
+
+    with (
+        patch(
+            "verl_omni.pipelines.ltx2_flow_grpo.vllm_omni_rollout_adapter.retrieve_timesteps",
+            return_value=(timesteps, 2),
+        ),
+        patch("verl_omni.pipelines.ltx2_flow_grpo.vllm_omni_rollout_adapter.LTXVideoAudioStepAdapter"),
+        patch("verl_omni.pipelines.ltx2_flow_grpo.vllm_omni_rollout_adapter.LTXForwardContext") as context_cls,
+        patch(
+            "verl_omni.pipelines.ltx2_flow_grpo.vllm_omni_rollout_adapter.prepare_rope_coords_stage",
+            side_effect=RuntimeError("stop after context construction"),
+        ),
+        pytest.raises(RuntimeError, match="stop after context construction"),
+    ):
+        pipeline.run_phase(
+            MagicMock(),
+            request_inputs,
+            noise_scale=1.0,
+            sigmas=None,
+            timesteps=None,
+            attention_kwargs=None,
+            phase_recipe=phase_recipe,
+            prompt_context=prompt_context,
+        )
+
+    assert context_cls.call_args.kwargs["sampler"] == "euler"
 
 
 def test_ltx2_rollout_denoise_step_collects_sde_trajectory() -> None:
@@ -287,4 +349,4 @@ def test_ltx2_rollout_forward_attaches_trajectory_and_metadata() -> None:
 def unittest_mock_super_forward(target, return_value):
     from unittest.mock import patch
 
-    return patch.object(LTX23PipelineWithLogProb.__bases__[0], "forward", return_value=return_value)
+    return patch.object(LTX2Pipeline, "forward", return_value=return_value)

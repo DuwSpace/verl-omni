@@ -474,6 +474,45 @@ def test_ltx2_omni_nft_forward_splits_packed_request_batch(tmp_path, monkeypatch
         )
 
 
+def test_ltx2_omni_nft_forward_splits_packed_cfg_disabled_without_negative_prompts() -> None:
+    pipeline = object.__new__(LTX23OmniNFTPipeline)
+    pipeline._inject_batch_prompt_embeds = MagicMock()
+    pipeline.vocoder = SimpleNamespace(config=SimpleNamespace(output_sampling_rate=24000))
+    requests = [
+        SimpleNamespace(sampling_params=SimpleNamespace(output_type="pt")),
+        SimpleNamespace(sampling_params=SimpleNamespace(output_type="pt")),
+    ]
+    request_batch = DiffusionRequestBatch(requests=requests)
+    clean_state = LTXAVState(video=torch.randn(2, 5, 8), audio=torch.randn(2, 7, 8))
+    forward_context = SimpleNamespace(
+        timesteps=torch.tensor([1000.0, 500.0]),
+        request_inputs=SimpleNamespace(frame_rate=24.0),
+    )
+    prompt_context = _prompt_context(batch_size=2)
+    prompt_context.negative_connector_prompt_embeds = None
+    prompt_context.negative_connector_audio_prompt_embeds = None
+    prompt_context.negative_connector_attention_mask = None
+
+    def native_forward(*_args, **_kwargs):
+        pipeline._omni_nft_clean_state = clean_state
+        pipeline._omni_nft_forward_context = forward_context
+        pipeline._omni_nft_prompt_context = prompt_context
+        return [
+            DiffusionOutput(output=(torch.rand(1, 9, 3, 16, 16), torch.rand(1, 24000))),
+            DiffusionOutput(output=(torch.rand(1, 9, 3, 16, 16), torch.rand(1, 24000))),
+        ]
+
+    with patch.object(LTX2Pipeline, "forward", side_effect=native_forward):
+        outputs = pipeline.forward(request_batch)
+
+    assert len(outputs) == 2
+    for output in outputs:
+        prompt_embeddings = output.output["metadata"]["prompt_embeddings"]
+        assert prompt_embeddings["negative_prompt_embeds"] is None
+        assert prompt_embeddings["negative_audio_prompt_embeds"] is None
+        assert prompt_embeddings["negative_prompt_embeds_mask"] is None
+
+
 def test_ltx2_omni_nft_forward_rejects_captured_batch_mismatch() -> None:
     pipeline = object.__new__(LTX23OmniNFTPipeline)
     pipeline._inject_batch_prompt_embeds = MagicMock()

@@ -19,6 +19,7 @@ from typing import Optional
 import numpy as np
 import torch
 from diffusers import ModelMixin
+from diffusers.models.normalization import RMSNorm
 from tensordict import TensorDict
 from verl.utils.device import get_device_name
 
@@ -29,6 +30,26 @@ from verl_omni.workers.config import DiffusionModelConfig
 from .common import apply_x0_cfg, calculate_shift
 
 __all__ = ["LTX23FlowGRPO"]
+
+
+def _eager_rms_norm_forward(self: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Run RMSNorm without torch-npu's fused op, which cannot consume FSDP parameter views."""
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+    weight = getattr(self, "weight", None)
+    if weight is not None:
+        hidden_states = hidden_states * weight.to(dtype=hidden_states.dtype)
+        bias = getattr(self, "bias", None)
+        if bias is not None:
+            hidden_states = hidden_states + bias.to(dtype=hidden_states.dtype)
+    return hidden_states.to(input_dtype)
+
+
+def _enable_eager_rms_norm() -> None:
+    """Keep eager RMSNorm enabled for checkpoint recomputation in this training worker."""
+    RMSNorm.forward = _eager_rms_norm_forward
 
 
 def _single_int(value: torch.Tensor, name: str) -> int:
@@ -142,6 +163,7 @@ class LTX23FlowGRPO(DiffusionModelBase):
     @staticmethod
     def _predict(module: ModelMixin, model_inputs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the LTX transformer and return float32 video/audio velocities."""
+        _enable_eager_rms_norm()
         video_pred, audio_pred = module(**model_inputs)
         return video_pred.float(), audio_pred.float()
 

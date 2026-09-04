@@ -328,7 +328,8 @@ class LTX23OmniNFTPipeline(LTXTokenIdPromptMixin, LTX2Pipeline):
                 video_latents=_slice_batch_row(clean_state.video, index, packed_batch, "video_latents_clean"),
                 audio_latents=_slice_batch_row(clean_state.audio, index, packed_batch, "audio_latents_clean"),
                 prompt_embeddings={
-                    key: _slice_batch_row(value, index, packed_batch, key) for key, value in prompt_fields.items()
+                    key: None if value is None else _slice_batch_row(value, index, packed_batch, key)
+                    for key, value in prompt_fields.items()
                 },
                 train_timesteps=_slice_batch_row(train_timesteps, index, packed_batch, "train_timesteps"),
                 fps=fps,
