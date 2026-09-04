@@ -11,7 +11,7 @@ source $ASCEND_HOME_PATH/../nnal/atb/set_env.sh
 WORKSPACE=${WORKSPACE:-$HOME}
 MODEL_PATH=${MODEL_PATH:-dg845/LTX-2.3-Diffusers}
 DATA_DIR=${DATA_DIR:-$WORKSPACE/data/vid_prompt/verl_omni}
-CLAP_MODEL_PATH=${CLAP_MODEL_PATH:-laion/larger_clap_general}
+CLAP_MODEL_PATH=${CLAP_MODEL_PATH:-/hub/omnift-rewards/checkpoints/clap-htsat-unfused}
 IMAGEBIND_MODEL_PATH=${IMAGEBIND_MODEL_PATH:-.checkpoints/imagebind_huge.pth}
 NUM_GPUS=${NUM_GPUS:-16}
 ROLLOUT_TP=${ROLLOUT_TP:-4}

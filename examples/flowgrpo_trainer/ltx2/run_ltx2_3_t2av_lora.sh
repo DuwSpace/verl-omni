@@ -113,7 +113,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     '+reward.reward_functions.clap.name=compute_score' \
     '+reward.reward_functions.clap.weight=1.0' \
     '+reward.reward_functions.clap.device=cuda:0' \
-    '+reward.reward_functions.clap.model_name_or_path=laion/larger_clap_general' \
+    '+reward.reward_functions.clap.model_name_or_path=/hub/omnift-rewards/checkpoints/clap-htsat-unfused' \
     "+reward.reward_functions.imagebind.path=$repo_root/verl_omni/utils/reward_score/imagebind.py" \
     '+reward.reward_functions.imagebind.name=compute_score' \
     '+reward.reward_functions.imagebind.weight=1.0' \

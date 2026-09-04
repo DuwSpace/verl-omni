@@ -53,6 +53,10 @@ all prompts when a limit is not provided.
 CLAP uses the existing `transformers` and `torchaudio` dependencies. ImageBind
 is optional software under the CC-BY-NC-SA 4.0 non-commercial license:
 
+Both launchers load CLAP from
+`/hub/omnift-rewards/checkpoints/clap-htsat-unfused` by default. The NPU
+launcher can override this location with `CLAP_MODEL_PATH`.
+
 ```bash
 pip install 'git+https://github.com/facebookresearch/ImageBind.git'
 pip install 'git+https://github.com/facebookresearch/pytorchvideo.git'
