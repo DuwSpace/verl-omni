@@ -16,11 +16,11 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
-DATA_DIR=${DATA_DIR:-$REPO_ROOT/data/omninft/vggsound/verl_omni}
+DATA_DIR=${DATA_DIR:-$REPO_ROOT/outputs/s5_2_data}
 TRAIN_FILE=${TRAIN_FILE:-$DATA_DIR/train.parquet}
 VAL_FILE=${VAL_FILE:-$DATA_DIR/test.parquet}
 
-export WANDB_MODE=${WANDB_MODE:-offline}
+export WANDB_MODE=${WANDB_MODE:-online}
 export OMNIFT_ROLLOUT_PROGRESS=${OMNIFT_ROLLOUT_PROGRESS:-1}
 ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit}
 set +u
@@ -28,18 +28,18 @@ source "$ASCEND_HOME_PATH/set_env.sh"
 source "$ASCEND_HOME_PATH/../nnal/atb/set_env.sh"
 set -u
 
-MODEL_PATH=${MODEL_PATH:-dg845/LTX-2.3-Diffusers}
+MODEL_PATH=${MODEL_PATH:-/hub/models--diffusers--LTX-2.3-Diffusers/snapshots/8eee8edcf067e838b843f926ec4d4cc9b2be1aaf}
 REWARD_ROOT=${REWARD_ROOT:-/hub/omnift-rewards}
 DESYNC_SOURCE_ROOT=${DESYNC_SOURCE_ROOT:-$REWARD_ROOT/OmniNFT-reference}
 NUM_GPUS=${NUM_GPUS:-8}
 ROLLOUT_TP=${ROLLOUT_TP:-8}
 REWARD_NUM_WORKERS=${REWARD_NUM_WORKERS:-$NUM_GPUS}
-TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1}
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-100}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-4}
 REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-100}
-ROLLOUT_DATA_SAVE_FREQ=${ROLLOUT_DATA_SAVE_FREQ:-3}
+ROLLOUT_DATA_SAVE_FREQ=${ROLLOUT_DATA_SAVE_FREQ:-10}
 ROLLOUT_DATA_MAX_SAMPLES=${ROLLOUT_DATA_MAX_SAMPLES:-null}
-REWARD_PARALLEL_GROUPS=${REWARD_PARALLEL_GROUPS:-}
+REWARD_PARALLEL_GROUPS=${REWARD_PARALLEL_GROUPS-audiobox_clap}
 
 reward_parallel_group_overrides=()
 case "$REWARD_PARALLEL_GROUPS" in
@@ -73,6 +73,8 @@ run_timestamp=$(date +"%Y%m%d_%H%M")
 log_file=$output_dir/logs/$run_timestamp/${NODE_RANK:-0}.log
 rollout_data_dir=$output_dir/logs/$run_timestamp/rollout_videos
 validation_data_dir=$output_dir/logs/$run_timestamp/validation_videos
+WANDB_DIR=$output_dir
+
 mkdir -p "$checkpoint_dir" "$(dirname "$log_file")"
 exec > >(tee -a "$log_file") 2>&1
 
@@ -84,8 +86,8 @@ python3 -m verl_omni.trainer.main_diffusion \
     data.val_files="$VAL_FILE" \
     data.return_multi_modal_inputs=False \
     data.train_batch_size=1 \
-    data.val_max_samples=8 \
-    data.val_batch_size=4 \
+    data.val_max_samples=1 \
+    data.val_batch_size=1 \
     data.max_prompt_length=1024 \
     data.truncation=error \
     data.seed=42 \
@@ -113,7 +115,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.model.fsdp_layer_prefixes="['transformer_blocks.']" \
     actor_rollout_ref.actor.strategy=fsdp2 \
     '+actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=[LTX2VideoTransformerBlock]' \
-    actor_rollout_ref.actor.optim.lr=1e-5 \
+    actor_rollout_ref.actor.optim.lr=3e-5 \
     actor_rollout_ref.actor.optim.weight_decay=1e-4 \
     actor_rollout_ref.actor.ppo_mini_batch_size=1 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
@@ -141,22 +143,32 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.rollout_adapter=old \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.max_num_seqs=${MAX_NUM_SEQS} \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.request_batch_max_wait_ms=${REQUEST_BATCH_MAX_WAIT_MS} \
-    actor_rollout_ref.rollout.pipeline.height=256 \
-    actor_rollout_ref.rollout.pipeline.width=384 \
+    ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.enable_cpu_offload=true \
+    ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.vae_use_tiling=true \
+    actor_rollout_ref.rollout.pipeline.height=512 \
+    actor_rollout_ref.rollout.pipeline.width=768 \
     actor_rollout_ref.rollout.pipeline.num_frames=121 \
     actor_rollout_ref.rollout.pipeline.frame_rate=24.0 \
-    actor_rollout_ref.rollout.pipeline.num_inference_steps=30 \
+    actor_rollout_ref.rollout.pipeline.num_inference_steps=20 \
     actor_rollout_ref.rollout.pipeline.video_cfg_scale=1.5 \
     actor_rollout_ref.rollout.pipeline.audio_cfg_scale=3.0 \
+    actor_rollout_ref.rollout.pipeline.video_modality_scale=1.0 \
+    actor_rollout_ref.rollout.pipeline.audio_modality_scale=1.0 \
+    actor_rollout_ref.rollout.pipeline.video_rescale_scale=0.0 \
+    actor_rollout_ref.rollout.pipeline.audio_rescale_scale=0.0 \
     actor_rollout_ref.rollout.pipeline.max_sequence_length=1024 \
     +actor_rollout_ref.rollout.pipeline.output_type=pt \
-    actor_rollout_ref.rollout.val_kwargs.pipeline.height=256 \
-    actor_rollout_ref.rollout.val_kwargs.pipeline.width=384 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.height=512 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.width=768 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_frames=121 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.frame_rate=24.0 \
-    actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=30 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=1 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.video_cfg_scale=3.0 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.audio_cfg_scale=7.0 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.video_modality_scale=1.0 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.audio_modality_scale=1.0 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.video_rescale_scale=0.0 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.audio_rescale_scale=0.0 \
     +actor_rollout_ref.rollout.val_kwargs.pipeline.output_type=pt \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
     reward.num_workers="$REWARD_NUM_WORKERS" \
@@ -199,9 +211,9 @@ python3 -m verl_omni.trainer.main_diffusion \
     +reward.reward_functions.desync.source_root="$DESYNC_SOURCE_ROOT" \
     +reward.reward_functions.desync.routing_weights.video=1.0 \
     +reward.reward_functions.desync.routing_weights.audio=1.0 \
-    trainer.logger='["console"]' \
+    trainer.logger='["console","wandb"]' \
     trainer.project_name=omni_nft \
-    trainer.experiment_name=ltx2_3_omninft_lora_npu \
+    trainer.experiment_name=sample_1_lr_3e-5_timestep_sort_kl_loss_m_rank_32_alpha_64_rollout_cfg_1/1 \
     trainer.default_local_dir=$checkpoint_dir \
     trainer.rollout_data_dir="$rollout_data_dir" \
     trainer.rollout_data_save_freq="$ROLLOUT_DATA_SAVE_FREQ" \

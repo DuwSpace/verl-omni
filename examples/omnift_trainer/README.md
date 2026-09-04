@@ -2,6 +2,9 @@
 
 This directory contains the production LTX-2.3 OmniNFT recipe.
 
+For environment setup, model downloads, Docker startup, data preparation, and
+the commands to run after entering the container, see [RUN.md](RUN.md).
+
 ## Prepare data
 
 Convert the native OmniNFT VGGSound JSONL metadata to the standard RLHF parquet schema:
@@ -36,9 +39,3 @@ from VideoAlign, HPSv3, and DeSync. Audio receives weights `0.5`, `1.0`, and `1.
 
 Pinned downloads, host/container paths, and SHA-256 checks are in
 [reward_models.md](reward_models.md).
-
-## Architecture
-
-Rollout/reward call chains and the fields crossing the rollout → reward →
-trainer-adapter boundary are in [architecture.md](architecture.md).
-
