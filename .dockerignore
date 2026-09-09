@@ -30,13 +30,6 @@ docs/_build
 # Training artifacts & datasets
 dataset
 data
-!data/
-data/*
-!data/omninft/
-data/omninft/*
-!data/omninft/vggsound/
-data/omninft/vggsound/*
-!data/omninft/vggsound/train_metadata_20k.jsonl
 checkpoints
 outputs
 output
@@ -54,3 +47,4 @@ playground
 # Hugging Face / model caches
 .huggingface
 **/huggingface
+
