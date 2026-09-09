@@ -130,3 +130,7 @@ logs
 log
 outputs
 .history
+.devcontainer/devcontainer.json
+profiler_info_*.json
+extra-info/
+kernel_meta/

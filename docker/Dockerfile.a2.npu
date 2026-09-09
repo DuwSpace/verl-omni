@@ -190,7 +190,23 @@ RUN python3 -m pip install --force-reinstall \
         'packaging>=26.2' \
         'fsspec<=2026.6.0'
 
-    
+# Install the two optional dependencies required by the production OmniNFT
+# AudioBox and DeSync rewards. Avoid dependency resolution here so the pinned
+# torch / torch-npu stack above remains unchanged.
+RUN python3 -m pip install --no-deps \
+        audiobox_aesthetics==0.0.4 \
+        timm==1.0.27 && \
+    python3 -c "from audiobox_aesthetics.model.aes import AesMultiOutput; from timm.layers import trunc_normal_; print('OmniNFT reward dependencies OK')"
+
+# Generate the small prompt-group parquet dataset used by the current OmniNFT
+# training recipe. The source JSONL is the only data file included in the
+# Docker build context; model and reward weights remain external mounts.
+ENV OMNIFT_DATA_DIR=/workspace/data/omninft/s5_2_data
+RUN OUTPUT_DIR=${OMNIFT_DATA_DIR} \
+    bash /workspace/src/verl-omni/examples/omnift_trainer/ltx2/prepare_s5_2_data_1.sh && \
+    test -f "${OMNIFT_DATA_DIR}/train.parquet" && \
+    test -f "${OMNIFT_DATA_DIR}/test.parquet"
+
 RUN echo "export VLLM_WORKER_MULTIPROC_METHOD=spawn" >> /root/.bashrc && \
     echo 'export LD_PRELOAD=/usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2:$LD_PRELOAD' >> /root/.bashrc && \
     echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib' >> /root/.bashrc

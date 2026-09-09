@@ -84,6 +84,10 @@ algorithm:
   # DiffusionNFT fraction of rollout timesteps used for forward-process training
   timestep_fraction: 1.0
 
+  # DiffusionNFT train-timestep selection: "random" reshuffles the rollout grid;
+  # "top_sigma" keeps only the highest-noise timesteps (official OmniNFT semantics)
+  timestep_selection: random
+
   # DiffusionNFT advantage mapping mode before reward-probability scaling
   adv_mode: continuous
 

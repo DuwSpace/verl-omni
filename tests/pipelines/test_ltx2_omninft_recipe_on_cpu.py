@@ -26,7 +26,6 @@ import torch
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics
 from verl.protocol import DataProto
 
-
 REPO_ROOT = Path(__file__).parents[2]
 RECIPE = REPO_ROOT / "examples/omnift_trainer/ltx2/run_ltx2_3_omninft_lora_npu.sh"
 
@@ -68,22 +67,71 @@ def test_recipe_has_valid_shell_syntax():
     subprocess.run(["bash", "-n", str(RECIPE)], check=True)
 
 
-def test_recipe_defaults_to_sequential_native_rewards(tmp_path):
+def test_recipe_defaults_to_audiobox_clap_parallel_group(tmp_path):
     result, args = _run_recipe_launcher(tmp_path)
-
-    assert result.returncode == 0, result.stderr
-    assert "reward.component_order=[video_align,hpsv3,audiobox,clap,desync]" in args
-    assert not any("reward.native.parallel_groups" in arg for arg in args)
-
-
-def test_recipe_opt_in_adds_only_audiobox_clap_parallel_group(tmp_path):
-    result, args = _run_recipe_launcher(tmp_path, reward_parallel_groups="audiobox_clap")
 
     assert result.returncode == 0, result.stderr
     assert "reward.component_order=[video_align,hpsv3,audiobox,clap,desync]" in args
     assert [arg for arg in args if "reward.native.parallel_groups" in arg] == [
         "+reward.native.parallel_groups.audiobox_clap.rewards=[audiobox,clap]"
     ]
+
+
+def test_recipe_empty_parallel_group_override_uses_sequential_native_rewards(tmp_path):
+    result, args = _run_recipe_launcher(tmp_path, reward_parallel_groups="")
+
+    assert result.returncode == 0, result.stderr
+    assert "reward.component_order=[video_align,hpsv3,audiobox,clap,desync]" in args
+    assert not any("reward.native.parallel_groups" in arg for arg in args)
+
+
+def test_recipe_matches_official_omninft_rollout_guidance(tmp_path):
+    result, args = _run_recipe_launcher(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    expected = {
+        "actor_rollout_ref.model.pipeline.video_cfg_scale=1",
+        "actor_rollout_ref.model.pipeline.audio_cfg_scale=1",
+        "actor_rollout_ref.rollout.pipeline.video_cfg_scale=1.5",
+        "actor_rollout_ref.rollout.pipeline.audio_cfg_scale=3.0",
+        "actor_rollout_ref.rollout.pipeline.video_modality_scale=1.0",
+        "actor_rollout_ref.rollout.pipeline.audio_modality_scale=1.0",
+        "actor_rollout_ref.rollout.pipeline.video_rescale_scale=0.0",
+        "actor_rollout_ref.rollout.pipeline.audio_rescale_scale=0.0",
+        "actor_rollout_ref.rollout.val_kwargs.pipeline.video_cfg_scale=3.0",
+        "actor_rollout_ref.rollout.val_kwargs.pipeline.audio_cfg_scale=7.0",
+        "actor_rollout_ref.rollout.val_kwargs.pipeline.video_modality_scale=1.0",
+        "actor_rollout_ref.rollout.val_kwargs.pipeline.audio_modality_scale=1.0",
+        "actor_rollout_ref.rollout.val_kwargs.pipeline.video_rescale_scale=0.0",
+        "actor_rollout_ref.rollout.val_kwargs.pipeline.audio_rescale_scale=0.0",
+    }
+    assert expected.issubset(args)
+
+
+def test_ltx_modality_guidance_and_rescale_reach_sampling_extra_args():
+    from verl_omni.agent_loop.diffusion_agent_loop import _config_to_sampling_dict
+    from verl_omni.workers.config.diffusion.rollout import DiffusionPipelineConfig
+
+    config = DiffusionPipelineConfig(
+        video_modality_scale=3.0,
+        audio_modality_scale=2.5,
+        video_rescale_scale=0.7,
+        audio_rescale_scale=0.3,
+    )
+
+    sampling = _config_to_sampling_dict(config)
+    guidance_keys = (
+        "video_modality_scale",
+        "audio_modality_scale",
+        "video_rescale_scale",
+        "audio_rescale_scale",
+    )
+    assert {key: sampling[key] for key in guidance_keys} == {
+        "video_modality_scale": 3.0,
+        "audio_modality_scale": 2.5,
+        "video_rescale_scale": 0.7,
+        "audio_rescale_scale": 0.3,
+    }
 
 
 def test_recipe_rejects_unapproved_parallel_group_values(tmp_path):
@@ -209,9 +257,7 @@ def test_g8_agent_loop_output_round_trips_without_identity_or_tensor_drift(tmp_p
     assert restored.non_tensor_batch["uid"].tolist() == ["prompt-0"] * 8
     assert restored.non_tensor_batch["sample_uid"].tolist() == sample_uids.tolist()
     assert len(set(restored.non_tensor_batch["sample_uid"].tolist())) == 8
-    assert restored.non_tensor_batch["raw_prompt"].tolist() == [
-        [{"role": "user", "content": "a joint prompt"}]
-    ] * 8
+    assert restored.non_tensor_batch["raw_prompt"].tolist() == [[{"role": "user", "content": "a joint prompt"}]] * 8
     assert restored.meta_info == replay.meta_info
 
 
