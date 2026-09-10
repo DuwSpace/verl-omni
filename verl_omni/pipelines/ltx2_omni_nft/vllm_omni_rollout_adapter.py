@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import LTXPromptContext
 from vllm_omni.diffusion.models.ltx2.ltx2_denoise import (
@@ -33,6 +36,12 @@ from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTXPhaseRecipe
 from vllm_omni.diffusion.models.ltx2.ltx2_request import LTXRequestInputs
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.diffusion.offloader.sequential_backend import (
+    SequentialOffloadHook,
+    apply_sequential_offload,
+    remove_sequential_offload,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
@@ -42,6 +51,8 @@ from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.request_batch import split_diffusion_output_by_request as _split_diffusion_output_by_request
 
 __all__ = ["LTX23OmniNFTPipeline"]
+
+logger = init_logger(__name__)
 
 
 def _resolve_omni_nft_output_type(sampling_params: Any) -> str:
@@ -182,6 +193,113 @@ class LTX23OmniNFTPipeline(LTXTokenIdPromptMixin, LTX2Pipeline):
 
     supports_request_batch = True
 
+    def enable_omni_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool,
+        use_hsdp: bool,
+    ) -> None:
+        """Own model-level offload so every LTX audio-video component participates."""
+        if getattr(self, "_model_cpu_offload_modules", None):
+            return
+
+        components = ModuleDiscovery.discover(self)
+        dits = components.dits
+        stages = [*components.encoders, *components.vaes, *components.resident_modules]
+        modules = list(dict.fromkeys([*dits, *stages]))
+        apply_sequential_offload(
+            dit_modules=dits,
+            encoder_modules=stages,
+            device=device,
+            pin_memory=pin_memory,
+            use_hsdp=use_hsdp,
+        )
+        self._model_cpu_offload_modules = modules
+        try:
+            # The pinned vLLM-Omni predates ``offload_initial_dits``.  Moving
+            # every registered component here gives NPU the same cold-start
+            # behavior without depending on that newer keyword.
+            self._offload_omni_model_components()
+        except BaseException:
+            remove_sequential_offload(modules)
+            self._model_cpu_offload_modules = []
+            raise
+        logger.info(
+            "LTX-2.3 OmniNFT model-level CPU offload enabled for %d component(s)",
+            len(modules),
+        )
+
+    def disable_omni_model_cpu_offload(self) -> None:
+        modules = getattr(self, "_model_cpu_offload_modules", None)
+        if not modules:
+            return
+        self._offload_omni_model_components()
+        remove_sequential_offload(modules)
+        self._model_cpu_offload_modules = []
+
+    @staticmethod
+    def _model_cpu_offload_hook(component: torch.nn.Module) -> SequentialOffloadHook:
+        registry = getattr(component, "_hook_registry", None)
+        hook = registry.get_hook(SequentialOffloadHook._HOOK_NAME) if registry is not None else None
+        if not isinstance(hook, SequentialOffloadHook):
+            raise RuntimeError(f"{component.__class__.__name__} has no sequential CPU-offload hook.")
+        return hook
+
+    @contextmanager
+    def _omni_component_on_device(self, component: torch.nn.Module) -> Iterator[None]:
+        """Stage a component whose entry point bypasses ``nn.Module.forward``."""
+        if not getattr(self, "_model_cpu_offload_modules", None):
+            yield
+            return
+
+        hook = self._model_cpu_offload_hook(component)
+        try:
+            hook.pre_forward(component)
+            yield
+        except BaseException:
+            try:
+                hook._to_cpu(component)
+            except BaseException:
+                logger.exception("Failed to release %s after component failure", component.__class__.__name__)
+            raise
+        else:
+            hook._to_cpu(component)
+
+    def _offload_omni_model_components(self) -> None:
+        first_error: BaseException | None = None
+        for component in getattr(self, "_model_cpu_offload_modules", ()):
+            try:
+                self._model_cpu_offload_hook(component)._to_cpu(component)
+            except BaseException as exc:
+                logger.exception("Failed to release CPU-offload component %s", component.__class__.__name__)
+                first_error = first_error or exc
+        if first_error is not None:
+            raise RuntimeError("Failed to release one or more CPU-offload components") from first_error
+
+    def _clear_omni_nft_capture(self) -> None:
+        self._omni_nft_prompt_context = None
+        self._omni_nft_clean_state = None
+        self._omni_nft_forward_context = None
+
+    @contextmanager
+    def _omni_nft_rollout_lifecycle(self) -> Iterator[None]:
+        self._clear_omni_nft_capture()
+        try:
+            yield
+        except BaseException:
+            self._clear_omni_nft_capture()
+            try:
+                self._offload_omni_model_components()
+            except BaseException:
+                # Preserve the generation error; a subsequent sleep still has
+                # the worker-level fallback for any component that failed here.
+                logger.exception("Failed to release CPU-offload components after rollout failure")
+            raise
+        else:
+            self._clear_omni_nft_capture()
+            self._offload_omni_model_components()
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
         if _rollout_progress_bar_enabled():
@@ -242,6 +360,26 @@ class LTX23OmniNFTPipeline(LTXTokenIdPromptMixin, LTX2Pipeline):
         self._omni_nft_forward_context = forward_ctx
         return clean_state
 
+    def _unpack_and_denormalize_stage(
+        self,
+        forward_ctx: LTXForwardContext,
+        latents: torch.Tensor,
+        audio_latents: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with self._omni_component_on_device(self.vae):
+            with self._omni_component_on_device(self.audio_vae):
+                return super()._unpack_and_denormalize_stage(forward_ctx, latents, audio_latents)
+
+    def _encode_i2v_image_latents(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        with self._omni_component_on_device(self.vae):
+            return super()._encode_i2v_image_latents(*args, **kwargs)
+
+    def decode_phase(self, phase: LTXPhaseResult) -> DiffusionOutput | list[DiffusionOutput]:
+        with self._omni_component_on_device(self.vae):
+            with self._omni_component_on_device(self.audio_vae):
+                with self._omni_component_on_device(self.vocoder):
+                    return super().decode_phase(phase)
+
     @torch.no_grad()
     def forward(
         self,
@@ -249,14 +387,19 @@ class LTX23OmniNFTPipeline(LTXTokenIdPromptMixin, LTX2Pipeline):
         **kwargs: Any,
     ) -> DiffusionOutput | list[DiffusionOutput]:
         """Generate decoded audio-video and attach final clean latent metadata."""
+        with self._omni_nft_rollout_lifecycle():
+            return self._forward_omni_nft(req, **kwargs)
+
+    def _forward_omni_nft(
+        self,
+        req: OmniDiffusionRequest | DiffusionRequestBatch,
+        **kwargs: Any,
+    ) -> DiffusionOutput | list[DiffusionOutput]:
         request_batch = req if isinstance(req, DiffusionRequestBatch) else DiffusionRequestBatch(requests=[req])
         return_batch = isinstance(req, DiffusionRequestBatch)
         if request_batch.num_reqs < 1:
             raise ValueError("LTX-2.3 OmniNFT expects at least one request.")
 
-        self._omni_nft_prompt_context = None
-        self._omni_nft_clean_state = None
-        self._omni_nft_forward_context = None
         for request in request_batch.requests:
             request.sampling_params.output_type = _resolve_omni_nft_output_type(request.sampling_params)
         self._inject_batch_prompt_embeds(request_batch)
