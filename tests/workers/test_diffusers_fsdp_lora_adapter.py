@@ -64,12 +64,17 @@ class LoRAFSDPTestWorker(TrainingWorker):
             "world_size": dist.get_world_size(),
             "strategy": self.engine.engine_config.strategy,
             "fsdp_size": self.engine.engine_config.fsdp_size,
+            "uses_fsdp2_cpu_offload_policy": self.engine._uses_fsdp2_cpu_offload_policy,
         }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def collect_lora_params(self, adapter_name: str = "default"):
+    def report_module_device(self):
+        return next(self.engine.module.parameters()).device.type
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def collect_lora_params(self, adapter_name: str = "default", layered_summon: bool = False):
         params, _ = self.engine.get_per_tensor_param(
-            layered_summon=False,
+            layered_summon=layered_summon,
             base_sync_done=True,
             adapter_name=adapter_name,
         )
@@ -307,6 +312,47 @@ def _run_copy_ema_adapter_test(strategy: str) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _run_fsdp2_cpu_offload_layered_collection_test() -> None:
+    base_model_path = _require_model_path()
+    device_count = _resolve_lora_test_device_count("fsdp2")
+
+    ray.init()
+    tmp_dir = tempfile.mkdtemp(prefix="qwen_image_lora_fsdp2_offload_")
+    try:
+        sp_enabled = device_count > 1 and _diffusers_sp_supported()
+        if sp_enabled:
+            model_path = _create_sp_compatible_model(tmp_dir, base_model_path, num_attention_heads=2)
+        else:
+            model_path = base_model_path
+
+        training_config, _ = create_training_config(
+            model_type="diffusion_model",
+            strategy="fsdp2",
+            device_count=device_count,
+            model=model_path,
+            policy_state_adapters=("default", "old"),
+            offload_policy=True,
+        )
+
+        ray_cls_with_init = RayClassWithInitArgs(cls=ray.remote(LoRAFSDPTestWorker), config=training_config)
+        resource_pool = RayResourcePool(process_on_nodes=[device_count])
+        wg = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=ray_cls_with_init)
+        wg.reset()
+
+        topology = wg.report_fsdp_topology()
+        assert all(worker_topology["uses_fsdp2_cpu_offload_policy"] for worker_topology in topology)
+        default_params = _rank0_params(wg.collect_lora_params("default", layered_summon=True))
+        wg.copy_adapter(source="default", target="old")
+        assert all(device == "cpu" for device in wg.report_module_device())
+        old_params = _rank0_params(wg.collect_lora_params("old", layered_summon=True))
+        assert old_params
+        assert all(param.device.type == "cpu" for param in old_params.values())
+        _lora_params_close(old_params, default_params)
+    finally:
+        ray.shutdown()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
 def test_diffusers_fsdp_lora_adapter_switch(strategy):
     if not torch.cuda.is_available():
@@ -319,3 +365,9 @@ def test_diffusers_fsdp_lora_adapter_copy_ema(strategy):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for FSDP LoRA adapter tests.")
     _run_copy_ema_adapter_test(strategy)
+
+
+def test_diffusers_fsdp2_cpu_offload_layered_lora_collection():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the FSDP2 CPU-offload LoRA test.")
+    _run_fsdp2_cpu_offload_layered_collection_test()

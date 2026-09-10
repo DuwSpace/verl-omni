@@ -32,6 +32,7 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 video_tensor_to_pil_frames = _MODULE.video_tensor_to_pil_frames
 pil_image_to_base64 = _MODULE.pil_image_to_base64
+load_torch_state_dict = _MODULE.load_torch_state_dict
 
 
 def test_video_tensor_to_pil_frames_preserves_uint8_pixels():
@@ -67,3 +68,47 @@ def test_pil_image_to_base64_roundtrips_to_the_same_image():
     decoded = Image.open(BytesIO(base64.b64decode(uri.split(",", 1)[1])))
     assert decoded.format == "PNG"
     assert np.array_equal(np.asarray(decoded), np.asarray(image))
+
+
+def test_load_torch_state_dict_uses_mmap_for_supported_checkpoints(monkeypatch):
+    calls = []
+
+    def fake_load(path, **kwargs):
+        calls.append((path, kwargs))
+        return {"weight": torch.ones(1)}
+
+    monkeypatch.setattr(_MODULE.torch, "load", fake_load)
+
+    result = load_torch_state_dict("/models/reward.pth")
+
+    assert result["weight"].equal(torch.ones(1))
+    assert len(calls) == 1
+    assert calls[0][1]["mmap"] is True
+
+
+def test_load_torch_state_dict_falls_back_for_legacy_checkpoints(monkeypatch):
+    calls = []
+
+    def fake_load(path, **kwargs):
+        calls.append((path, kwargs))
+        if len(calls) == 1:
+            raise RuntimeError("mmap can only be used with files saved with torch.save")
+        return {"weight": torch.ones(1)}
+
+    monkeypatch.setattr(_MODULE.torch, "load", fake_load)
+
+    result = load_torch_state_dict("/models/reward.pth")
+
+    assert result["weight"].equal(torch.ones(1))
+    assert len(calls) == 2
+    assert "mmap" not in calls[1][1]
+
+
+def test_load_torch_state_dict_does_not_hide_other_load_errors(monkeypatch):
+    def fake_load(path, **kwargs):
+        raise RuntimeError("checkpoint is corrupted")
+
+    monkeypatch.setattr(_MODULE.torch, "load", fake_load)
+
+    with pytest.raises(RuntimeError, match="checkpoint is corrupted"):
+        load_torch_state_dict("/models/reward.pth")

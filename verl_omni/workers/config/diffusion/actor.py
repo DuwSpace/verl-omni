@@ -42,6 +42,10 @@ class DiffusionLossConfig(BaseConfig):
     adv_clip_max: float = 5.0
     mix_beta: float = 0.5
     ref_kl_coef: float = 0.0
+    video_weight: float = 1.0
+    audio_weight: float = 1.0
+    video_ref_kl_coef: float = 0.0
+    audio_ref_kl_coef: float = 0.0
     adaptive_weight_min: float = 1e-5
     dpo_beta: float = 2000.0
     kl_mask_threshold: float = 1e-5
@@ -54,6 +58,7 @@ class DiffusionLossConfig(BaseConfig):
             "flow_dppo",
             "grpo_guard",
             "diffusion_nft",
+            "omni_nft",
             "dpo",
             "dance_grpo",
             "distill_kl",
@@ -69,6 +74,10 @@ class DiffusionLossConfig(BaseConfig):
             raise ValueError(f"adaptive_weight_min must be positive, got {self.adaptive_weight_min}.")
         if self.kl_mask_threshold <= 0:
             raise ValueError(f"kl_mask_threshold must be positive, got {self.kl_mask_threshold}.")
+        for name in ("video_weight", "audio_weight", "video_ref_kl_coef", "audio_ref_kl_coef"):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}.")
 
 
 @dataclass

@@ -86,6 +86,43 @@ def test_pixel_quantization_preserves_float_audio(diffusion_server):
     assert output.extra_fields["audio_sample_rate"] == 48_000
 
 
+def test_omninft_metadata_preserves_named_av_conditions(diffusion_server):
+    def values(offset: int, shape: tuple[int, ...], dtype=torch.float32) -> torch.Tensor:
+        return torch.arange(offset, offset + int(np.prod(shape)), dtype=dtype).reshape(shape)
+
+    prompt_embeddings = {
+        "prompt_embeds": values(0, (1, 3, 4)),
+        "audio_prompt_embeds": values(20, (1, 3, 4)),
+        "prompt_embeds_mask": values(40, (1, 3), torch.long),
+        "negative_prompt_embeds": values(50, (1, 3, 4)),
+        "negative_audio_prompt_embeds": values(70, (1, 3, 4)),
+        "negative_prompt_embeds_mask": values(90, (1, 3), torch.long),
+    }
+    rl = {
+        "audio": values(100, (1, 2, 8)),
+        "video_latents_clean": values(120, (1, 5, 4)),
+        "audio_latents_clean": values(140, (1, 7, 4)),
+        "train_timesteps": values(180, (1, 2)),
+    }
+
+    output = diffusion_server._process_output(
+        _request_output(
+            torch.tensor([0.0, 0.5, 1.0]),
+            {"metadata": {"prompt_embeddings": prompt_embeddings, "rl": rl}},
+        ),
+        params=None,
+        sampling_params={},
+    )
+
+    expected = {**prompt_embeddings, **rl}
+    assert set(expected) <= set(output.extra_fields)
+    assert output.log_probs is None
+    assert "all_latents" not in output.extra_fields
+    assert "all_timesteps" not in output.extra_fields
+    for key, value in expected.items():
+        torch.testing.assert_close(output.extra_fields[key], value[0])
+
+
 @pytest.mark.parametrize(
     "latents",
     [

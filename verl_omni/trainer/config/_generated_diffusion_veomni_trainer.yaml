@@ -88,6 +88,10 @@ actor_rollout_ref:
       adv_clip_max: 5.0
       mix_beta: 0.5
       ref_kl_coef: 0.0
+      video_weight: 1.0
+      audio_weight: 1.0
+      video_ref_kl_coef: 0.0
+      audio_ref_kl_coef: 0.0
       adaptive_weight_min: 1.0e-05
       dpo_beta: 2000.0
       kl_mask_threshold: 1.0e-05
@@ -263,6 +267,12 @@ actor_rollout_ref:
         true_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.true_cfg_scale,1.0}
         max_sequence_length: ${oc.select:actor_rollout_ref.rollout.pipeline.max_sequence_length,512}
         guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
+        video_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_cfg_scale,null}
+        audio_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_cfg_scale,null}
+        video_modality_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_modality_scale,null}
+        audio_modality_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_modality_scale,null}
+        video_rescale_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_rescale_scale,null}
+        audio_rescale_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_rescale_scale,null}
         num_frames: ${oc.select:actor_rollout_ref.rollout.pipeline.num_frames,1}
         frame_rate: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_rate,24.0}
       algo:
@@ -290,6 +300,12 @@ actor_rollout_ref:
       true_cfg_scale: 1.0
       max_sequence_length: 512
       guidance_scale: null
+      video_cfg_scale: null
+      audio_cfg_scale: null
+      video_modality_scale: null
+      audio_modality_scale: null
+      video_rescale_scale: null
+      audio_rescale_scale: null
       num_frames: 1
       frame_rate: 24.0
     calculate_log_probs: false
@@ -358,6 +374,12 @@ actor_rollout_ref:
       true_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.true_cfg_scale,1.0}
       max_sequence_length: ${oc.select:actor_rollout_ref.rollout.pipeline.max_sequence_length,512}
       guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
+      video_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_cfg_scale,null}
+      audio_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_cfg_scale,null}
+      video_modality_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_modality_scale,null}
+      audio_modality_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_modality_scale,null}
+      video_rescale_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.video_rescale_scale,null}
+      audio_rescale_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_rescale_scale,null}
       num_frames: ${oc.select:actor_rollout_ref.rollout.pipeline.num_frames,1}
       frame_rate: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_rate,24.0}
     algo:
@@ -490,6 +512,7 @@ reward:
     name: compute_score
   reward_functions: {}
   aggregation: weighted_sum
+  component_order: []
   reward_manager:
     _target_: verl.workers.config.reward_model.RewardManagerConfig
     source: importlib
@@ -519,6 +542,7 @@ algorithm:
   old_policy_decay: null
   old_policy_update_interval: 1
   timestep_fraction: 1.0
+  timestep_selection: random
   adv_mode: continuous
   paired_preference: false
   rollout_correction:

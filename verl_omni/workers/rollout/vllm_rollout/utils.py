@@ -16,6 +16,7 @@ import os
 import time
 
 import torch
+from torch.distributed._tensor import DTensor
 from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH, set_death_signal
 from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 
@@ -41,6 +42,100 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
     """
 
     _pending_lora_peft_config: dict | None = None
+
+    def _prepare_cpu_offload_sleep(self) -> None:
+        """Move dynamically loaded model-level-offload tensors back to CPU.
+
+        vLLM-Omni loads a CPU-offloaded pipeline on CPU, then its sequential
+        offload hooks move the component being executed to the accelerator.
+        Those later allocations happen outside the sleep-mode ``weights``
+        memory pool, so the allocator's level-1 sleep cannot release them.
+
+        Remember only tensors that are resident on the accelerator at the
+        sleep boundary.  Restoring that exact set after wake-up preserves
+        resident components without materializing the whole pipeline at once.
+        """
+        od_config = getattr(self, "od_config", None)
+        if not getattr(od_config, "enable_cpu_offload", False):
+            return
+        if getattr(self, "_cpu_offload_sleep_tensor_devices", None):
+            return
+
+        model_runner = getattr(self, "model_runner", None)
+        pipeline = getattr(model_runner, "pipeline", None)
+        if pipeline is None:
+            return
+        from vllm_omni.diffusion.offloader.sequential_backend import ModelLevelOffloadBackend
+
+        if not isinstance(getattr(model_runner, "offload_backend", None), ModelLevelOffloadBackend):
+            return
+
+        pin_memory = bool(getattr(od_config, "pin_cpu_memory", True))
+        tensor_devices: list[tuple[torch.Tensor, torch.device]] = []
+        seen: set[int] = set()
+        try:
+            for tensor in (*pipeline.parameters(), *pipeline.buffers()):
+                if id(tensor) in seen or tensor.device.type == "cpu":
+                    continue
+                seen.add(id(tensor))
+                original_device = tensor.device
+                data = tensor.data.to(torch.device("cpu"), non_blocking=False)
+                if pin_memory and not isinstance(data, DTensor):
+                    data = data.pin_memory()
+                tensor.data = data
+                tensor_devices.append((tensor, original_device))
+        except BaseException:
+            self._restore_tensor_devices(tensor_devices)
+            raise
+
+        self._cpu_offload_sleep_tensor_devices = tensor_devices
+        if tensor_devices:
+            logger.info(
+                "Moved %d CPU-offload tensor(s) out of accelerator memory before sleep",
+                len(tensor_devices),
+            )
+
+    @staticmethod
+    def _restore_tensor_devices(tensor_devices: list[tuple[torch.Tensor, torch.device]]) -> None:
+        first_error: BaseException | None = None
+        for tensor, device in tensor_devices:
+            try:
+                if tensor.device != device:
+                    tensor.data = tensor.data.to(device, non_blocking=False)
+            except BaseException as exc:
+                logger.exception("Failed to restore CPU-offload tensor to %s", device)
+                first_error = first_error or exc
+        if first_error is not None:
+            raise RuntimeError("Failed to restore one or more CPU-offload tensors") from first_error
+
+    def _restore_cpu_offload_sleep(self, tags: list[str] | None = None) -> None:
+        if tags is not None and "weights" not in tags:
+            return
+        tensor_devices = getattr(self, "_cpu_offload_sleep_tensor_devices", [])
+        if not tensor_devices:
+            return
+        self._restore_tensor_devices(tensor_devices)
+        self._cpu_offload_sleep_tensor_devices = []
+        logger.info("Restored %d CPU-offload tensor(s) after wake-up", len(tensor_devices))
+
+    def sleep(self, level: int = 1):
+        if level != 1:
+            return super().sleep(level)
+
+        self._prepare_cpu_offload_sleep()
+        try:
+            return super().sleep(level)
+        except BaseException:
+            try:
+                self._restore_cpu_offload_sleep(tags=["weights"])
+            except BaseException:
+                logger.exception("Failed to roll back CPU-offload tensors after sleep failed")
+            raise
+
+    def wake_up(self, tags: list[str] | None = None):
+        result = super().wake_up(tags)
+        self._restore_cpu_offload_sleep(tags)
+        return result
 
     def __new__(cls, **kwargs):
         set_death_signal()

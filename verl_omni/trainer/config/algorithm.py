@@ -38,6 +38,7 @@ class DiffusionAlgoConfig(BaseConfig):
     old_policy_decay: Optional[float] = None
     old_policy_update_interval: int = 1
     timestep_fraction: float = 1.0
+    timestep_selection: str = "random"  # "random" shuffles the grid; "top_sigma" trains the highest-noise prefix
     adv_mode: str = "continuous"
     paired_preference: bool = False  # True for pair-based algorithms (e.g. DPO)
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
@@ -57,6 +58,12 @@ class DiffusionAlgoConfig(BaseConfig):
             raise ValueError(f"old_policy_update_interval must be positive, got {self.old_policy_update_interval}.")
         if not 0 < self.timestep_fraction <= 1:
             raise ValueError(f"timestep_fraction must be in (0, 1], got {self.timestep_fraction}.")
+        valid_timestep_selections = {"random", "top_sigma"}
+        if self.timestep_selection not in valid_timestep_selections:
+            raise ValueError(
+                f"Invalid timestep_selection: {self.timestep_selection}. "
+                f"Must be one of {sorted(valid_timestep_selections)}"
+            )
 
 
 @dataclass

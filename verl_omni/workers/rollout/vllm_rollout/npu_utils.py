@@ -134,12 +134,24 @@ class vLLMOmniNPUColocateWorkerExtension(vLLMOmniColocateWorkerExtension):
         except Exception:
             pass
 
+        if level == 1:
+            self._prepare_cpu_offload_sleep()
+
         if level == 2 and self.model_runner is not None:
             model = self.model_runner.pipeline
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
         allocator = _get_npu_memory_allocator()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+        try:
+            allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+            torch.npu.empty_cache()
+        except BaseException:
+            if level == 1:
+                try:
+                    self._restore_cpu_offload_sleep(tags=["weights"])
+                except BaseException:
+                    logger.exception("Failed to roll back CPU-offload tensors after NPU sleep failed")
+            raise
 
         if free_bytes_before_sleep is not None:
             try:
@@ -161,6 +173,7 @@ class vLLMOmniNPUColocateWorkerExtension(vLLMOmniColocateWorkerExtension):
 
         allocator = _get_npu_memory_allocator()
         allocator.wake_up(tags=tags)
+        self._restore_cpu_offload_sleep(tags)
 
         if len(self._sleep_saved_buffers) and self.model_runner is not None:
             model = self.model_runner.pipeline

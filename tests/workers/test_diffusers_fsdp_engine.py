@@ -65,7 +65,9 @@ def _create_sp_compatible_model(parent_dir, src_model_path, num_attention_heads=
     return dst
 
 
-def create_training_config(model_type, strategy, device_count, model, policy_state_adapters=None):
+def create_training_config(
+    model_type, strategy, device_count, model, policy_state_adapters=None, *, offload_policy=False
+):
     if strategy not in {"fsdp", "fsdp2"}:
         raise NotImplementedError(f"strategy {strategy} is not supported")
 
@@ -118,6 +120,7 @@ def create_training_config(model_type, strategy, device_count, model, policy_sta
                 "optim.weight_decay=0.0001",
                 "fsdp_config.param_offload=False",
                 "fsdp_config.optimizer_offload=False",
+                f"fsdp_config.offload_policy={str(offload_policy).lower()}",
                 "fsdp_config.model_dtype='bfloat16'",
                 "fsdp_config.dtype='bfloat16'",
                 "+fsdp_config.mixed_precision.param_dtype='bfloat16'",

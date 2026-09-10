@@ -66,6 +66,18 @@ class DiffusionPipelineConfig(BaseConfig):
     true_cfg_scale: float = 1.0
     max_sequence_length: int = 512
     guidance_scale: Optional[float] = None
+    # LTX video text CFG scale; None falls back to guidance_scale.
+    video_cfg_scale: Optional[float] = None
+    # LTX audio text CFG scale; None falls back to guidance_scale.
+    audio_cfg_scale: Optional[float] = None
+    # LTX video modality guidance scale; None uses the pipeline default.
+    video_modality_scale: Optional[float] = None
+    # LTX audio modality guidance scale; None uses the pipeline default.
+    audio_modality_scale: Optional[float] = None
+    # LTX video guidance rescale factor; None uses the pipeline default.
+    video_rescale_scale: Optional[float] = None
+    # LTX audio guidance rescale factor; None uses the pipeline default.
+    audio_rescale_scale: Optional[float] = None
 
     # Wan2.2 video generation: number of frames (81 = ~3s at 24fps)
     num_frames: int = 1

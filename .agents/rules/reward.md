@@ -33,11 +33,14 @@ reward.reward_manager.name=MultiVisualRewardManager
 +reward.reward_functions.drm.noise_level=0.4      # forwarded to the scorer as a kwarg
 ```
 
-`path` accepts a file path or a `pkg://` module. Under `reward_functions.<key>`,
+`path` accepts a file path or a `pkg://` module. For `MultiVisualRewardManager`,
 `{path, name, weight, required}` are reserved and **every other key is forwarded to
 the scorer as a keyword argument** — that is how `server_url` and `noise_level`
-arrive. `data.reward_fn_key` (default `data_source`) names the dataset column that
-becomes the `data_source` argument.
+arrive. For lifecycle-based `MultiModalRewardManager` entries, `{path, required,
+micro_batch_size, routing_weights}` are reserved; all remaining keys are forwarded
+to `initialize()`. `routing_weights` stays in the config for the future
+controller-side router and is not a scorer argument. `data.reward_fn_key` (default
+`data_source`) names the dataset column that becomes the `data_source` argument.
 
 The surrounding config — reward-model resource pools, worker counts, how the reward
 loop plugs into the agent loop — is documented in `docs/algo/async_reward.md`, and

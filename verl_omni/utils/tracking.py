@@ -106,6 +106,7 @@ def _export_video(
         subprocess.run(
             [
                 ffmpeg_exe,
+                "-nostdin",
                 "-y",
                 "-loglevel",
                 "error",

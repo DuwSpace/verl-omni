@@ -71,3 +71,6 @@ class NoOpCheckpointManager:
 
     def sleep_replicas(self) -> None:
         return None
+
+    def wake_up_replicas(self) -> None:
+        return None

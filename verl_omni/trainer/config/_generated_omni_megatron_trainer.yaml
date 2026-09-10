@@ -837,6 +837,7 @@ reward:
     name: compute_score
   reward_functions: {}
   aggregation: weighted_sum
+  component_order: []
   reward_manager:
     _target_: verl.workers.config.reward_model.RewardManagerConfig
     source: register

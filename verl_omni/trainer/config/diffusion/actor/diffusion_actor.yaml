@@ -41,6 +41,14 @@ diffusion_loss:
   # DiffusionNFT prediction-space reference MSE coefficient
   ref_kl_coef: 0.0
 
+  # OmniNFT video/audio policy-loss weights
+  video_weight: 1.0
+  audio_weight: 1.0
+
+  # OmniNFT per-modality prediction-space reference MSE coefficients
+  video_ref_kl_coef: 0.0
+  audio_ref_kl_coef: 0.0
+
   # DiffusionNFT minimum adaptive denominator for x0 reconstruction losses
   adaptive_weight_min: 1e-5
 
