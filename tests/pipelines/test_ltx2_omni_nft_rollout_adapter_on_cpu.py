@@ -127,12 +127,31 @@ def test_ltx2_omni_nft_moves_unregistered_lora_sidecars() -> None:
     lora_layer.lora_b_stacked = [torch.ones(1)]
     component.add_module("lora_layer", lora_layer)
 
-    LTX23OmniNFTPipeline._move_component_lora_buffers(component, torch.device("meta"))
+    with torch.inference_mode():
+        LTX23OmniNFTPipeline._move_component_lora_buffers(component, torch.device("meta"))
 
     assert isinstance(lora_layer.lora_a_stacked, tuple)
     assert isinstance(lora_layer.lora_b_stacked, list)
     assert lora_layer.lora_a_stacked[0].device.type == "meta"
     assert lora_layer.lora_b_stacked[0].device.type == "meta"
+    assert not torch.is_inference(lora_layer.lora_a_stacked[0])
+    assert not torch.is_inference(lora_layer.lora_b_stacked[0])
+
+
+def test_ltx2_omni_nft_normalizes_existing_inference_lora_sidecars() -> None:
+    component = torch.nn.Module()
+    lora_layer = torch.nn.Module()
+    with torch.inference_mode():
+        lora_layer.lora_a_stacked = (torch.ones(1),)
+        lora_layer.lora_b_stacked = [torch.ones(1)]
+    component.add_module("lora_layer", lora_layer)
+
+    LTX23OmniNFTPipeline._move_component_lora_buffers(component, torch.device("cpu"))
+
+    assert not torch.is_inference(lora_layer.lora_a_stacked[0])
+    assert not torch.is_inference(lora_layer.lora_b_stacked[0])
+    lora_layer.lora_a_stacked[0].zero_()
+    lora_layer.lora_b_stacked[0].zero_()
 
 
 def test_ltx2_omni_nft_decode_stages_non_forward_components() -> None:

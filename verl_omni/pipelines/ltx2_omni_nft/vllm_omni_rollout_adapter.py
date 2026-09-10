@@ -248,17 +248,28 @@ class LTX23OmniNFTPipeline(LTXTokenIdPromptMixin, LTX2Pipeline):
 
     @staticmethod
     def _move_component_lora_buffers(component: torch.nn.Module, device: torch.device) -> None:
-        """Move diffusion LoRA sidecars that PyTorch does not register as buffers."""
-        for module in component.modules():
-            for attr_name in ("lora_a_stacked", "lora_b_stacked"):
-                stacked = getattr(module, attr_name, None)
-                if not isinstance(stacked, (list, tuple)):
-                    continue
-                moved = [
-                    tensor.to(device=device, non_blocking=False) if isinstance(tensor, torch.Tensor) else tensor
-                    for tensor in stacked
-                ]
-                setattr(module, attr_name, tuple(moved) if isinstance(stacked, tuple) else moved)
+        """Move diffusion LoRA sidecars while keeping them mutable after inference."""
+        # ``run_phase`` may execute under ``torch.inference_mode``.  A device
+        # transfer performed there creates inference tensors, but vLLM later
+        # resets these buffers in-place while replacing the rollout adapter.
+        # Materialize normal tensors so that update_weights_from_ipc can mutate
+        # them after the rollout has returned.
+        with torch.inference_mode(False), torch.no_grad():
+            for module in component.modules():
+                for attr_name in ("lora_a_stacked", "lora_b_stacked"):
+                    stacked = getattr(module, attr_name, None)
+                    if not isinstance(stacked, (list, tuple)):
+                        continue
+                    moved = []
+                    for tensor in stacked:
+                        if not isinstance(tensor, torch.Tensor):
+                            moved.append(tensor)
+                            continue
+                        moved_tensor = tensor.to(device=device, non_blocking=False)
+                        if torch.is_inference(moved_tensor):
+                            moved_tensor = moved_tensor.clone()
+                        moved.append(moved_tensor)
+                    setattr(module, attr_name, tuple(moved) if isinstance(stacked, tuple) else moved)
 
     def _offload_component_with_hook(
         self,
