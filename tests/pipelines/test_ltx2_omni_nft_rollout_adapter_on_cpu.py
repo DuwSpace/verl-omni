@@ -120,6 +120,21 @@ def test_ltx2_omni_nft_manual_component_stage_always_returns_to_cpu(fail: bool) 
     hook._to_cpu.assert_called_once_with(component)
 
 
+def test_ltx2_omni_nft_moves_unregistered_lora_sidecars() -> None:
+    component = torch.nn.Module()
+    lora_layer = torch.nn.Module()
+    lora_layer.lora_a_stacked = (torch.ones(1),)
+    lora_layer.lora_b_stacked = [torch.ones(1)]
+    component.add_module("lora_layer", lora_layer)
+
+    LTX23OmniNFTPipeline._move_component_lora_buffers(component, torch.device("meta"))
+
+    assert isinstance(lora_layer.lora_a_stacked, tuple)
+    assert isinstance(lora_layer.lora_b_stacked, list)
+    assert lora_layer.lora_a_stacked[0].device.type == "meta"
+    assert lora_layer.lora_b_stacked[0].device.type == "meta"
+
+
 def test_ltx2_omni_nft_decode_stages_non_forward_components() -> None:
     pipeline = object.__new__(LTX23OmniNFTPipeline)
     pipeline.vae = SimpleNamespace(name="vae")
@@ -293,6 +308,19 @@ def test_ltx2_omni_nft_gemma_receives_per_request_attention_mask() -> None:
 
 def test_ltx2_omni_nft_phase_delegates_to_native_sampler() -> None:
     pipeline = object.__new__(LTX23OmniNFTPipeline)
+    pipeline.transformer = torch.nn.Linear(2, 2)
+    events: list[str] = []
+
+    @contextmanager
+    def stage(component):
+        assert component is pipeline.transformer
+        events.append("load:transformer")
+        try:
+            yield
+        finally:
+            events.append("offload:transformer")
+
+    pipeline._omni_component_on_device = stage
     phase_recipe = SimpleNamespace(sampler=object())
     expected = object()
 
@@ -311,6 +339,7 @@ def test_ltx2_omni_nft_phase_delegates_to_native_sampler() -> None:
 
     assert actual is expected
     assert native_phase.call_args.kwargs["phase_recipe"].sampler is phase_recipe.sampler
+    assert events == ["load:transformer", "offload:transformer"]
 
 
 def test_ltx2_omni_nft_denoise_captures_native_clean_state() -> None:

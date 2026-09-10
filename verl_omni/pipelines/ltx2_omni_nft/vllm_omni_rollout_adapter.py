@@ -246,6 +246,39 @@ class LTX23OmniNFTPipeline(LTXTokenIdPromptMixin, LTX2Pipeline):
             raise RuntimeError(f"{component.__class__.__name__} has no sequential CPU-offload hook.")
         return hook
 
+    @staticmethod
+    def _move_component_lora_buffers(component: torch.nn.Module, device: torch.device) -> None:
+        """Move diffusion LoRA sidecars that PyTorch does not register as buffers."""
+        for module in component.modules():
+            for attr_name in ("lora_a_stacked", "lora_b_stacked"):
+                stacked = getattr(module, attr_name, None)
+                if not isinstance(stacked, (list, tuple)):
+                    continue
+                moved = [
+                    tensor.to(device=device, non_blocking=False) if isinstance(tensor, torch.Tensor) else tensor
+                    for tensor in stacked
+                ]
+                setattr(module, attr_name, tuple(moved) if isinstance(stacked, tuple) else moved)
+
+    def _offload_component_with_hook(
+        self,
+        component: torch.nn.Module,
+        hook: SequentialOffloadHook,
+    ) -> None:
+        first_error: BaseException | None = None
+        try:
+            self._move_component_lora_buffers(component, torch.device("cpu"))
+        except BaseException as exc:
+            first_error = exc
+        try:
+            hook._to_cpu(component)
+        except BaseException as exc:
+            first_error = first_error or exc
+        if first_error is not None:
+            raise RuntimeError(
+                f"Failed to release CPU-offload component {component.__class__.__name__}"
+            ) from first_error
+
     @contextmanager
     def _omni_component_on_device(self, component: torch.nn.Module) -> Iterator[None]:
         """Stage a component whose entry point bypasses ``nn.Module.forward``."""
@@ -256,21 +289,23 @@ class LTX23OmniNFTPipeline(LTXTokenIdPromptMixin, LTX2Pipeline):
         hook = self._model_cpu_offload_hook(component)
         try:
             hook.pre_forward(component)
+            self._move_component_lora_buffers(component, hook.device)
             yield
         except BaseException:
             try:
-                hook._to_cpu(component)
+                self._offload_component_with_hook(component, hook)
             except BaseException:
                 logger.exception("Failed to release %s after component failure", component.__class__.__name__)
             raise
         else:
-            hook._to_cpu(component)
+            self._offload_component_with_hook(component, hook)
 
     def _offload_omni_model_components(self) -> None:
         first_error: BaseException | None = None
         for component in getattr(self, "_model_cpu_offload_modules", ()):
             try:
-                self._model_cpu_offload_hook(component)._to_cpu(component)
+                hook = self._model_cpu_offload_hook(component)
+                self._offload_component_with_hook(component, hook)
             except BaseException as exc:
                 logger.exception("Failed to release CPU-offload component %s", component.__class__.__name__)
                 first_error = first_error or exc
@@ -329,17 +364,21 @@ class LTX23OmniNFTPipeline(LTXTokenIdPromptMixin, LTX2Pipeline):
         prompt_context: LTXPromptContext | None = None,
     ) -> LTXPhaseResult:
         """Delegate phase execution to LTX's native model and sampler."""
-        return super().run_phase(
-            req,
-            request_inputs,
-            noise_scale=noise_scale,
-            sigmas=sigmas,
-            timesteps=timesteps,
-            attention_kwargs=attention_kwargs,
-            phase_recipe=phase_recipe,
-            image=image,
-            prompt_context=prompt_context,
-        )
+        # LoRA A/B tensors are dynamic tuple sidecars rather than registered
+        # parameters. Keep them with the transformer for the complete denoise
+        # phase so a many-step rollout performs only one NPU<->CPU swap.
+        with self._omni_component_on_device(self.transformer):
+            return super().run_phase(
+                req,
+                request_inputs,
+                noise_scale=noise_scale,
+                sigmas=sigmas,
+                timesteps=timesteps,
+                attention_kwargs=attention_kwargs,
+                phase_recipe=phase_recipe,
+                image=image,
+                prompt_context=prompt_context,
+            )
 
     def _denoise_step(
         self,
