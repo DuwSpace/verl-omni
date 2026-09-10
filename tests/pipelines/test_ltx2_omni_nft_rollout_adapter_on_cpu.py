@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -58,6 +59,98 @@ def test_ltx2_omni_nft_registers_and_directly_reuses_ltx_pipeline() -> None:
     assert VllmOmniPipelineBase.get_class("LTX2Pipeline", "omni_nft") is LTX23OmniNFTPipeline
     assert LTX23OmniNFTPipeline.__bases__ == (LTXTokenIdPromptMixin, LTX2Pipeline)
     assert LTX23OmniNFTPipeline.supports_request_batch is True
+
+
+def test_ltx2_omni_nft_registers_all_components_for_model_cpu_offload() -> None:
+    pipeline = object.__new__(LTX23OmniNFTPipeline)
+    pipeline._offload_omni_model_components = MagicMock()
+    transformer = torch.nn.Linear(2, 2)
+    text_encoder = torch.nn.Linear(2, 2)
+    vae = torch.nn.Linear(2, 2)
+    audio_vae = torch.nn.Linear(2, 2)
+    vocoder = torch.nn.Linear(2, 2)
+    components = SimpleNamespace(
+        dits=[transformer],
+        encoders=[text_encoder],
+        vaes=[vae, audio_vae],
+        resident_modules=[vocoder],
+    )
+
+    with (
+        patch(
+            "verl_omni.pipelines.ltx2_omni_nft.vllm_omni_rollout_adapter.ModuleDiscovery.discover",
+            return_value=components,
+        ),
+        patch("verl_omni.pipelines.ltx2_omni_nft.vllm_omni_rollout_adapter.apply_sequential_offload") as apply_offload,
+    ):
+        pipeline.enable_omni_model_cpu_offload(
+            device=torch.device("cpu"),
+            pin_memory=False,
+            use_hsdp=False,
+        )
+
+    apply_offload.assert_called_once_with(
+        dit_modules=[transformer],
+        encoder_modules=[text_encoder, vae, audio_vae, vocoder],
+        device=torch.device("cpu"),
+        pin_memory=False,
+        use_hsdp=False,
+    )
+    pipeline._offload_omni_model_components.assert_called_once_with()
+    assert pipeline._model_cpu_offload_modules == [transformer, text_encoder, vae, audio_vae, vocoder]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_ltx2_omni_nft_manual_component_stage_always_returns_to_cpu(fail: bool) -> None:
+    pipeline = object.__new__(LTX23OmniNFTPipeline)
+    component = torch.nn.Linear(2, 2)
+    hook = MagicMock()
+    pipeline._model_cpu_offload_modules = [component]
+    pipeline._model_cpu_offload_hook = MagicMock(return_value=hook)
+
+    if fail:
+        with pytest.raises(RuntimeError, match="decode failed"):
+            with pipeline._omni_component_on_device(component):
+                raise RuntimeError("decode failed")
+    else:
+        with pipeline._omni_component_on_device(component):
+            pass
+
+    hook.pre_forward.assert_called_once_with(component)
+    hook._to_cpu.assert_called_once_with(component)
+
+
+def test_ltx2_omni_nft_decode_stages_non_forward_components() -> None:
+    pipeline = object.__new__(LTX23OmniNFTPipeline)
+    pipeline.vae = SimpleNamespace(name="vae")
+    pipeline.audio_vae = SimpleNamespace(name="audio_vae")
+    pipeline.vocoder = SimpleNamespace(name="vocoder")
+    events: list[str] = []
+
+    @contextmanager
+    def stage(component):
+        events.append(f"load:{component.name}")
+        try:
+            yield
+        finally:
+            events.append(f"offload:{component.name}")
+
+    pipeline._omni_component_on_device = stage
+    phase = object()
+    expected = object()
+    with patch.object(LTX2Pipeline, "decode_phase", return_value=expected) as native_decode:
+        actual = pipeline.decode_phase(phase)
+
+    assert actual is expected
+    native_decode.assert_called_once_with(phase)
+    assert events == [
+        "load:vae",
+        "load:audio_vae",
+        "load:vocoder",
+        "offload:vocoder",
+        "offload:audio_vae",
+        "offload:vae",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -244,6 +337,7 @@ def test_ltx2_omni_nft_denoise_captures_native_clean_state() -> None:
 def test_ltx2_omni_nft_forward_runs_native_model_and_returns_contract(output_type: str | None) -> None:
     pipeline = object.__new__(LTX23OmniNFTPipeline)
     pipeline._inject_batch_prompt_embeds = MagicMock()
+    pipeline._offload_omni_model_components = MagicMock()
     pipeline.vocoder = SimpleNamespace(config=SimpleNamespace(output_sampling_rate=24000))
     request = SimpleNamespace(sampling_params=SimpleNamespace(output_type=output_type))
     request_batch = DiffusionRequestBatch(requests=[request])
@@ -269,6 +363,10 @@ def test_ltx2_omni_nft_forward_runs_native_model_and_returns_contract(output_typ
 
     model_forward.assert_called_once()
     assert pipeline._inject_batch_prompt_embeds.call_count == 1
+    pipeline._offload_omni_model_components.assert_called_once_with()
+    assert pipeline._omni_nft_prompt_context is None
+    assert pipeline._omni_nft_clean_state is None
+    assert pipeline._omni_nft_forward_context is None
     assert request.sampling_params.output_type == "pt"
     assert output.trajectory_latents is None
     assert output.trajectory_timesteps is None
@@ -311,6 +409,30 @@ def test_ltx2_omni_nft_forward_runs_native_model_and_returns_contract(output_typ
     assert set(prompt_embeddings) == set(expected_conditions)
     for key, expected in expected_conditions.items():
         torch.testing.assert_close(prompt_embeddings[key], expected)
+
+
+def test_ltx2_omni_nft_forward_clears_capture_and_offloads_after_failure() -> None:
+    pipeline = object.__new__(LTX23OmniNFTPipeline)
+    pipeline._inject_batch_prompt_embeds = MagicMock()
+    pipeline._offload_omni_model_components = MagicMock()
+    request = SimpleNamespace(sampling_params=SimpleNamespace(output_type="pt"))
+
+    def native_forward(*_args, **_kwargs):
+        pipeline._omni_nft_prompt_context = object()
+        pipeline._omni_nft_clean_state = object()
+        pipeline._omni_nft_forward_context = object()
+        raise RuntimeError("generation failed")
+
+    with (
+        patch.object(LTX2Pipeline, "forward", side_effect=native_forward),
+        pytest.raises(RuntimeError, match="generation failed"),
+    ):
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+
+    pipeline._offload_omni_model_components.assert_called_once_with()
+    assert pipeline._omni_nft_prompt_context is None
+    assert pipeline._omni_nft_clean_state is None
+    assert pipeline._omni_nft_forward_context is None
 
 
 @pytest.mark.parametrize("output_type", ["latent", "np"])
