@@ -28,6 +28,8 @@ from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.tensor import DTensor
+from torch.utils._pytree import tree_map
+from torch.utils.checkpoint import checkpoint
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -65,6 +67,7 @@ from verl_omni.pipelines.utils import (
     prepare_model_inputs,
     prepare_noisy_latents,
 )
+from verl_omni.utils.diffusers_npu import apply_diffusers_npu_rms_norm_patch
 from verl_omni.utils.fsdp_utils import collect_lora_params
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
@@ -73,6 +76,25 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _fsdp2_gradient_checkpointing_with_cast_func(param_dtype: torch.dtype) -> Callable:
+    """Match FSDP2 input casting inside both checkpoint forward executions."""
+
+    def cast_fp_tensor(value):
+        if not isinstance(value, torch.Tensor) or not torch.is_floating_point(value) or value.dtype == param_dtype:
+            return value
+        return value.to(param_dtype)
+
+    def gradient_checkpointing_func(module, *args, **kwargs):
+        def checkpointed_forward(*inner_args, **inner_kwargs):
+            cast_args = tree_map(cast_fp_tensor, inner_args)
+            cast_kwargs = tree_map(cast_fp_tensor, inner_kwargs)
+            return module.__call__(*cast_args, **cast_kwargs)
+
+        return checkpoint(checkpointed_forward, *args, use_reentrant=False, **kwargs)
+
+    return gradient_checkpointing_func
 
 
 class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
@@ -116,6 +138,21 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._is_lora = self.model_config.lora_rank > 0
+        self._uses_fsdp2_cpu_offload_policy = False
+
+    def _get_mixed_precision_dtypes(self) -> tuple[torch.dtype, torch.dtype, torch.dtype]:
+        from verl.utils.torch_dtypes import PrecisionType
+
+        mixed_precision_config = self.engine_config.mixed_precision
+        if mixed_precision_config is not None:
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
+            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
+        else:
+            param_dtype = torch.bfloat16
+            reduce_dtype = torch.float32
+            buffer_dtype = torch.float32
+        return param_dtype, reduce_dtype, buffer_dtype
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -225,7 +262,13 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
         if self.model_config.enable_gradient_checkpointing:
             try:
-                module.enable_gradient_checkpointing()
+                if self.engine_config.strategy == "fsdp2":
+                    param_dtype, _, _ = self._get_mixed_precision_dtypes()
+                    module.enable_gradient_checkpointing(
+                        gradient_checkpointing_func=_fsdp2_gradient_checkpointing_with_cast_func(param_dtype)
+                    )
+                else:
+                    module.enable_gradient_checkpointing()
             except AttributeError:
                 raise NotImplementedError(
                     f"Gradient checkpointing is enabled in config, but {type(module).__name__} "
@@ -241,6 +284,8 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         return module
 
     def _build_module(self):
+        apply_diffusers_npu_rms_norm_patch()
+
         from diffusers import AutoModel
         from verl.utils.torch_dtypes import PrecisionType
 
@@ -286,7 +331,13 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             module.to(torch_dtype)
 
             if self.model_config.enable_gradient_checkpointing:
-                module.enable_gradient_checkpointing()
+                if self.engine_config.strategy == "fsdp2":
+                    param_dtype, _, _ = self._get_mixed_precision_dtypes()
+                    module.enable_gradient_checkpointing(
+                        gradient_checkpointing_func=_fsdp2_gradient_checkpointing_with_cast_func(param_dtype)
+                    )
+                else:
+                    module.enable_gradient_checkpointing()
 
             # patch for checkpoint saving
             def save_config(self, save_directory: str | os.PathLike):
@@ -302,18 +353,8 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
     def _build_fsdp_module(self, module):
         # TODO(ziheng): need to improve
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from verl.utils.torch_dtypes import PrecisionType
 
-        mixed_precision_config = self.engine_config.mixed_precision
-        if mixed_precision_config is not None:
-            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
-            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
-            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
-        else:
-            param_dtype = torch.bfloat16
-            reduce_dtype = torch.float32
-            buffer_dtype = torch.float32
-
+        param_dtype, reduce_dtype, buffer_dtype = self._get_mixed_precision_dtypes()
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
         auto_wrap_policy = get_fsdp_wrap_policy(
@@ -366,6 +407,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
                 offload_policy = CPUOffloadPolicy(pin_memory=True)
+                self._uses_fsdp2_cpu_offload_policy = True
 
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,
@@ -682,7 +724,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         Save FSDP checkpoint, handling parameter offload as needed.
         """
         origin_module_device = next(self.module.parameters()).device.type
-        if self._is_offload_param or origin_module_device == "cpu":
+        if (self._is_offload_param or origin_module_device == "cpu") and not self._uses_fsdp2_cpu_offload_policy:
             load_fsdp_model_to_gpu(self.module)
 
         self.checkpoint_manager.save_checkpoint(
@@ -721,7 +763,12 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
     ):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
-        load_fsdp_model_to_gpu(self.module)
+        # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement. Calling
+        # ``model.to(device)`` here leaves the module half-moved and can
+        # fail while materializing the state dict (the per-DTensor
+        # ``to(device).full_tensor()`` below still yields GPU tensors).
+        if not self._uses_fsdp2_cpu_offload_policy:
+            load_fsdp_model_to_gpu(self.module)
 
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
