@@ -13,6 +13,12 @@
 # limitations under the License.
 
 from .multi import MultiVisualRewardManager
+from .multimodal import MultiModalRewardManager, SupportsBatchScoring
 from .visual import VisualRewardManager
 
-__all__ = ["VisualRewardManager", "MultiVisualRewardManager"]
+__all__ = [
+    "VisualRewardManager",
+    "MultiVisualRewardManager",
+    "MultiModalRewardManager",
+    "SupportsBatchScoring",
+]

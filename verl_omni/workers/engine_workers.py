@@ -172,7 +172,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         if hasattr(self.model_config, "hf_config"):
             self.flops_counter = FlopsCounter(self.model_config.hf_config)
-        elif self.config.model_type in ("diffusion_model", "diffusion_dpo_model", "diffusion_nft_model"):
+        elif self.config.model_type in (
+            "diffusion_model",
+            "diffusion_dpo_model",
+            "diffusion_nft_model",
+            "omni_nft_model",
+        ):
             self.flops_counter = DiffusionFlopsCounter(
                 architecture=self.model_config.architecture,
                 transformer_config=self.model_config.transformer_config,
@@ -612,6 +617,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             "diffusion_model",
             "diffusion_dpo_model",
             "diffusion_nft_model",
+            "omni_nft_model",
         )
 
         # 1. build reference model

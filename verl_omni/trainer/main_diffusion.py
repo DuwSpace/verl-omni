@@ -26,6 +26,7 @@ from verl.utils.device import auto_set_device, is_cuda_available
 
 from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
     DirectPreferenceRayTrainer,
+    MultiModalDirectPreferenceRayTrainer,
     PolicyGradientRayTrainer,
 )
 from verl_omni.utils.diffusion_attention import fallback_fa3_if_unavailable, validate_attention_consistency
@@ -123,6 +124,8 @@ def _get_trainer_cls(config):
     if trainer_type == "policy_gradient":
         return PolicyGradientRayTrainer
     if trainer_type == "direct_preference":
+        if config.actor_rollout_ref.model.algorithm == "omni_nft":
+            return MultiModalDirectPreferenceRayTrainer
         return DirectPreferenceRayTrainer
     raise ValueError(
         f"Unsupported diffusion trainer_type {trainer_type!r}. Expected one of: 'policy_gradient', 'direct_preference'."

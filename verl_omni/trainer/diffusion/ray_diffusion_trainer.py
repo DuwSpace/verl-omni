@@ -1374,6 +1374,10 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                 "Old-adapter algorithms require actor_rollout_ref.actor.diffusion_loss.loss_mode=diffusion_nft."
             )
 
+    def _compute_data_metrics(self, batch: DataProto) -> dict:
+        """Collect batch reward/advantage stats for the training logger."""
+        return compute_data_metrics_diffusion(batch)
+
     def init_workers(self):
         """Initialize actor-only workers for offline, or full stack for online preference training."""
         actor_rollout_resource_pool = self._init_colocated_workers()
@@ -1722,7 +1726,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics_diffusion(batch=batch))
+                metrics.update(self._compute_data_metrics(batch))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 num_images = (
                     batch.batch["advantages"].shape[0]
@@ -1752,3 +1756,232 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+
+class MultiModalDirectPreferenceRayTrainer(DirectPreferenceRayTrainer):
+    """Run the online OmniNFT rollout, reward routing, and actor update loop."""
+
+    def __init__(self, config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        self.use_rm = True
+        self.reward_batch_coordinator = None
+        self._last_reward_names: list[str] | None = None
+        self._is_validating = False
+
+    def _validate_old_adapter_config(self):
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        actor_loss_cfg = self.config.actor_rollout_ref.actor.diffusion_loss
+        if rollout_cfg.rollout_adapter != "old":
+            raise ValueError("OmniNFT requires actor_rollout_ref.rollout.rollout_adapter=old.")
+        if actor_loss_cfg.loss_mode != "omni_nft":
+            raise ValueError("OmniNFT requires actor_rollout_ref.actor.diffusion_loss.loss_mode=omni_nft.")
+
+    def init_workers(self):
+        """Initialize workers and tear down partial reward state on failure."""
+        try:
+            return super().init_workers()
+        except BaseException:
+            self._shutdown_reward_loop()
+            raise
+
+    def fit(self):
+        """Run training and finalize native reward workers."""
+        try:
+            return super().fit()
+        finally:
+            self._shutdown_reward_loop()
+
+    def _validate(self):
+        self._is_validating = True
+        try:
+            return super()._validate()
+        finally:
+            self._is_validating = False
+
+    def _shutdown_reward_loop(self) -> None:
+        manager = getattr(self, "reward_loop_manager", None)
+        if manager is None:
+            return
+        try:
+            manager.shutdown()
+        finally:
+            self.reward_loop_manager = None
+            self.reward_batch_coordinator = None
+
+    def _init_online_rollout_stack(self, actor_rollout_resource_pool):
+        """Start vLLM rollout and colocated native Reward Workers on the shared pool."""
+        from verl.experimental.agent_loop import AgentLoopManager
+
+        from verl_omni.pipelines.ltx2_omni_nft.agent_loop import LTX2OmniNFTAgentLoopWorker
+        from verl_omni.reward_loop.multimodal_reward_loop import (
+            BatchRewardCoordinator,
+            MultiModalRewardLoopManager,
+        )
+
+        self.reward_loop_manager = MultiModalRewardLoopManager(
+            config=self.config,
+            resource_pool=actor_rollout_resource_pool,
+        )
+        self.reward_batch_coordinator = BatchRewardCoordinator(self.reward_loop_manager.reward_loop_workers)
+        self.async_rollout_mode = True
+        self.enable_agent_reward_loop = False
+
+        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
+        if manager_class_fqn:
+            agent_loop_manager_cls = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+        else:
+            agent_loop_manager_cls = AgentLoopManager
+            AgentLoopManager.agent_loop_workers_class = ray.remote(LTX2OmniNFTAgentLoopWorker)
+
+        self.llm_server_manager = LLMServerManager.create(
+            config=self.config,
+            worker_group=self.actor_rollout_wg,
+            rollout_resource_pool=actor_rollout_resource_pool,
+        )
+        self.async_rollout_manager = agent_loop_manager_cls.create(
+            config=self.config,
+            llm_client=self.llm_server_manager.get_client(),
+            reward_loop_worker_handles=None,
+        )
+        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        self.checkpoint_manager = CheckpointEngineManager(
+            config=checkpoint_engine_config,
+            actor_wg=self.actor_rollout_wg,
+            replicas=self.llm_server_manager.get_replicas(),
+        )
+        self.checkpoint_manager.sleep_replicas()
+
+    def _compute_reward_colocate(self, batch: DataProto) -> DataProto:
+        """Score the local batch and publish each `[B,K]` reward column as a numeric extra."""
+        if self.reward_batch_coordinator is None:
+            raise RuntimeError("Batch Reward Coordinator is not initialized.")
+        batch.meta_info = dict(batch.meta_info or {})
+        batch.meta_info["validate"] = self._is_validating
+        reward_batch = self.reward_batch_coordinator.compute(batch)
+        reward_names = reward_batch.meta_info.get("reward_names")
+        if not reward_names:
+            config = getattr(self, "config", None)
+            reward_names = getattr(getattr(config, "reward", None), "component_order", None)
+        if not reward_names:
+            self._last_reward_names = None
+            return reward_batch
+        self._last_reward_names = list(reward_names)
+        reward_batch = self._publish_component_reward_scores(reward_batch)
+        return reward_batch
+
+    def _publish_component_reward_scores(self, reward_batch: DataProto) -> DataProto:
+        names = self._last_reward_names
+        if not names:
+            return reward_batch
+        scores = reward_batch.batch.get("rm_scores")
+        if scores is None or scores.ndim != 2 or scores.shape[1] != len(names):
+            shape = None if scores is None else tuple(scores.shape)
+            raise ValueError(f"OmniNFT rm_scores must have shape (B, {len(names)}), got {shape}.")
+        extra_keys = list(reward_batch.meta_info.get("reward_extra_keys", []))
+        cpu_scores = scores.detach().cpu().float()
+        for index, name in enumerate(names):
+            reward_batch.non_tensor_batch[name] = cpu_scores[:, index].numpy()
+            if name not in extra_keys:
+                extra_keys.append(name)
+        reward_batch.meta_info["reward_extra_keys"] = extra_keys
+        return reward_batch
+
+    def _numeric_reward_extras(self, reward_extra_infos_dict: dict) -> dict:
+        extras = {}
+        for key, values in reward_extra_infos_dict.items():
+            if isinstance(values, np.ndarray):
+                if values.size == 0 or not np.issubdtype(values.dtype, np.number):
+                    continue
+                extras[key] = values
+            elif isinstance(values, list) and values and isinstance(values[0], int | float | np.integer | np.floating):
+                extras[key] = values
+        return extras
+
+    def _summarize_component_rewards(self, scores: torch.Tensor, names: list[str], split: str) -> dict[str, float]:
+        """Build wandb keys ``{split}/reward/{name}/{mean,std,min,max}`` and ``{split}/reward/sum/*``."""
+        if scores.ndim != 2 or scores.shape[1] != len(names) or not names:
+            raise ValueError(f"OmniNFT {split} scores must have shape (B, {len(names)}), got {tuple(scores.shape)}.")
+        cpu_scores = scores.detach().cpu().float()
+        metrics = {}
+        prefix = f"{split}/reward"
+        per_sample_sum = cpu_scores.sum(dim=1)
+        metrics[f"{prefix}/sum/mean"] = float(per_sample_sum.mean())
+        metrics[f"{prefix}/sum/std"] = float(per_sample_sum.std(unbiased=False))
+        for index, name in enumerate(names):
+            column = cpu_scores[:, index]
+            metrics[f"{prefix}/{name}/mean"] = float(column.mean())
+            metrics[f"{prefix}/{name}/std"] = float(column.std(unbiased=False))
+            metrics[f"{prefix}/{name}/min"] = float(column.min())
+            metrics[f"{prefix}/{name}/max"] = float(column.max())
+        return metrics
+
+    def _reward_component_wandb_metrics(self, batch: DataProto, split: str) -> dict[str, float]:
+        names = None
+        if getattr(batch, "meta_info", None):
+            names = batch.meta_info.get("reward_names")
+        names = list(names or getattr(self, "_last_reward_names", None) or [])
+        scores = None if getattr(batch, "batch", None) is None else batch.batch.get("rm_scores")
+        if not names or scores is None:
+            return {}
+        return self._summarize_component_rewards(scores, names, split)
+
+    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+        """Log each OmniNFT reward for wandb as ``val/reward/<name>/*``; skip metadata dicts."""
+        extras = self._numeric_reward_extras(reward_extra_infos_dict)
+        names = [name for name in (getattr(self, "_last_reward_names", None) or []) if name in extras]
+        metrics = {}
+        if names:
+            stacked = torch.tensor(np.stack([np.asarray(extras[name], dtype=np.float32) for name in names], axis=1))
+            metrics.update(self._summarize_component_rewards(stacked, names, split="val"))
+        parent_extras = {key: extras[key] for key in ("reward",) if key in extras}
+        metrics.update(super()._val_metrics_update(data_sources, sample_uids, parent_extras, sample_turns))
+        return metrics
+
+    def _update_actor(self, batch: DataProto) -> DataProto:
+        """Attach per-reward train wandb metrics, then run the inherited actor update."""
+        output = super()._update_actor(batch)
+        reward_metrics = self._reward_component_wandb_metrics(batch, split="train")
+        if not reward_metrics:
+            return output
+        meta_info = getattr(output, "meta_info", None)
+        if not isinstance(meta_info, dict):
+            return output
+        merged = dict(meta_info.get("metrics") or {})
+        merged.update({key: [value] for key, value in reward_metrics.items()})
+        meta_info["metrics"] = merged
+        return output
+
+    def _compute_data_metrics(self, batch: DataProto) -> dict:
+        """Keep advantage/return stats, but reduce OmniNFT `[B,K]` rewards by unweighted sum."""
+        metrics = super()._compute_data_metrics(batch)
+        names = None
+        if getattr(batch, "meta_info", None):
+            names = batch.meta_info.get("reward_names")
+        names = list(names or getattr(self, "_last_reward_names", None) or [])
+        scores = None if getattr(batch, "batch", None) is None else batch.batch.get("rm_scores")
+        if scores is None:
+            scores = batch.batch.get("sample_level_rewards") if getattr(batch, "batch", None) is not None else None
+        if not names or scores is None or scores.ndim != 2 or scores.shape[1] != len(names):
+            return metrics
+        per_sample = scores.detach().float().sum(dim=1)
+        metrics["critic/rewards/mean"] = float(per_sample.mean())
+        metrics["critic/rewards/max"] = float(per_sample.max())
+        metrics["critic/rewards/min"] = float(per_sample.min())
+        if "uid" not in batch.non_tensor_batch:
+            return metrics
+        rewards_np = per_sample.detach().cpu().numpy()
+        uid_array = np.array(batch.non_tensor_batch["uid"])
+        unique_uids = np.unique(uid_array)
+        per_prompt_stds = np.array([np.std(rewards_np[uid_array == uid]) for uid in unique_uids])
+        metrics["critic/rewards/zero_std_ratio"] = float(np.mean(per_prompt_stds == 0))
+        metrics["critic/rewards/std_mean"] = float(np.mean(per_prompt_stds))
+        metrics["critic/rewards/group_size"] = float(len(rewards_np) / len(unique_uids))
+        return metrics
+
+    def _prepare_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> DataProto:
+        """Route the preserved `[B,K]` reward matrix into the OmniNFT actor batch."""
+        if "reward_names" not in batch.meta_info:
+            if not self._last_reward_names:
+                raise ValueError("OmniNFT actor batch requires reward_names in meta_info.")
+            batch.meta_info["reward_names"] = list(self._last_reward_names)
+        return self._loss_fn.prepare_actor_batch(batch, reward_tensor.float(), self.config)

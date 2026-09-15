@@ -23,11 +23,14 @@ custom_reward_function:
 
 # Multi-reward configuration (dict-based, mutually exclusive with custom_reward_function).
 # Keys are user-chosen names used for metric logging (e.g., "ocr", "jpeg").
-# Each entry: path (str), name (str), weight (float).
+# Weighted entries use path/name/weight; component-preserving entries use path/required/micro_batch_size.
 reward_functions: {}
 
-# Aggregation method for multi-reward. Only "weighted_sum" is supported.
+# Aggregation method for multi-reward: "weighted_sum" or "preserve_components".
 aggregation: weighted_sum
+
+# Reward component order for preserve_components aggregation.
+component_order: []
 
 # reward manager configuration
 reward_manager:
