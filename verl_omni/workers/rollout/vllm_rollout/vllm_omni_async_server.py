@@ -128,6 +128,9 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
         if self._ar_mode:
             return omega_conf_to_dataclass(model_config, dataclass_type=OmniModelConfig)
+        # Preserve pipeline-specific dataclasses by letting Hydra resolve nested targets.
+        if isinstance(model_config, Mapping) and model_config.get("_target_"):
+            return omega_conf_to_dataclass(model_config)
         return omega_conf_to_dataclass(model_config, dataclass_type=DiffusionModelConfig)
 
     def _validate_configs(self) -> None:
