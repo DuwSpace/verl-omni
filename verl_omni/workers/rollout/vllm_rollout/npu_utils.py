@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import logging
 import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -183,6 +184,16 @@ class vLLMOmniNPUColocateWorkerExtension(vLLMOmniColocateWorkerExtension):
     def wake_up(self, tags: list[str] | None = None) -> bool:
         if not _is_npu_platform():
             return super().wake_up(tags)
+
+        # vLLM-Omni's worker loop can keep the previous request result alive
+        # until the next RPC is handled.  CaMemAllocator.sleep() empties the
+        # cache before that RPC result is replaced, so freed request tensors may
+        # remain reserved and compete with the remapped weights on the next
+        # rollout.  Reclaim ordinary allocator blocks immediately before the
+        # remap; the CaMem allocations are already unmapped while asleep.
+        torch.npu.synchronize()
+        gc.collect()
+        torch.npu.empty_cache()
 
         allocator = _get_npu_memory_allocator()
         allocator.wake_up(tags=tags)

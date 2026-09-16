@@ -22,11 +22,13 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 server_module = pytest.importorskip("verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server")
 
 from verl.workers.rollout.replica import RolloutMode  # noqa: E402
 
+from verl_omni.workers.rollout.vllm_rollout import npu_utils  # noqa: E402
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer  # noqa: E402
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_strategy_base import OmniStrategyBase  # noqa: E402
 
@@ -574,3 +576,26 @@ async def test_failed_wake_skips_admission_resume():
         await server.wake_up()
 
     assert engine.resumed == 0
+
+
+def test_npu_worker_reclaims_stale_request_cache_before_remapping_weights(monkeypatch):
+    events = []
+    allocator = SimpleNamespace(wake_up=lambda tags: events.append(("wake_up", tags)))
+    worker = SimpleNamespace(
+        _sleep_saved_buffers={},
+        model_runner=None,
+    )
+
+    monkeypatch.setattr(npu_utils, "_is_npu_platform", lambda: True)
+    monkeypatch.setattr(npu_utils, "_get_npu_memory_allocator", lambda: allocator)
+    monkeypatch.setattr(npu_utils.gc, "collect", lambda: events.append(("gc", None)))
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: events.append(("synchronize", None)))
+    monkeypatch.setattr(torch.npu, "empty_cache", lambda: events.append(("empty_cache", None)))
+
+    assert npu_utils.vLLMOmniNPUColocateWorkerExtension.wake_up(worker, tags=["weights"])
+    assert events == [
+        ("synchronize", None),
+        ("gc", None),
+        ("empty_cache", None),
+        ("wake_up", ["weights"]),
+    ]
