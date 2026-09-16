@@ -33,6 +33,7 @@ from verl_omni.workers.config.reward import (
     validate_reward_model_terms,
 )
 
+from .async_utils import gather_complete
 from .reward_model import MultiRewardModelManager
 from .reward_model_executor import (
     EngineRewardExecutor,
@@ -44,14 +45,22 @@ from .reward_model_executor import (
 logger = logging.getLogger(__name__)
 
 
-def _validate_named_reward_manager_cls(reward_manager_cls) -> None:
+def _validate_named_reward_manager_cls(reward_manager_cls, *, preserve_components: bool) -> None:
     from .reward_manager.multi import MultiVisualRewardManager
 
-    if not issubclass(reward_manager_cls, MultiVisualRewardManager):
+    if preserve_components:
+        if callable(getattr(reward_manager_cls, "run_batch", None)):
+            return
         raise ValueError(
-            "reward.models currently requires reward.reward_manager.name=MultiVisualRewardManager; "
-            f"got {reward_manager_cls.__name__!r}. Support for other modalities is follow-up work."
+            "reward.aggregation='preserve_components' requires a reward manager with an async run_batch() method; "
+            f"got {reward_manager_cls.__name__!r}."
         )
+    if issubclass(reward_manager_cls, MultiVisualRewardManager):
+        return
+    raise ValueError(
+        "reward.models currently requires MultiVisualRewardManager for aggregated scoring; "
+        f"got {reward_manager_cls.__name__!r}. Support for other modalities is follow-up work."
+    )
 
 
 class OmniRewardLoopWorker(RewardLoopWorker):
@@ -79,6 +88,26 @@ class OmniRewardLoopWorker(RewardLoopWorker):
                 self.engine_reward_executors,
                 self.native_reward_executors,
             )
+
+    async def compute_score_components(self, data: DataProto):
+        """Return a local shard's named reward-component columns."""
+        run_batch = getattr(self.reward_manager, "run_batch", None)
+        if not callable(run_batch):
+            raise TypeError(f"{type(self.reward_manager).__name__} does not support component scoring.")
+        return await run_batch(data)
+
+    async def shutdown(self) -> None:
+        """Finalize native executors and optional worker-local reward state."""
+        results = await gather_complete(
+            (executor.close() for executor in self.native_reward_executors.values()),
+            return_exceptions=True,
+        )
+        shutdown = getattr(self.reward_manager, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise errors[0]
 
     async def wake_up_reward_model(self, model_name: str) -> None:
         try:
@@ -108,12 +137,17 @@ class OmniRewardLoopManager(RewardLoopManager):
 
     def __init__(self, config, rm_resource_pool=None, accelerator_resource_pool=None):
         self._score_lock = asyncio.Lock()
+        self._shutdown = False
+        self._preserve_reward_components = config.reward.get("aggregation") == "preserve_components"
         self.accelerator_resource_pool = accelerator_resource_pool
         named_reward_manager_cls = None
         if has_reward_models(config):
             validate_reward_model_terms(config)
             named_reward_manager_cls = resolve_reward_manager_cls(config)
-            _validate_named_reward_manager_cls(named_reward_manager_cls)
+            _validate_named_reward_manager_cls(
+                named_reward_manager_cls,
+                preserve_components=self._preserve_reward_components,
+            )
         self.multi_reward_model_manager = MultiRewardModelManager(
             config,
             # The trainer maps Role.RewardModel to global_pool or reward_pool.
@@ -260,6 +294,14 @@ class OmniRewardLoopManager(RewardLoopManager):
 
     def compute_rm_score(self, data):
         """Synchronous compatibility entrypoint for current trainers."""
+        if self._preserve_reward_components:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(self.async_compute_rm_score(data))
+            raise RuntimeError(
+                "compute_rm_score() cannot run inside an event loop; await async_compute_rm_score() instead"
+            )
         if not self.multi_reward_model_manager.models:
             return super().compute_rm_score(data)
         try:
@@ -270,6 +312,30 @@ class OmniRewardLoopManager(RewardLoopManager):
 
     async def async_compute_rm_score(self, data):
         """Score named reward models without blocking the caller's event loop."""
+        if self._preserve_reward_components:
+            from .reward_components import compute_component_rewards
+
+            async with self._score_lock:
+                if not self.multi_reward_model_manager.models:
+                    raise ValueError("Component-preserving reward scoring requires reward.models deployments.")
+                scoring_error = None
+                try:
+                    await self.multi_reward_model_manager.wake_up()
+                    return await compute_component_rewards(
+                        self._reward_worker_groups,
+                        data,
+                        set(self.config.reward.reward_functions),
+                    )
+                except BaseException as exc:
+                    scoring_error = exc
+                    raise
+                finally:
+                    try:
+                        await self.multi_reward_model_manager.sleep()
+                    except Exception:
+                        if scoring_error is None:
+                            raise
+                        logger.exception("Failed to sleep component reward models after scoring failed")
         if not self.multi_reward_model_manager.models:
             return await asyncio.to_thread(super().compute_rm_score, data)
         async with self._score_lock:
@@ -352,3 +418,12 @@ class OmniRewardLoopManager(RewardLoopManager):
             await asyncio.gather(*[getattr(replica, method)(**kwargs) for replica in replicas])
 
         asyncio.run(run_all())
+
+    def shutdown(self) -> None:
+        """Finalize worker-local reward state exactly once."""
+        if self._shutdown:
+            return
+        self._shutdown = True
+        workers = getattr(self, "reward_loop_workers", None) or []
+        if workers:
+            ray.get([worker.shutdown.remote() for worker in workers])

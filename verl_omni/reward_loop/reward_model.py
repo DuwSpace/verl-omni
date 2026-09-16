@@ -35,6 +35,7 @@ from verl_omni.workers.config.reward import (
 )
 
 from .accelerator_reward_workers import _IndexedResourcePool
+from .async_utils import gather_complete
 
 __all__ = [
     "EngineManagedRewardModel",
@@ -102,12 +103,22 @@ class MultiRewardModelManager:
 
     async def wake_up(self) -> None:
         """Wake independent reward models concurrently."""
-        await asyncio.gather(*(model.wake_up() for model in self.models.values()))
+        models = list(self.models.values())
+        results = await gather_complete(
+            (model.wake_up() for model in models),
+            return_exceptions=True,
+        )
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise errors[0]
 
     async def sleep(self) -> None:
         """Attempt to sleep every model and report the first lifecycle error."""
         models = list(reversed(self.models.values()))
-        results = await asyncio.gather(*(model.sleep() for model in models), return_exceptions=True)
+        results = await gather_complete(
+            (model.sleep() for model in models),
+            return_exceptions=True,
+        )
         errors = []
         for model, result in zip(models, results, strict=True):
             if isinstance(result, BaseException):
@@ -248,6 +259,7 @@ class NativeManagedRewardModel(ManagedRewardModel):
                 name=name,
                 backend="native",
                 model_path=model.model_path,
+                offload_mode=model.offload_mode,
                 executor_config=executor_config,
             ),
             offload=offload,
@@ -265,7 +277,7 @@ class NativeManagedRewardModel(ManagedRewardModel):
         if self._workers is None:
             raise RuntimeError(f"Native reward model {self.name!r} has no bound workers")
         refs = [getattr(worker, method).remote(self.name) for worker in self._workers]
-        await asyncio.gather(*refs)
+        await gather_complete(refs)
 
     async def wake_up(self) -> None:
         if not self.offload and self._resident:

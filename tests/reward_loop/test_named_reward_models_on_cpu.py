@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -33,7 +34,7 @@ from verl_omni.reward_loop.reward_loop import (
     OmniRewardLoopWorker,
     _validate_named_reward_manager_cls,
 )
-from verl_omni.reward_loop.reward_manager import MultiVisualRewardManager, VisualRewardManager
+from verl_omni.reward_loop.reward_manager import MultiModalRewardManager, MultiVisualRewardManager, VisualRewardManager
 from verl_omni.reward_loop.reward_model import (
     EngineManagedRewardModel,
     MultiRewardModelManager,
@@ -42,6 +43,7 @@ from verl_omni.reward_loop.reward_model import (
 )
 from verl_omni.reward_loop.reward_model_executor import (
     NativeRewardExecutor,
+    NativeRewardModelState,
     build_engine_reward_executors,
 )
 from verl_omni.workers.config.reward import (
@@ -241,10 +243,17 @@ def test_native_only_model_uses_parent_pool_and_batch_scoring():
 
 
 def test_named_models_require_explicit_multi_visual_reward_manager():
-    _validate_named_reward_manager_cls(MultiVisualRewardManager)
+    _validate_named_reward_manager_cls(MultiVisualRewardManager, preserve_components=False)
 
     with pytest.raises(ValueError, match="currently requires.*MultiVisualRewardManager"):
-        _validate_named_reward_manager_cls(VisualRewardManager)
+        _validate_named_reward_manager_cls(VisualRewardManager, preserve_components=False)
+
+
+def test_component_aggregation_requires_batch_manager_contract():
+    _validate_named_reward_manager_cls(MultiModalRewardManager, preserve_components=True)
+
+    with pytest.raises(ValueError, match="preserve_components.*run_batch"):
+        _validate_named_reward_manager_cls(MultiVisualRewardManager, preserve_components=True)
 
 
 def test_accelerator_worker_setting_keeps_the_legacy_alias():
@@ -277,6 +286,7 @@ def test_named_model_entries_parse_to_backend_specific_base_configs():
         OmegaConf.create(
             {
                 "backend": "native",
+                "offload_mode": "cpu",
                 "placement": {"devices": [0]},
                 "executor": {"model": "tests.fake:Model", "kwargs": {"threshold": 0.5}},
             }
@@ -285,6 +295,7 @@ def test_named_model_entries_parse_to_backend_specific_base_configs():
 
     assert isinstance(engine, EngineRewardModelConfig)
     assert isinstance(native, NativeRewardModelConfig)
+    assert native.offload_mode == "cpu"
     assert native.executor.kwargs == {"threshold": 0.5}
 
 
@@ -303,6 +314,25 @@ def test_named_model_entries_parse_to_backend_specific_base_configs():
             },
             "unsupported fields: rollout",
         ),
+        (
+            {
+                "backend": "native",
+                "offload_mode": "unknown",
+                "placement": {"devices": [0]},
+                "executor": {"model": "tests.fake:Model"},
+            },
+            "offload_mode must be one of",
+        ),
+        (
+            {
+                "backend": "native",
+                "offload": False,
+                "offload_mode": "cpu",
+                "placement": {"devices": [0]},
+                "executor": {"model": "tests.fake:Model"},
+            },
+            "cannot use offload_mode='cpu' when offload=false",
+        ),
     ],
 )
 def test_backend_schema_rejects_invalid_single_model_fields(model, message):
@@ -316,6 +346,7 @@ def test_native_model_uses_configured_executor_class():
         OmegaConf.create(
             {
                 "backend": "native",
+                "offload_mode": "cpu",
                 "executor": {"model": "my_package.reward:QualityModel"},
                 "model_path": "/models/quality",
                 "placement": {"devices": [0]},
@@ -325,6 +356,7 @@ def test_native_model_uses_configured_executor_class():
 
     assert model.executor_spec.executor_config["model"] == "my_package.reward:QualityModel"
     assert model.executor_spec.model_path == "/models/quality"
+    assert model.executor_spec.offload_mode == "cpu"
 
 
 def test_native_model_requires_configured_executor_class():
@@ -871,6 +903,131 @@ async def test_native_executor_wakes_infers_and_sleeps(monkeypatch):
     assert _FakeModel.instances[0].device == torch.device("cpu", 0)
     assert _FakeModel.instances[0].closed
     assert executor._model is None
+    assert executor.state is NativeRewardModelState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_native_executor_cpu_mode_reuses_one_instance_until_close(monkeypatch):
+    class _CpuResidentModel:
+        instances = []
+
+        def __init__(self, model_path, device):
+            self.model_path = model_path
+            self.calls = [("init", torch.device(device))]
+            self.closed = False
+            self.__class__.instances.append(self)
+
+        def activate(self, device):
+            self.calls.append(("activate", torch.device(device)))
+
+        def offload_to_cpu(self):
+            self.calls.append(("offload", torch.device("cpu")))
+
+        def infer(self):
+            self.calls.append(("infer", None))
+            return torch.tensor([0.25])
+
+        def close(self):
+            self.calls.append(("close", None))
+            self.closed = True
+
+    executor = NativeRewardExecutor(
+        RewardModelSpec(
+            name="native",
+            backend="native",
+            model_path="/models/native",
+            offload_mode="cpu",
+            executor_config={"model": "tests.fake:CpuResidentModel"},
+        )
+    )
+    _CpuResidentModel.instances.clear()
+    monkeypatch.setattr(executor_module, "_load_native_model", lambda _: _CpuResidentModel)
+    monkeypatch.setattr(executor_module, "get_device_name", lambda: "cuda")
+    monkeypatch.setattr(executor_module, "get_device_id", lambda: 3)
+
+    assert executor.state is NativeRewardModelState.CLOSED
+    await executor.wake_up()
+    assert executor.state is NativeRewardModelState.DEVICE
+    torch.testing.assert_close(await executor.infer(), torch.tensor([0.25]))
+    await executor.sleep()
+    assert executor.state is NativeRewardModelState.CPU
+    retained_model = executor._model
+    await executor.wake_up()
+    assert executor.state is NativeRewardModelState.DEVICE
+    assert executor._model is retained_model
+    await executor.sleep()
+    await executor.close()
+
+    assert len(_CpuResidentModel.instances) == 1
+    assert _CpuResidentModel.instances[0].calls == [
+        ("init", torch.device("cpu")),
+        ("activate", torch.device("cuda", 3)),
+        ("infer", None),
+        ("offload", torch.device("cpu")),
+        ("activate", torch.device("cuda", 3)),
+        ("offload", torch.device("cpu")),
+        ("close", None),
+    ]
+    assert _CpuResidentModel.instances[0].closed
+    assert executor._model is None
+    assert executor.state is NativeRewardModelState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_native_executor_cpu_mode_requires_complete_lifecycle(monkeypatch):
+    class _IncompleteModel:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def activate(self, device):
+            del device
+
+    executor = NativeRewardExecutor(
+        RewardModelSpec(
+            name="native",
+            backend="native",
+            offload_mode="cpu",
+            executor_config={"model": "tests.fake:IncompleteModel"},
+        )
+    )
+    monkeypatch.setattr(executor_module, "_load_native_model", lambda _: _IncompleteModel)
+
+    with pytest.raises(TypeError, match=r"offload_to_cpu\(\), close\(\)"):
+        await executor.wake_up()
+
+    assert executor._model is None
+    assert executor.state is NativeRewardModelState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_native_executor_releases_model_before_emptying_cache(monkeypatch):
+    class _ModelWithoutClose:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def infer(self):
+            return None
+
+    spec = RewardModelSpec(
+        name="native",
+        backend="native",
+        model_path=None,
+        router_address=None,
+        executor_config={"model": "tests.fake:ModelWithoutClose"},
+    )
+    executor = NativeRewardExecutor(spec)
+    monkeypatch.setattr(executor_module, "_load_native_model", lambda _: _ModelWithoutClose)
+    monkeypatch.setattr(executor_module, "get_device_name", lambda: "cpu")
+    monkeypatch.setattr(executor_module, "get_device_id", lambda: 0)
+
+    await executor.wake_up()
+    model_ref = weakref.ref(executor._model)
+    cache_observations = []
+    monkeypatch.setattr(executor_module, "_empty_accelerator_cache", lambda: cache_observations.append(model_ref()))
+
+    await executor.sleep()
+
+    assert cache_observations == [None]
 
 
 @pytest.mark.asyncio
@@ -935,6 +1092,113 @@ async def test_native_executor_waits_for_inflight_score_before_sleep(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_cpu_sleep_waits_for_cancelled_sync_inference_thread(monkeypatch):
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class _BlockingCpuModel:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def activate(self, device):
+            calls.append(("activate", torch.device(device)))
+
+        def infer(self):
+            started.set()
+            release.wait(timeout=5)
+            calls.append(("infer_done", None))
+            return torch.tensor([0.5])
+
+        def offload_to_cpu(self):
+            calls.append(("offload", None))
+
+        def close(self):
+            calls.append(("close", None))
+
+    executor = NativeRewardExecutor(
+        RewardModelSpec(
+            name="native",
+            backend="native",
+            offload_mode="cpu",
+            executor_config={"model": "tests.fake:BlockingCpuModel"},
+        )
+    )
+    monkeypatch.setattr(executor_module, "_load_native_model", lambda _: _BlockingCpuModel)
+    monkeypatch.setattr(executor_module, "get_device_name", lambda: "cpu")
+    monkeypatch.setattr(executor_module, "get_device_id", lambda: 0)
+
+    await executor.wake_up()
+    infer_task = asyncio.create_task(executor.infer())
+    assert await asyncio.to_thread(started.wait, 1)
+    infer_task.cancel()
+    sleep_task = asyncio.create_task(executor.sleep())
+    await asyncio.sleep(0.02)
+
+    assert not sleep_task.done()
+    assert not any(name == "offload" for name, _ in calls)
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await infer_task
+    await sleep_task
+
+    assert [name for name, _ in calls][-2:] == ["infer_done", "offload"]
+    assert executor.state is NativeRewardModelState.CPU
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cpu_sleep_drains_offload_before_propagating(monkeypatch):
+    import threading
+
+    offload_started = threading.Event()
+    release_offload = threading.Event()
+
+    class _BlockingOffloadModel:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def activate(self, device):
+            del device
+
+        def infer(self):
+            return None
+
+        def offload_to_cpu(self):
+            offload_started.set()
+            release_offload.wait(timeout=5)
+
+        def close(self):
+            return None
+
+    executor = NativeRewardExecutor(
+        RewardModelSpec(
+            name="native",
+            backend="native",
+            offload_mode="cpu",
+            executor_config={"model": "tests.fake:BlockingOffloadModel"},
+        )
+    )
+    monkeypatch.setattr(executor_module, "_load_native_model", lambda _: _BlockingOffloadModel)
+    monkeypatch.setattr(executor_module, "get_device_name", lambda: "cpu")
+    monkeypatch.setattr(executor_module, "get_device_id", lambda: 0)
+
+    await executor.wake_up()
+    sleep_task = asyncio.create_task(executor.sleep())
+    assert await asyncio.to_thread(offload_started.wait, 1)
+    sleep_task.cancel()
+    await asyncio.sleep(0.02)
+    assert not sleep_task.done()
+
+    release_offload.set()
+    with pytest.raises(asyncio.CancelledError):
+        await sleep_task
+    assert executor.state is NativeRewardModelState.CPU
+
+
+@pytest.mark.asyncio
 async def test_native_executor_does_not_serialize_async_model_calls(monkeypatch):
     class _BatchingModel:
         instances = []
@@ -988,14 +1252,17 @@ async def test_native_executor_does_not_serialize_async_model_calls(monkeypatch)
 @pytest.mark.asyncio
 async def test_worker_exposes_native_model_lifecycle():
     worker = object.__new__(OmniRewardLoopWorker)
-    executor = SimpleNamespace(wake_up=AsyncMock(), sleep=AsyncMock())
+    executor = SimpleNamespace(wake_up=AsyncMock(), sleep=AsyncMock(), close=AsyncMock())
     worker.native_reward_executors = {"native": executor}
+    worker.reward_manager = SimpleNamespace(shutdown=lambda: None)
 
     await worker.wake_up_reward_model("native")
     await worker.sleep_reward_model("native")
+    await worker.shutdown()
 
     executor.wake_up.assert_awaited_once_with()
     executor.sleep.assert_awaited_once_with()
+    executor.close.assert_awaited_once_with()
 
 
 def test_model_manager_rejects_existing_and_named_models():
@@ -1122,6 +1389,7 @@ async def test_async_compute_rm_score_brackets_scoring_with_one_lifecycle():
     calls = []
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
+    manager._preserve_reward_components = False
 
     async def wake_up():
         calls.append("wake_up")
@@ -1153,6 +1421,7 @@ async def test_async_compute_rm_score_serializes_lifecycle_brackets():
     release_first_score = asyncio.Event()
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
+    manager._preserve_reward_components = False
 
     async def wake_up():
         calls.append("wake_up")

@@ -48,6 +48,7 @@ __all__ = [
 
 _ENGINE_BACKENDS = {"engine"}
 _NATIVE_BACKENDS = {"native"}
+_NATIVE_OFFLOAD_MODES = {"recreate", "cpu"}
 
 
 @dataclass
@@ -214,6 +215,8 @@ class EngineRewardModelConfig(RewardModelConfig):
 class NativeRewardModelConfig(RewardModelConfig):
     """Complete user-facing schema for one worker-local native reward model."""
 
+    # How an offloaded native model releases accelerator memory between phases.
+    offload_mode: str = "recreate"
     placement: RewardModelPlacementConfig | None = None
     executor: NativeRewardModelExecutorConfig | None = None
 
@@ -225,16 +228,26 @@ class NativeRewardModelConfig(RewardModelConfig):
             raise ValueError(f"Native reward model {self.name!r} requires placement.devices")
         if not isinstance(self.executor, NativeRewardModelExecutorConfig):
             raise ValueError(f"Native reward model {self.name!r} requires executor.model")
+        if self.offload_mode not in _NATIVE_OFFLOAD_MODES:
+            raise ValueError(
+                f"Native reward model {self.name!r} offload_mode must be one of "
+                f"{sorted(_NATIVE_OFFLOAD_MODES)}, got {self.offload_mode!r}"
+            )
+        if not self.resolved_offload and self.offload_mode != "recreate":
+            raise ValueError(
+                f"Native reward model {self.name!r} cannot use offload_mode={self.offload_mode!r} when offload=false"
+            )
 
     @classmethod
     def from_mapping(cls, name: str, value) -> NativeRewardModelConfig:
         model = to_mapping(value)
-        allowed = {"backend", "offload", "model_path", "placement", "executor"}
+        allowed = {"backend", "offload", "offload_mode", "model_path", "placement", "executor"}
         _reject_unknown_fields(name, model, allowed)
         return cls(
             name=name,
             backend=model.get("backend", ""),
             offload=model.get("offload"),
+            offload_mode=model.get("offload_mode", "recreate"),
             model_path=model.get("model_path"),
             placement=RewardModelPlacementConfig.from_mapping(name, model.get("placement")),
             executor=NativeRewardModelExecutorConfig.from_mapping(name, model.get("executor")),
@@ -249,6 +262,8 @@ class RewardModelSpec(BaseConfig):
     backend: str = ""
     model_path: str | None = None
     router_address: str | None = None
+    # Native executor lifecycle policy; ignored by engine-backed models.
+    offload_mode: str = "recreate"
     executor_config: dict[str, Any] = field(default_factory=dict)
 
 
@@ -318,9 +333,9 @@ def validate_reward_model_terms(config) -> None:
 
 
 def reward_is_enabled(config) -> bool:
-    """Return whether either the legacy or named-model reward path is enabled."""
+    """Return whether any legacy, named-model, or accelerator-worker reward path is enabled."""
     reward_model = config.reward.get("reward_model", {})
-    return bool(reward_model.get("enable", False) or has_reward_models(config))
+    return bool(reward_model.get("enable", False) or has_reward_models(config) or accelerator_workers_enabled(config))
 
 
 def reward_role_required(config) -> bool:
