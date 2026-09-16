@@ -18,7 +18,7 @@ FSDP utilities for verl-omni
 import json
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -85,6 +85,14 @@ def fsdp_summon_full_params(module, *, writeback: bool = False, with_grads: bool
 
 def _param_to_cpu(param):
     if hasattr(param, "full_tensor"):
+        # FSDP2 CPUOffloadPolicy leaves the local DTensor shard on CPU. Move
+        # that shard back to the accelerator before the device-mesh all-gather;
+        # HCCL/NCCL cannot all-gather CPU tensors.
+        mesh_device_type = getattr(getattr(param, "device_mesh", None), "device_type", None)
+        if param.device.type == "cpu" and mesh_device_type not in (None, "cpu"):
+            from verl.utils.device import get_device_id
+
+            param = param.to(get_device_id(), non_blocking=True)
         return param.full_tensor().detach().cpu()
     return param.detach().cpu()
 
@@ -386,36 +394,79 @@ def _layered_summon_lora_params_diffusers(
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from verl.utils.device import get_torch_device
 
-    def _prefix_submodules(module, prefix):
+    def _normalized_fsdp_name(name: str) -> str:
+        return name.replace("_fsdp_wrapped_module.", "").strip(".")
+
+    def _layer_fsdp_units(module):
+        """Yield every distinct FSDP unit under a configured layer prefix."""
+        normalized_prefixes = tuple(_normalized_fsdp_name(prefix) for prefix in layer_prefixes)
+        seen = set()
         for name, submodule in module.named_modules():
-            if name.startswith(prefix) and "." not in name[len(prefix) :]:
-                yield name, submodule
+            normalized_name = _normalized_fsdp_name(name)
+            if not normalized_name or fsdp_version(submodule) == 0:
+                continue
+            if not any(
+                normalized_name == prefix or normalized_name.startswith(f"{prefix}.") for prefix in normalized_prefixes
+            ):
+                continue
+            identity = id(submodule)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            yield normalized_name, submodule
+
+    def _owned_by_unit(param_name: str, nested_fsdp_names: set[str]) -> bool:
+        normalized_name = _normalized_fsdp_name(param_name)
+        return not any(
+            normalized_name == nested_name or normalized_name.startswith(f"{nested_name}.")
+            for nested_name in nested_fsdp_names
+        )
 
     lora_params = OrderedDict()
-    prefix_list = []
-    for lp in layer_prefixes:
-        # FSDP1
-        prefix_list.append(f"_fsdp_wrapped_module.{lp}")
-        # FSDP2
-        prefix_list.append(lp)
     peft_model = getattr(fsdp_module, "_fsdp_wrapped_module", fsdp_module)
-    for prefix in prefix_list:
-        for name, submodule in _prefix_submodules(fsdp_module, prefix):
-            block_prefix = name.replace("_fsdp_wrapped_module.", "")
-            if name.endswith(".model") or name.endswith(".layers"):
-                continue
-            if fsdp_version(submodule) > 0:
-                with FSDP.summon_full_params(submodule, writeback=False):
-                    sub_lora_params = get_peft_model_state_dict(
-                        peft_model, state_dict=submodule.state_dict(), adapter_name=adapter_name
-                    )
-                    sub_lora_params = {
-                        f"{block_prefix}.{param_name}": _param_to_cpu(param)
-                        for param_name, param in sub_lora_params.items()
-                    }
-                    lora_params.update(sub_lora_params)
-                    submodule._is_root = False
-                get_torch_device().empty_cache()
+    for block_prefix, submodule in _layer_fsdp_units(fsdp_module):
+        if block_prefix.endswith(".model") or block_prefix.endswith(".layers"):
+            continue
+        version = fsdp_version(submodule)
+
+        # A parent unit must not export a nested unit's parameters.  Every
+        # nested FSDP unit is yielded independently above, so this partitions
+        # the parameter tree instead of dropping or duplicating tensors.
+        nested_fsdp_names = {
+            _normalized_fsdp_name(name)
+            for name, nested in submodule.named_modules()
+            if name and fsdp_version(nested) > 0
+        }
+
+        # FSDP1 can expose only ``_flat_param`` before summon_full_params, so
+        # LoRA-name filtering must happen after the summon.  ``recurse=False``
+        # leaves nested units for their own iteration.  FSDP2 parameters are
+        # DTensors and are materialized individually by ``_param_to_cpu``;
+        # summoning CPU-offloaded FSDP2 parameters creates invalid wrappers.
+        is_fsdp1 = version == 1
+        original_is_root = getattr(submodule, "_is_root", None)
+        if is_fsdp1:
+            submodule._is_root = True
+        summon_ctx = FSDP.summon_full_params(submodule, writeback=False, recurse=False) if is_fsdp1 else nullcontext()
+        try:
+            with summon_ctx:
+                sub_state_dict = {
+                    param_name: param
+                    for param_name, param in submodule.named_parameters()
+                    if _owned_by_unit(param_name, nested_fsdp_names)
+                }
+                sub_lora_params = get_peft_model_state_dict(
+                    peft_model, state_dict=sub_state_dict, adapter_name=adapter_name
+                )
+                for param_name, param in sub_lora_params.items():
+                    full_name = f"{block_prefix}.{param_name}"
+                    if full_name in lora_params:
+                        raise RuntimeError(f"Layered LoRA collection produced duplicate key: {full_name}")
+                    lora_params[full_name] = _param_to_cpu(param)
+        finally:
+            if is_fsdp1:
+                submodule._is_root = original_is_root
+        get_torch_device().empty_cache()
     return lora_params
 
 
@@ -438,7 +489,8 @@ def collect_lora_params(
         base_sync_done: If ``True``, collect only LoRA weights; else full base weights.
         is_diffusers: Use the diffusers-specific layered summon helper.
         adapter_name: LoRA adapter name (usually ``"default"``).
-        layer_prefixes: FSDP layer name prefixes (``["transformer_blocks."]``
+        layer_prefixes: FSDP layer name prefixes (for example,
+            ``["transformer_blocks."]``).
     """
     use_diffusers_layered = is_diffusers and layered_summon and fsdp_version(module) > 0
     if adapter_name == "default" and not use_diffusers_layered and fsdp_version(module) != 2:

@@ -352,6 +352,15 @@ class BaseRayDiffusionTrainer(ABC):
         except (KeyError, TypeError, AttributeError, OmegaConf.errors.OmegaConfBaseException) as e:
             raise RuntimeError("Failed to propagate trainer.total_training_steps to actor optimizer config.") from e
 
+    def shutdown(self) -> None:
+        """Release optional reward-loop state owned by the trainer."""
+        manager = getattr(self, "reward_loop_manager", None)
+        self.reward_loop_manager = None
+        if manager is not None:
+            shutdown = getattr(manager, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+
     def _dump_generations(
         self,
         inputs,
@@ -639,6 +648,11 @@ class BaseRayDiffusionTrainer(ABC):
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            # Reward managers may validate different media contracts for train
+            # and validation pipelines (for example, different resolutions).
+            # Agent-loop postprocessing owns a new meta_info mapping, so carry
+            # the phase marker across the rollout boundary explicitly.
+            test_output_gen_batch_padded.meta_info["validate"] = True
 
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
@@ -1521,10 +1535,46 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
         actor_loss_cfg = self.config.actor_rollout_ref.actor.diffusion_loss
         if rollout_cfg.rollout_adapter != "old":
             raise ValueError("Old-adapter algorithms require actor_rollout_ref.rollout.rollout_adapter=old.")
-        if actor_loss_cfg.loss_mode != "diffusion_nft":
+        if actor_loss_cfg.loss_mode not in {"diffusion_nft", "omni_nft"}:
             raise ValueError(
-                "Old-adapter algorithms require actor_rollout_ref.actor.diffusion_loss.loss_mode=diffusion_nft."
+                "Old-adapter algorithms require actor_rollout_ref.actor.diffusion_loss.loss_mode "
+                "to be 'diffusion_nft' or 'omni_nft'."
             )
+
+    def _compute_data_metrics(self, batch: DataProto) -> dict:
+        """Collect batch reward/advantage stats for the training logger."""
+        metrics = compute_data_metrics_diffusion(batch)
+        reward_names = list(batch.meta_info.get("reward_names") or [])
+        scores = batch.batch.get("rm_scores")
+        if not reward_names or scores is None:
+            return metrics
+        if scores.ndim != 2 or scores.shape[1] != len(reward_names):
+            raise ValueError(
+                f"Component reward scores must have shape (B, {len(reward_names)}), got {tuple(scores.shape)}."
+            )
+
+        scores = scores.detach().float()
+        combined = scores.sum(dim=1)
+        metrics.update(
+            {
+                "critic/rewards/mean": float(combined.mean()),
+                "critic/rewards/max": float(combined.max()),
+                "critic/rewards/min": float(combined.min()),
+            }
+        )
+        for index, name in enumerate(reward_names):
+            column = scores[:, index]
+            metrics.update(
+                {
+                    f"train/reward/{name}/mean": float(column.mean()),
+                    f"train/reward/{name}/std": float(column.std(unbiased=False)),
+                    f"train/reward/{name}/min": float(column.min()),
+                    f"train/reward/{name}/max": float(column.max()),
+                }
+            )
+        metrics["train/reward/sum/mean"] = float(combined.mean())
+        metrics["train/reward/sum/std"] = float(combined.std(unbiased=False))
+        return metrics
 
     def init_workers(self):
         """Initialize actor-only workers for offline, or full stack for online preference training."""
@@ -1874,7 +1924,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics_diffusion(batch=batch))
+                metrics.update(self._compute_data_metrics(batch))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 num_images = (
                     batch.batch["advantages"].shape[0]

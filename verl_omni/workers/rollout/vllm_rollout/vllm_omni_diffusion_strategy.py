@@ -20,6 +20,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 import torchvision.transforms as T
+from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.import_utils import import_external_libs
 from vllm_omni.inputs.data import OmniCustomPrompt, OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -93,6 +94,12 @@ class DiffusionStrategy(OmniStrategyBase):
 
     rollout_config_cls = DiffusionRolloutConfig
     model_config_cls = DiffusionModelConfig
+
+    def init_model_config(self, model_config: Any) -> DiffusionModelConfig:
+        """Preserve adapter-specific nested config dataclasses resolved by Hydra."""
+        if isinstance(model_config, Mapping) and model_config.get("_target_"):
+            return omega_conf_to_dataclass(model_config)
+        return super().init_model_config(model_config)
 
     def post_init(self, cuda_visible_devices: str) -> None:
         self.server._to_tensor = T.PILToTensor()

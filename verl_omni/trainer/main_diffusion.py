@@ -402,11 +402,14 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
-        # Initialize the workers of the trainer.
-        trainer.init_workers()
+        try:
+            # Initialize the workers of the trainer.
+            trainer.init_workers()
 
-        # Start the training process.
-        trainer.fit()
+            # Start the training process.
+            trainer.fit()
+        finally:
+            trainer.shutdown()
 
 
 if __name__ == "__main__":

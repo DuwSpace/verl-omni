@@ -11,21 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .diffusers_impl import (  # noqa: F401
-    DiffusersFSDPEngine,
-    DPODiffusersFSDPEngine,
-    NFTDiffusersFSDPEngine,
-    OmniNFTDiffusersFSDPEngine,
-    PPODiffusersFSDPEngine,
-)
-from .omni_impl import OmniFSDPEngine  # noqa: F401
 
-# TODO(andy): unify DPO and NFT engines later.
+from .diffusers_training_adapter import LTX23OmniNFT
+from .vllm_omni_rollout_adapter import LTX23OmniNFTPipeline
+
 __all__ = [
-    "PPODiffusersFSDPEngine",
-    "DPODiffusersFSDPEngine",
-    "NFTDiffusersFSDPEngine",
-    "OmniNFTDiffusersFSDPEngine",
-    "DiffusersFSDPEngine",
-    "OmniFSDPEngine",
+    "LTX23OmniNFT",
+    "LTX23OmniNFTPipeline",
 ]
