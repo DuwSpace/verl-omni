@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ci-e2e-diffusion GPU smoke tests (4-GPU): end-to-end diffusion training paths.
-# Includes FlowGRPO / online DPO / DiffusionNFT (v0), synchronous separate,
-# FlowGRPO v1 separate_async, and two-teacher OPD on the v1 sync and
+# Includes FlowGRPO / online DPO / DiffusionNFT / OmniNFT, synchronous
+# separate, FlowGRPO v1 separate_async, and two-teacher OPD on the v1 sync and
 # separate_async trainers.
 
 set -euo pipefail
@@ -70,5 +70,9 @@ run_test 8 "Diffusion OPD v1 sync colocated teachers e2e" \
 run_test 9 "Diffusion OPD v1 separate_async standalone teachers e2e" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" SMOKE=async \
     bash tests/special_e2e/run_diffusion_teacher_smoke.sh
+
+run_test 10 "LTX-2.3 OmniNFT trainer e2e" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
+    bash tests/special_e2e/run_omnift_ltx2_tiny.sh "${diffusion_trainer_args[@]}"
 
 gpu_smoke_summary
