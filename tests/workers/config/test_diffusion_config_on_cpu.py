@@ -86,6 +86,10 @@ class TestDiffusionLossConfig:
         cfg = DiffusionLossConfig(loss_mode="dance_grpo")
         assert cfg.loss_mode == "dance_grpo"
 
+    def test_omni_nft_loss_mode(self):
+        cfg = DiffusionLossConfig(loss_mode="omni_nft")
+        assert cfg.loss_mode == "omni_nft"
+
 
 # ---------------------------------------------------------------------------
 # DiffusionAlgoConfig

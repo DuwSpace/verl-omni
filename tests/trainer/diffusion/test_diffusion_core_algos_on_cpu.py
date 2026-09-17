@@ -327,13 +327,16 @@ def test_diffusion_nft_advantage_to_reward_prob(adv_mode: str) -> None:
         torch.testing.assert_close(reward_prob[3:5], torch.full((2,), 0.6), atol=1e-5, rtol=1e-5)
 
 
-def test_prepare_diffusion_nft_actor_batch() -> None:
+@pytest.mark.parametrize("column_reward", [False, True])
+def test_prepare_diffusion_nft_actor_batch(column_reward: bool) -> None:
     from types import SimpleNamespace
 
     from verl import DataProto
 
     B, T, C, H, W = 4, 6, 4, 8, 8
     rewards = torch.randn(B)
+    if column_reward:
+        rewards = rewards[:, None]
     uid = np.array([f"uid-{i // 2}" for i in range(B)], dtype=object)
     batch = DataProto.from_dict(
         tensors={

@@ -27,6 +27,7 @@ from tensordict import TensorDict
 from verl import DataProto
 from verl.utils import tensordict_utils as tu
 
+from verl_omni.trainer.diffusion.modality_advantage import ModalityAdvantageRouter
 from verl_omni.workers.config import DiffusionActorConfig
 
 
@@ -949,6 +950,15 @@ class DiffusionNFTLoss(DiffusionLossFn):
         timestep_fraction: float,
         seed: int | None = None,
     ) -> torch.Tensor:
+        """Select per-sample training timesteps from the rollout grid.
+
+        Independently shuffle each row of ``[B, T]`` and take up to
+        ``max(1, int(T * timestep_fraction))`` entries, capped by slicing at T.
+        A supplied seed initializes one device-local generator shared across
+        row permutations. Return stacked model-scale values converted with
+        ``.long()`` (fractional values are truncated), without changing input.
+        Non-rank-2 input raises ``ValueError``.
+        """
         if train_timesteps.ndim != 2:
             raise ValueError(f"`train_timesteps` must have shape [B, T], got {train_timesteps.shape}.")
         num_timesteps = train_timesteps.shape[1]
@@ -969,7 +979,22 @@ class DiffusionNFTLoss(DiffusionLossFn):
         reward_tensor: torch.Tensor,
         config: Any,
     ) -> DataProto:
-        """Prepare final-latent rollout data for DiffusionNFT actor updates."""
+        """Prepare final-latent rollout data for DiffusionNFT actor updates.
+
+        Accept one scalar reward per sample as ``[B]`` or ``[B, 1]``, flatten
+        to FP32, and reject other shapes. Write the selected timesteps,
+        probabilities, advantages, returns, and rewards into ``batch`` and
+        return the same DataProto.
+        """
+
+        if reward_tensor.ndim == 2 and reward_tensor.shape[1] == 1:
+            reward_tensor = reward_tensor[:, 0]
+        elif reward_tensor.ndim != 1:
+            raise ValueError(
+                "DiffusionNFT expects one scalar reward per sample with shape [B] or [B, 1], "
+                f"got {tuple(reward_tensor.shape)}."
+            )
+        reward_tensor = reward_tensor.float()
 
         algorithm_cfg = config.algorithm
         actor_cfg = config.actor_rollout_ref.actor
@@ -1007,6 +1032,290 @@ class DiffusionNFTLoss(DiffusionLossFn):
         batch.batch["reward_prob"] = reward_prob
         batch.batch["returns"] = batch.batch["advantages"]
         batch.batch["sample_level_rewards"] = reward_tensor[:, None].expand(-1, train_timesteps.shape[1])
+        return batch
+
+
+@register_diffusion_loss("omni_nft")
+class OmniNFTLoss(DiffusionNFTLoss):
+    """Two-branch DiffusionNFT objective for joint audio-video generation."""
+
+    required_model_output_keys = (
+        "video_forward_prediction",
+        "video_old_prediction",
+        "video_ref_forward_prediction",
+        "video_x0",
+        "video_xt",
+        "video_t_expanded",
+        "audio_forward_prediction",
+        "audio_old_prediction",
+        "audio_ref_forward_prediction",
+        "audio_x0",
+        "audio_xt",
+        "audio_t_expanded",
+    )
+    required_data_keys = ("reward_prob",)
+
+    @staticmethod
+    def _compute_modality_loss(
+        *,
+        forward_prediction: torch.Tensor,
+        old_prediction: torch.Tensor,
+        ref_forward_prediction: torch.Tensor,
+        x0: torch.Tensor,
+        xt: torch.Tensor,
+        t_expanded: torch.Tensor,
+        reward_prob: torch.Tensor,
+        config: DiffusionActorConfig,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute one modality's preference objective and reference velocity MSE.
+
+        Args:
+            forward_prediction: Current policy velocity, ``[B, ...]``.
+            old_prediction: Rollout-policy velocity with the same shape; detached here.
+            ref_forward_prediction: Base/reference velocity; detached here.
+            x0: Clean latent target, matching prediction shape.
+            xt: Noised latent at normalized time ``t_expanded``.
+            t_expanded: Time broadcastable to each sample's latent dimensions.
+            reward_prob: Per-sample optimality weight. Any trailing dimensions
+                are flattened and averaged, then cast to x0's device and dtype.
+            config: Supplies beta, adaptive-weight floor, and advantage clip scale.
+
+        Form velocities ``v+ = beta*v + (1-beta)*v_old`` and
+        ``v- = (1+beta)*v_old - beta*v``, then reconstruct ``x0+/- = xt - t*v+/-``.
+        Each branch's squared error is divided by a detached per-sample mean
+        absolute error, computed in FP64 and floored before casting back.
+        Average latent dimensions, mix branches by reward_prob, divide by beta,
+        multiply by adv_clip_max, and average the batch. The reference term is
+        mean squared velocity error over all elements, not KL divergence.
+
+        Returns:
+            Scalar policy loss, scalar reference MSE, and tensor diagnostics.
+            ``ref_kl_loss`` is the legacy metric name for that MSE. Gradients
+            through current predictions follow the caller's grad context.
+        """
+        loss_cfg = config.diffusion_loss
+        beta = loss_cfg.mix_beta
+        old_prediction = old_prediction.detach()
+        ref_forward_prediction = ref_forward_prediction.detach()
+
+        reward_weight = reward_prob
+        if reward_weight.ndim > 1:
+            reward_weight = reward_weight.flatten(1).mean(dim=1)
+        reward_weight = reward_weight.to(device=x0.device, dtype=x0.dtype)
+
+        reduce_dims = tuple(range(1, x0.ndim))
+        positive_prediction = beta * forward_prediction + (1.0 - beta) * old_prediction
+        negative_prediction = (1.0 + beta) * old_prediction - beta * forward_prediction
+        positive_x0 = xt - t_expanded * positive_prediction
+        negative_x0 = xt - t_expanded * negative_prediction
+
+        with torch.no_grad():
+            positive_weight = (
+                torch.abs(positive_x0.double() - x0.double())
+                .mean(dim=reduce_dims, keepdim=True)
+                .clamp_min(loss_cfg.adaptive_weight_min)
+                .to(dtype=positive_x0.dtype)
+            )
+            negative_weight = (
+                torch.abs(negative_x0.double() - x0.double())
+                .mean(dim=reduce_dims, keepdim=True)
+                .clamp_min(loss_cfg.adaptive_weight_min)
+                .to(dtype=negative_x0.dtype)
+            )
+
+        positive_loss = ((positive_x0 - x0).square() / positive_weight).mean(dim=reduce_dims)
+        negative_loss = ((negative_x0 - x0).square() / negative_weight).mean(dim=reduce_dims)
+        policy_per_sample = reward_weight * positive_loss / beta + (1.0 - reward_weight) * negative_loss / beta
+        policy_loss = (policy_per_sample * loss_cfg.adv_clip_max).mean()
+        ref_loss = (forward_prediction - ref_forward_prediction).square().mean()
+        details = {
+            "positive_loss": positive_loss.mean(),
+            "negative_loss": negative_loss.mean(),
+            "ref_kl_loss": ref_loss,
+            "old_deviate": (forward_prediction - old_prediction).square().mean(),
+            "reward_prob_mean": reward_weight.mean(),
+        }
+        return policy_loss, ref_loss, details
+
+    @classmethod
+    def compute_loss(
+        cls,
+        *,
+        video_forward_prediction: torch.Tensor,
+        video_old_prediction: torch.Tensor,
+        video_ref_forward_prediction: torch.Tensor,
+        video_x0: torch.Tensor,
+        video_xt: torch.Tensor,
+        video_t_expanded: torch.Tensor,
+        video_reward_prob: torch.Tensor,
+        audio_forward_prediction: torch.Tensor,
+        audio_old_prediction: torch.Tensor,
+        audio_ref_forward_prediction: torch.Tensor,
+        audio_x0: torch.Tensor,
+        audio_xt: torch.Tensor,
+        audio_t_expanded: torch.Tensor,
+        audio_reward_prob: torch.Tensor,
+        config: DiffusionActorConfig,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Combine video/audio preference losses and reference velocity penalties.
+
+        Each modality supplies matching ``[B, ...]`` current/old/reference
+        velocities and clean/noised latents, broadcastable normalized times,
+        and per-sample reward probabilities. See ``_compute_modality_loss``
+        for branch construction and reductions. Each reference MSE is scaled
+        by its modality's ``*_ref_kl_coef``; the two resulting branch losses
+        are weighted by ``video_weight``/``audio_weight`` and divided by their
+        sum floored at 1e-8. These loss weights differ from reward routing weights.
+
+        Returns the differentiable scalar total and detached Python scalar
+        metrics, including ``ref_kl_loss`` names that denote velocity MSE.
+        """
+        video_policy, video_ref, video_details = cls._compute_modality_loss(
+            forward_prediction=video_forward_prediction,
+            old_prediction=video_old_prediction,
+            ref_forward_prediction=video_ref_forward_prediction,
+            x0=video_x0,
+            xt=video_xt,
+            t_expanded=video_t_expanded,
+            reward_prob=video_reward_prob,
+            config=config,
+        )
+        audio_policy, audio_ref, audio_details = cls._compute_modality_loss(
+            forward_prediction=audio_forward_prediction,
+            old_prediction=audio_old_prediction,
+            ref_forward_prediction=audio_ref_forward_prediction,
+            x0=audio_x0,
+            xt=audio_xt,
+            t_expanded=audio_t_expanded,
+            reward_prob=audio_reward_prob,
+            config=config,
+        )
+        loss_cfg = config.diffusion_loss
+        modality_weight_sum = max(loss_cfg.video_weight + loss_cfg.audio_weight, 1e-8)
+        total_loss = (
+            loss_cfg.video_weight * (video_policy + loss_cfg.video_ref_kl_coef * video_ref)
+            + loss_cfg.audio_weight * (audio_policy + loss_cfg.audio_ref_kl_coef * audio_ref)
+        ) / modality_weight_sum
+
+        metrics = {
+            "actor/video/policy_loss": video_policy.detach().item(),
+            "actor/audio/policy_loss": audio_policy.detach().item(),
+            "actor/total_loss": total_loss.detach().item(),
+        }
+        for modality, details in (("video", video_details), ("audio", audio_details)):
+            for name, value in details.items():
+                metrics[f"actor/{modality}/{name}"] = value.detach().item()
+        return total_loss, metrics
+
+    def __call__(
+        self,
+        *,
+        config: DiffusionActorConfig,
+        model_output: dict[str, Any],
+        data: TensorDict,
+    ) -> DiffusionLossResult:
+        """Validate single-step ``reward_prob[B, 2]`` and dispatch video/audio losses."""
+        self.validate_inputs(loss_name="omni_nft", model_output=model_output, data=data)
+        reward_prob = data["reward_prob"]
+        if reward_prob.ndim != 2 or reward_prob.shape[1] != 2:
+            raise ValueError(
+                "OmniNFT reward_prob must have shape [B, 2] with columns ordered as video, audio; "
+                f"got {tuple(reward_prob.shape)}."
+            )
+        loss, metrics = self.compute_loss(
+            **{key: model_output[key] for key in self.required_model_output_keys},
+            video_reward_prob=reward_prob[:, 0],
+            audio_reward_prob=reward_prob[:, 1],
+            config=config,
+        )
+        return DiffusionLossResult(loss=loss, metrics=metrics)
+
+    @staticmethod
+    def prepare_actor_batch(batch: DataProto, reward_tensor: torch.Tensor, config: Any) -> DataProto:
+        """Populate the actor batch in place and return the same DataProto.
+
+        Args:
+            batch: Rollout batch with video/audio clean latents, model-scale
+                ``train_timesteps[B, T]``, finite ``rm_scores[B, K]``, prompt
+                grouping ``uid`` values, and column-ordered ``reward_names``.
+                An optional reward_valid_mask must match scores and be all true.
+            reward_tensor: Extracted reward matrix whose shape must match
+                rm_scores; values used for routing are read from rm_scores.
+            config: Normalization, routing, probability, and timestep settings.
+
+        Center each reward column by prompt uid, optionally standardize using
+        full-batch or group statistics, and apply the ``[K, 2]`` routing matrix.
+        Store reward_advantages ``[B, K]`` and modality_advantages and
+        modality_reward_probs ``[B, 2]`` in video/audio order. Repeat probabilities
+        over selected timesteps as reward_prob ``[B, T_selected, 2]``; the engine
+        selects one step for the loss. Store the modality mean as advantages and
+        returns ``[B, T_selected]`` and the component scores as sample_level_rewards.
+        Group uid is distinct from the sample_uid used for reward row alignment.
+
+        Raises:
+            ValueError: Required fields, reward validity/shape, routing, or
+                normalization/probability configuration are invalid.
+        """
+        if "uid" not in batch.non_tensor_batch:
+            raise ValueError("OmniNFT actor batch requires `uid` in non_tensor_batch.")
+        for key in ("video_latents_clean", "audio_latents_clean", "train_timesteps"):
+            if key not in batch.batch:
+                raise ValueError(f"OmniNFT actor batch requires `{key}` from rollout.")
+        if "rm_scores" not in batch.batch:
+            raise ValueError("OmniNFT actor batch requires `rm_scores` from the batch Reward Manager.")
+
+        scores = batch.batch["rm_scores"].detach().float()
+        if reward_tensor.shape != scores.shape:
+            raise ValueError(
+                f"OmniNFT extracted reward shape {tuple(reward_tensor.shape)} does not match "
+                f"rm_scores {tuple(scores.shape)}."
+            )
+        valid_mask = batch.batch.get("reward_valid_mask")
+        if valid_mask is not None and (valid_mask.shape != scores.shape or not valid_mask.all()):
+            raise ValueError("OmniNFT requires a fully valid reward_valid_mask matching rm_scores.")
+
+        algorithm_cfg = config.algorithm
+        actor_cfg = config.actor_rollout_ref.actor
+        reward_cfg = config.reward
+        reward_names = batch.meta_info.get("reward_names")
+        if reward_names is None:
+            raise ValueError("OmniNFT actor batch requires reward_names in meta_info.")
+
+        reward_advantages = ModalityAdvantageRouter.compute_reward_advantages(
+            scores=scores,
+            uid=batch.non_tensor_batch["uid"],
+            norm_by_std=algorithm_cfg.norm_adv_by_std_in_grpo,
+            global_std=algorithm_cfg.global_std,
+        )
+        routing_matrix = ModalityAdvantageRouter.build_routing_matrix(
+            reward_names=reward_names,
+            reward_functions=reward_cfg.reward_functions,
+            device=reward_advantages.device,
+            dtype=reward_advantages.dtype,
+        )
+        modality_advantages = ModalityAdvantageRouter.route(reward_advantages, routing_matrix)
+        modality_reward_probs = ModalityAdvantageRouter.to_probability(
+            modality_advantages,
+            adv_clip_max=actor_cfg.diffusion_loss.adv_clip_max,
+            adv_mode=algorithm_cfg.adv_mode,
+        )
+        train_timesteps = DiffusionNFTLoss._select_train_timesteps(
+            batch.batch["train_timesteps"],
+            timestep_fraction=algorithm_cfg.timestep_fraction,
+            seed=actor_cfg.data_loader_seed,
+        )
+        num_steps = train_timesteps.shape[1]
+        timestep_modality_reward_probs = modality_reward_probs[:, None, :].expand(-1, num_steps, -1)
+        summary_advantages = modality_advantages.mean(dim=1, keepdim=True).expand(-1, num_steps)
+
+        batch.batch["train_timesteps"] = train_timesteps
+        batch.batch["reward_advantages"] = reward_advantages
+        batch.batch["modality_advantages"] = modality_advantages
+        batch.batch["modality_reward_probs"] = modality_reward_probs
+        batch.batch["reward_prob"] = timestep_modality_reward_probs
+        batch.batch["advantages"] = summary_advantages
+        batch.batch["returns"] = summary_advantages
+        batch.batch["sample_level_rewards"] = scores
         return batch
 
 
