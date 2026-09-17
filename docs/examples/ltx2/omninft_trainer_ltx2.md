@@ -1,0 +1,114 @@
+# LTX-2.3 audio-video OmniNFT
+
+Last updated: 09/17/2026
+
+This recipe trains LoRA adapters for
+`diffusers/LTX-2.3-Diffusers@8eee8edcf067e838b843f926ec4d4cc9b2be1aaf`
+text-to-audio-video generation on 16 Ascend NPUs. It reuses the standard
+LTX-2.3 diffusers actor, vLLM-Omni rollout pipeline, worker placement, and native
+reward-model lifecycle. OmniNFT adds the dual-modal direct-preference loss and
+routes independent reward components to its video and audio branches.
+
+The configuration uses FSDP2, sequence-parallel size one, and four TP=4
+rollout replicas. Each replica serves up to two concurrent samples, for 0.5
+concurrent samples per NPU, with rollout CPU offload disabled.
+
+## Paper feature coverage
+
+The [OmniNFT paper](https://arxiv.org/abs/2605.12480) introduces three core
+techniques. This integration currently implements one of them:
+
+| Technique | Status |
+|-----------|--------|
+| Modality-wise advantage routing | Implemented |
+| Layer-wise gradient surgery | Not implemented |
+| Region-wise loss reweighting | Not implemented |
+
+The training results in this example cover modality-wise advantage routing.
+They do not include layer-wise gradient surgery or the paper's attention-based
+region-wise video-loss weighting.
+
+## Prepare data
+
+Convert the OmniNFT VGGSound metadata to the standard RLHF parquet schema:
+
+```bash
+python3 examples/omninft_trainer/data_process/prepare_data.py
+```
+
+By default, the converter downloads `train_metadata_20k.jsonl` and
+`test_metadata.jsonl` from OmniNFT revision
+`fb9237f6e74edf0d0f2a683f4d975b79fde588fe` and writes `train.parquet` and
+`test.parquet` under `data/omninft/vggsound/verl_omni`. This is the same
+revision used by the pinned reward reference source. Use `--train_file` and
+`--val_file` for local metadata files. Each generated sample receives a unique
+`sample_uid`; samples from the same prompt retain their shared `uid` for
+group-wise advantage normalization.
+
+## Prepare model assets
+
+Download the pinned LTX-2.3 base model, install the optional reward packages,
+and download the pinned reward assets:
+
+```bash
+bash examples/omninft_trainer/download_models.sh
+```
+
+The script writes the Hugging Face cache and reward assets under `outputs` by
+default, matching the launcher's default paths. Set `MODEL_ROOT` and
+`REWARD_ROOT` consistently for another location. If the LTX-2.3 base model is
+already available, run `download_reward_models.sh` directly to prepare only
+the rewards. Review the licenses of the reward repositories and checkpoints
+before use.
+
+The five required components keep the scoring definitions used by OmniNFT:
+
+| Component | Signal | Routed to |
+|-----------|--------|-----------|
+| VideoAlign | video-text quality and alignment | video, weight 1.0 |
+| HPSv3 | five-frame top-30% visual preference | video, weight 1.5 |
+| AudioBox | duration-weighted audio aesthetics | audio, weight 0.5 |
+| CLAP | paired audio-text cosine score | audio, weight 1.0 |
+| DeSync | audio-video synchronization | video and audio, weight 1.0 |
+
+Scores remain separate through reward execution. For each component, OmniNFT
+centers scores within a prompt group and, with the checked-in recipe, divides
+by that component's full-batch standard deviation (`correction=0`) before
+applying the routing weights. A missing required score fails the training step.
+The routed actor input is `reward_prob[B,T,2]`; its final dimension is ordered
+as video, audio. The shared DiffusionNFT engine executes old, current, and
+reference policy forwards, while the OmniNFT adapter only packs and unpacks the
+two modalities.
+
+Each named reward model owns an upstream native worker group. With
+`REWARD_OFFLOAD_MODE=cpu`, the executor loads a model once, moves it to its NPU
+for inference, and returns it to CPU on sleep. Set
+`REWARD_OFFLOAD_MODE=recreate` for the compatible close-and-reload lifecycle.
+
+## Launch on Ascend NPU
+
+```bash
+bash examples/omninft_trainer/ltx2/run_ltx2_3_omninft_lora_npu_bs32.sh
+```
+
+The launcher composes the example-local
+`examples/omninft_trainer/ltx2/ltx2_omninft.yaml`, which extends the shared
+diffusion trainer configuration and owns the stable algorithm, adapter, loss,
+rollout, and five-reward definitions. The shell owns machine-dependent paths,
+device placement, run size, and environment setup; trailing Hydra arguments
+override either layer.
+
+Useful environment overrides include `DATA_DIR`, `TRAIN_FILE`, `VAL_FILE`,
+`MODEL_ROOT`, `MODEL_PATH`, `REWARD_ROOT`, `OUTPUT_DIR`, `NUM_GPUS`, `ROLLOUT_TP`,
+`ROLLOUT_N`, `ROLLOUT_MAX_NUM_SEQS`, `TOTAL_TRAINING_STEPS`, and `WANDB_MODE`.
+The default device placement is VideoAlign `[0,1,8,9]`, HPSv3
+`[2,3,10,11]`, AudioBox `[4,12]`, CLAP `[5,13]`, and DeSync
+`[6,7,14,15]`; the corresponding `*_DEVICES` variables can be adjusted
+without changing reward or training semantics.
+
+The recipe uses a batch size of 32 and learning rate `3e-5`. Training uses 20
+denoising steps at 256x384, and validation uses 40 denoising steps at 256x384.
+Training replay applies video/audio CFG values of 1.
+
+See [the example README](../../../examples/omninft_trainer/README.md) for the
+data contract, lifecycle details, and exact routing configuration.
