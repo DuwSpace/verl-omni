@@ -174,7 +174,21 @@ def fsdp_summon_full_params(module, *, writeback: bool = False, with_grads: bool
 
 
 def _param_to_cpu(param):
+    """Return a detached CPU tensor, materializing a DTensor's full value if needed.
+
+    Ordinary tensors use detach/cpu directly. DTensor ``full_tensor()`` may run
+    collectives, so participating mesh ranks must call it in matching order.
+    A CPU local shard on an accelerator mesh is temporarily moved to the current
+    accelerator before materialization; the original parameter is not replaced.
+    A CPU result need not own storage independent of the input.
+    """
     if hasattr(param, "full_tensor"):
+        # Accelerator collectives cannot gather CPU-offloaded local shards.
+        mesh_device_type = getattr(getattr(param, "device_mesh", None), "device_type", None)
+        if param.device.type == "cpu" and mesh_device_type not in (None, "cpu"):
+            from verl.utils.device import get_device_id
+
+            param = param.to(get_device_id(), non_blocking=True)
         return param.full_tensor().detach().cpu()
     return param.detach().cpu()
 
@@ -559,7 +573,8 @@ def collect_lora_params(
         base_sync_done: If ``True``, collect only LoRA weights; else full base weights.
         is_diffusers: Use the diffusers-specific layered summon helper.
         adapter_name: LoRA adapter name (usually ``"default"``).
-        layer_prefixes: FSDP layer name prefixes (``["transformer_blocks."]``
+        layer_prefixes: FSDP layer name prefixes (for example,
+            ``["transformer_blocks."]``).
     """
     use_diffusers_layered = is_diffusers and layered_summon and fsdp_version(module) > 0
     if adapter_name == "default" and not use_diffusers_layered and fsdp_version(module) != 2:
