@@ -61,6 +61,7 @@ from verl_omni.trainer.diffusion.diffusion_algos import (
     get_diffusion_loss_fn,
 )
 from verl_omni.trainer.diffusion.diffusion_metric_utils import (
+    compute_component_reward_metrics_diffusion,
     compute_data_metrics_diffusion,
     compute_old_policy_metrics,
     compute_reward_extra_metrics_diffusion,
@@ -1536,9 +1537,10 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
         actor_loss_cfg = self.config.actor_rollout_ref.actor.diffusion_loss
         if rollout_cfg.rollout_adapter != "old":
             raise ValueError("Old-adapter algorithms require actor_rollout_ref.rollout.rollout_adapter=old.")
-        if actor_loss_cfg.loss_mode != "diffusion_nft":
+        if actor_loss_cfg.loss_mode not in {"diffusion_nft", "omni_nft"}:
             raise ValueError(
-                "Old-adapter algorithms require actor_rollout_ref.actor.diffusion_loss.loss_mode=diffusion_nft."
+                "Old-adapter algorithms require actor_rollout_ref.actor.diffusion_loss.loss_mode "
+                "to be 'diffusion_nft' or 'omni_nft'."
             )
 
     def init_workers(self):
@@ -1635,9 +1637,12 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
         return DataProto.from_tensordict(tu.get_tensordict(ref_output))
 
     def _prepare_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> DataProto:
-        """Delegate algorithm-specific rollout-to-actor batch preparation."""
-        reward_tensor = reward_tensor.squeeze(-1).float() if reward_tensor.ndim > 1 else reward_tensor.float()
-        return self._loss_fn.prepare_actor_batch(batch, reward_tensor, self.config)
+        """Delegate batch preparation with FP32 rewards, preserving component axes.
+
+        Scalar losses handle their own flattening; OmniNFT consumes ``[B, K]``
+        even when K is one. Batch mutation follows the selected loss's contract.
+        """
+        return self._loss_fn.prepare_actor_batch(batch, reward_tensor.float(), self.config)
 
     def _update_old_policy(self) -> tuple[bool, float, Literal["none", "copy", "ema"]]:
         algo_cfg = self.config.algorithm
@@ -1675,7 +1680,8 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
-        if self._has_old_adapter:
+        if self._has_old_adapter and self.global_steps == 0:
+            # Resumed checkpoints already contain the old-policy EMA state.
             self.actor_rollout_wg.copy_adapter(source="default", target="old")
         self.checkpoint_manager.update_weights(self.global_steps)
 
@@ -1889,7 +1895,8 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics_diffusion(batch=batch))
+                metrics.update(compute_data_metrics_diffusion(batch))
+                metrics.update(compute_component_reward_metrics_diffusion(batch))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 num_images = (
                     batch.batch["advantages"].shape[0]
