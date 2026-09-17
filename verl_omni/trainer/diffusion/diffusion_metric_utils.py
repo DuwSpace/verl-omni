@@ -95,6 +95,41 @@ def compute_data_metrics_diffusion(batch: DataProto) -> dict[str, Any]:
     return metrics
 
 
+def compute_component_reward_metrics_diffusion(batch: DataProto) -> dict[str, float]:
+    """Summarize ``rm_scores[B, K]`` in reward_names order without routing weights.
+
+    Return per-column mean/population std/min/max and row-sum mean/population
+    std as Python floats. Return an empty dict when names or scores are absent;
+    raise ValueError when score shape and column names disagree.
+    """
+    reward_names = list(batch.meta_info.get("reward_names") or [])
+    scores = batch.batch.get("rm_scores")
+    if not reward_names or scores is None:
+        return {}
+    if scores.ndim != 2 or scores.shape[1] != len(reward_names):
+        raise ValueError(
+            f"Component reward scores must have shape (B, {len(reward_names)}), got {tuple(scores.shape)}."
+        )
+
+    scores = scores.detach().float()
+    combined = scores.sum(dim=1)
+    metrics = {
+        "train/reward/sum/mean": float(combined.mean()),
+        "train/reward/sum/std": float(combined.std(unbiased=False)),
+    }
+    for index, name in enumerate(reward_names):
+        column = scores[:, index]
+        metrics.update(
+            {
+                f"train/reward/{name}/mean": float(column.mean()),
+                f"train/reward/{name}/std": float(column.std(unbiased=False)),
+                f"train/reward/{name}/min": float(column.min()),
+                f"train/reward/{name}/max": float(column.max()),
+            }
+        )
+    return metrics
+
+
 def compute_old_policy_metrics(
     update_result: tuple[bool, float, Literal["none", "copy", "ema"]],
 ) -> dict[str, Any]:
