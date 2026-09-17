@@ -80,7 +80,14 @@ class LoRAAdapterMixin:
 
     @contextmanager
     def _adapter_state_context(self):
-        """Open writable adapter parameter access (FSDP summon when applicable)."""
+        """Open writable adapter parameters and select default adapter on exit.
+
+        FSDP modules summon full parameters with writeback. FSDP2 CPUOffloadPolicy
+        owns device movement; otherwise FSDP parameters are loaded manually when
+        offload is configured or they start on CPU, and offloaded on exit only
+        when _is_offload_param is set. Neither the arbitrary previous adapter
+        nor the original device is unconditionally restored.
+        """
         from verl.utils.fsdp_utils import fsdp_version, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
         from verl.utils.memory_utils import aggressive_empty_cache
 
@@ -88,8 +95,10 @@ class LoRAAdapterMixin:
 
         is_fsdp_module = fsdp_version(self.module) in (1, 2)
         is_offload_param = getattr(self, "_is_offload_param", False)
+        uses_fsdp2_cpu_offload_policy = getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
         origin_module_device = next(self.module.parameters()).device.type
-        if is_fsdp_module and (is_offload_param or origin_module_device == "cpu"):
+        manually_manage_device = is_fsdp_module and not uses_fsdp2_cpu_offload_policy
+        if manually_manage_device and (is_offload_param or origin_module_device == "cpu"):
             load_fsdp_model_to_gpu(self.module)
 
         ctx = fsdp_summon_full_params(self.module, writeback=True) if is_fsdp_module else nullcontext()
@@ -100,7 +109,7 @@ class LoRAAdapterMixin:
                 finally:
                     self._set_adapter("default")
         finally:
-            if is_offload_param:
+            if manually_manage_device and is_offload_param:
                 offload_fsdp_model_to_cpu(self.module)
                 aggressive_empty_cache(force_sync=True)
 
