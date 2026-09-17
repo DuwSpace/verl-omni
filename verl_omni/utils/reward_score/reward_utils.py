@@ -49,6 +49,20 @@ def normalize_video_tensor(video: torch.Tensor) -> torch.Tensor:
     return normalized
 
 
+def load_torch_state_dict(path: str, *, weights_only: bool = True):
+    """Load a checkpoint with mmap when supported, falling back for legacy files.
+
+    Map tensors to CPU and forward ``weights_only`` unchanged. Retry without
+    mmap only for the legacy-serialization RuntimeError; propagate other errors.
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=weights_only, mmap=True)
+    except RuntimeError as exc:
+        if "mmap can only be used with files saved with" not in str(exc):
+            raise
+        return torch.load(path, map_location="cpu", weights_only=weights_only)
+
+
 def video_tensor_to_pil_frames(video: torch.Tensor) -> list[Image.Image]:
     """Convert a normalized RGB uint8 video tensor to PIL frames.
 
