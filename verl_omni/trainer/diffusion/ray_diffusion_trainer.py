@@ -546,6 +546,19 @@ class BaseRayDiffusionTrainer(ABC):
         except (KeyError, TypeError, AttributeError, OmegaConf.errors.OmegaConfBaseException) as e:
             raise RuntimeError("Failed to propagate trainer.total_training_steps to actor optimizer config.") from e
 
+    def shutdown(self) -> None:
+        """Shut down the optional reward manager, then drop the trainer's reference.
+
+        Propagate cleanup errors and retain the reference for retry on failure.
+        This hook does not terminate actor/rollout workers.
+        """
+        manager = getattr(self, "reward_loop_manager", None)
+        if manager is not None:
+            shutdown = getattr(manager, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+            self.reward_loop_manager = None
+
     def _dump_generations(
         self,
         inputs,
@@ -757,6 +770,8 @@ class BaseRayDiffusionTrainer(ABC):
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            # Rollout replaces meta_info; restore the validation media contract.
+            test_output_gen_batch_padded.meta_info["validate"] = True
 
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model

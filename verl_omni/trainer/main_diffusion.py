@@ -14,6 +14,7 @@
 """Entrypoint for diffusion model RL training."""
 
 import json
+import logging
 import os
 import socket
 
@@ -34,6 +35,8 @@ from verl_omni.utils.config import validate_config
 from verl_omni.utils.diffusion_attention import validate_attention_consistency
 from verl_omni.utils.rl_insight import enable_rl_insight
 from verl_omni.workers.config.reward import reward_pool_is_separate, reward_role_required
+
+logger = logging.getLogger(__name__)
 
 
 def _count_controller_capture_ranges(profile_steps: list[int], profile_continuous_steps: bool) -> int:
@@ -166,6 +169,28 @@ def _get_trainer_cls(config):
     raise ValueError(
         f"Unsupported diffusion trainer_type {trainer_type!r}. Expected one of: 'policy_gradient', 'direct_preference'."
     )
+
+
+def _run_trainer_with_cleanup(trainer) -> None:
+    """Initialize and fit, always calling shutdown even if initialization fails.
+
+    Propagate init/fit errors unchanged. If shutdown also fails, log that failure
+    without replacing the primary error; otherwise propagate the shutdown error.
+    """
+    training_error = None
+    try:
+        trainer.init_workers()
+        trainer.fit()
+    except BaseException as exc:
+        training_error = exc
+        raise
+    finally:
+        try:
+            trainer.shutdown()
+        except BaseException:
+            if training_error is None:
+                raise
+            logger.exception("Trainer shutdown failed after training had already failed")
 
 
 class TaskRunner:
@@ -402,11 +427,7 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
-        # Initialize the workers of the trainer.
-        trainer.init_workers()
-
-        # Start the training process.
-        trainer.fit()
+        _run_trainer_with_cleanup(trainer)
 
 
 if __name__ == "__main__":
