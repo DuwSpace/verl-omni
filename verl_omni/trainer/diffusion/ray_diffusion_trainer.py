@@ -1641,11 +1641,6 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
             self.actor_rollout_wg.ema_update_adapter(source="default", target="old", decay=decay)
             return True, float(decay), "ema"
 
-    def _initialize_old_policy(self) -> None:
-        """Initialize old from current only for a fresh run, not after resume."""
-        if self._has_old_adapter and self.global_steps == 0:
-            self.actor_rollout_wg.copy_adapter(source="default", target="old")
-
     def fit(self):
         """
         Training loop for direct-preference algorithms (DPO, DiffusionNFT, etc.).
@@ -1666,7 +1661,8 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
-        self._initialize_old_policy()
+        if self._has_old_adapter:
+            self.actor_rollout_wg.copy_adapter(source="default", target="old")
         self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
