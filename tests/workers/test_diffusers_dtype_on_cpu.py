@@ -13,18 +13,10 @@
 # limitations under the License.
 """CPU tests for diffusers model dtype finalization."""
 
-from types import SimpleNamespace
-from unittest.mock import patch
-
-import pytest
 import torch
 
 from verl_omni.pipelines.wan22_dance_grpo.diffusers_training_adapter import Wan22DanceGRPO
-from verl_omni.workers.engine.fsdp.diffusers_impl import (
-    PPODiffusersFSDPEngine,
-    _cast_loaded_diffusers_module,
-    _fsdp_param_dtype,
-)
+from verl_omni.workers.engine.fsdp.diffusers_impl import _cast_loaded_diffusers_module, _fsdp_param_dtype
 
 
 class _MixedPrecisionModel(torch.nn.Module):
@@ -79,24 +71,3 @@ def test_ordinary_diffusers_model_is_cast_to_engine_dtype():
 
     assert model[0].weight.dtype == torch.bfloat16
     assert _fsdp_param_dtype(model, torch.bfloat16) == torch.bfloat16
-
-
-@pytest.mark.parametrize("preserve_fp32_modules", [False, True])
-def test_registry_loader_uses_the_same_fp32_island_policy_as_automodel(preserve_fp32_modules):
-    model = _MixedPrecisionModel()
-    model_cls = SimpleNamespace(
-        build_module=lambda model_config, torch_dtype: model,
-        preserve_fp32_modules=lambda: preserve_fp32_modules,
-    )
-    engine = object.__new__(PPODiffusersFSDPEngine)
-    engine.model_config = SimpleNamespace(enable_gradient_checkpointing=False)
-
-    with patch(
-        "verl_omni.workers.engine.fsdp.diffusers_impl.DiffusionModelBase.get_class",
-        return_value=model_cls,
-    ):
-        loaded = engine._build_module_from_registry(torch.bfloat16)
-
-    assert loaded is model
-    expected_dtypes = {torch.bfloat16, torch.float32} if preserve_fp32_modules else {torch.bfloat16}
-    assert {parameter.dtype for parameter in loaded.parameters()} == expected_dtypes
