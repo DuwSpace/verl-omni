@@ -1015,6 +1015,8 @@ class DiffusionNFTLoss(DiffusionLossFn):
 class OmniNFTLoss(DiffusionNFTLoss):
     """Two-branch DiffusionNFT objective for joint audio-video generation."""
 
+    _REWARD_METRIC_PREFIX = "_omnift_reward_metric::"
+
     required_model_output_keys = (
         "video_forward_prediction",
         "video_old_prediction",
@@ -1204,10 +1206,53 @@ class OmniNFTLoss(DiffusionNFTLoss):
             audio_reward_prob=reward_prob[:, 1],
             config=config,
         )
+        metrics.update(self._collect_reward_metrics(data))
         return DiffusionLossResult(loss=loss, metrics=metrics)
 
-    @staticmethod
-    def prepare_actor_batch(batch: DataProto, reward_tensor: torch.Tensor, config: Any) -> DataProto:
+    @classmethod
+    def _collect_reward_metrics(cls, data: TensorDict) -> dict[str, float]:
+        """Read replicated step-level reward summaries from the actor batch."""
+        metrics = {}
+        for key in data.keys():
+            if not isinstance(key, str) or not key.startswith(cls._REWARD_METRIC_PREFIX):
+                continue
+            name = key.removeprefix(cls._REWARD_METRIC_PREFIX)
+            metrics[f"actor/reward/{name}"] = data[key].detach().float().mean().item()
+        return metrics
+
+    @classmethod
+    def _attach_reward_metrics(
+        cls,
+        batch: DataProto,
+        scores: torch.Tensor,
+        reward_names: list[str],
+    ) -> None:
+        """Attach global component summaries as replicated actor-only tensors."""
+        combined = scores.sum(dim=1)
+        summaries = {
+            "sum/mean": combined.mean(),
+            "sum/std": combined.std(correction=0),
+        }
+        for index, name in enumerate(reward_names):
+            column = scores[:, index]
+            summaries.update(
+                {
+                    f"{name}/mean": column.mean(),
+                    f"{name}/std": column.std(correction=0),
+                    f"{name}/min": column.min(),
+                    f"{name}/max": column.max(),
+                }
+            )
+        for name, value in summaries.items():
+            batch.batch[f"{cls._REWARD_METRIC_PREFIX}{name}"] = torch.full(
+                (scores.shape[0],),
+                value.detach().item(),
+                dtype=torch.float32,
+                device=scores.device,
+            )
+
+    @classmethod
+    def prepare_actor_batch(cls, batch: DataProto, reward_tensor: torch.Tensor, config: Any) -> DataProto:
         """Populate the actor batch in place and return the same DataProto.
 
         Args:
@@ -1258,6 +1303,8 @@ class OmniNFTLoss(DiffusionNFTLoss):
         reward_names = batch.meta_info.get("reward_names")
         if reward_names is None:
             raise ValueError("OmniNFT actor batch requires reward_names in meta_info.")
+        reward_names = list(reward_names)
+        cls._attach_reward_metrics(batch, scores, reward_names)
 
         reward_advantages = ModalityAdvantageRouter.compute_reward_advantages(
             scores=scores,

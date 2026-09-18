@@ -28,8 +28,6 @@ from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.tensor import DTensor
-from torch.utils._pytree import tree_leaves, tree_map
-from torch.utils.checkpoint import checkpoint
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -61,7 +59,6 @@ from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.fsdp.utils import create_device_mesh, get_sharding_strategy
 from verl.workers.engine.utils import enable_full_determinism, prepare_micro_batches
 
-from verl_omni.pipelines.ltx2_omni_nft.compat import apply_ltx_npu_rms_norm_workaround
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.utils import (
     build_scheduler,
@@ -78,17 +75,6 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
-
-
-def _tensor_tree_device(value) -> torch.device:
-    """Return the first Tensor leaf's device, without checking other leaves.
-
-    Raise TypeError when the prediction/context PyTree contains no Tensor.
-    """
-    for leaf in tree_leaves(value):
-        if isinstance(leaf, torch.Tensor):
-            return leaf.device
-    raise TypeError("Diffusion model context must contain at least one tensor.")
 
 
 def _cast_loaded_diffusers_module(
@@ -167,27 +153,6 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         # Set True in _build_fsdp_module to skip that manual load.
         self._uses_fsdp2_cpu_offload_policy = False
 
-    def _get_mixed_precision_dtypes(self) -> tuple[torch.dtype, torch.dtype, torch.dtype]:
-        """Resolve FSDP ``(param_dtype, reduce_dtype, buffer_dtype)`` settings.
-
-        Absent settings default to BF16 parameters and FP32 reductions/buffers.
-        These are mixed-precision policy dtypes, not the model loading dtype.
-        FSDP construction may replace param_dtype with None to preserve the
-        loader's mixed layout; FSDP2 does not consume buffer_dtype here.
-        """
-        from verl.utils.torch_dtypes import PrecisionType
-
-        mixed_precision_config = self.engine_config.mixed_precision
-        if mixed_precision_config is not None:
-            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
-            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
-            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
-        else:
-            param_dtype = torch.bfloat16
-            reduce_dtype = torch.float32
-            buffer_dtype = torch.float32
-        return param_dtype, reduce_dtype, buffer_dtype
-
     @property
     def is_param_offload_enabled(self) -> bool:
         return self._is_offload_param
@@ -264,20 +229,12 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         """Try loading via ``DiffusionModelBase.build_module()``.
 
         Returns ``None`` if the registry has no custom loader, so the
-        caller falls back to ``diffusers.AutoModel``. Any other result must be
-        a torch.nn.Module. Cast it to torch_dtype unless the adapter requests
-        FP32 preservation and the module declares _keep_in_fp32_modules; in
-        that case retain the loader's dtype layout without per-layer conversion.
+        caller falls back to ``diffusers.AutoModel``.
         """
         model_cls = DiffusionModelBase.get_class(self.model_config)
         module = model_cls.build_module(self.model_config, torch_dtype)
         if module is None:
             return None
-        if not isinstance(module, torch.nn.Module):
-            raise TypeError(
-                f"{type(module).__name__} returned by build_module() is not a torch.nn.Module. "
-                "Custom models must be torch.nn.Module instances."
-            )
 
         logger.warning(
             "Built %s via DiffusionModelBase custom loader; engine-level hooks "
@@ -287,11 +244,13 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             type(module).__name__,
         )
 
-        _cast_loaded_diffusers_module(
-            module,
-            torch_dtype,
-            preserve_fp32_modules=model_cls.preserve_fp32_modules(),
-        )
+        try:
+            module.to(torch_dtype)
+        except AttributeError:
+            raise TypeError(
+                f"{type(module).__name__} returned by build_module() has no to() method. "
+                "Custom models must be torch.nn.Module instances."
+            ) from None
 
         if self.model_config.enable_gradient_checkpointing:
             try:
@@ -373,8 +332,18 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
     def _build_fsdp_module(self, module):
         # TODO(ziheng): need to improve
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
+        from verl.utils.torch_dtypes import PrecisionType
 
-        param_dtype, reduce_dtype, buffer_dtype = self._get_mixed_precision_dtypes()
+        mixed_precision_config = self.engine_config.mixed_precision
+        if mixed_precision_config is not None:
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
+            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
+        else:
+            param_dtype = torch.bfloat16
+            reduce_dtype = torch.float32
+            buffer_dtype = torch.float32
+
         model_cls = DiffusionModelBase.get_class(self.model_config)
         preserve_fp32_modules = model_cls.preserve_fp32_modules()
 
@@ -1450,44 +1419,17 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
         }
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
-        """Evaluate old/current/base policies for one NFT timestep and compute loss.
-
-        Predictions and forward-process contexts may be tensors or PyTrees.
-        Old-adapter and adapter-disabled reference forwards run without gradients
-        and each Tensor leaf is detached; non-Tensor leaves pass through. The
-        current/default adapter forward follows the caller's gradient mode, so
-        an outer forward_only/no_grad context still applies. This method does
-        not call backward or update parameters.
-
-        Args:
-            micro_batch: Batched clean latents, prompts, selected train_timesteps,
-                and reward_prob. The selected probability column is passed to
-                the loss with gradient-accumulation and SP metadata.
-            loss_function: Callback receiving prepared model_output, step data,
-                and the data-parallel group; returns a loss tensor and metrics.
-            forward_only: Required to be true when no loss callback is supplied;
-                does not itself disable gradients inside this method.
-            step: Index into the selected timestep/probability dimension.
-
-        Returns:
-            ``(loss, output)`` where output contains prepared model_output,
-            a detached Python loss scalar, and metrics. Without a callback the
-            loss is a constant 1 on the first x0 Tensor leaf's device.
-        """
         model_inputs, negative_model_inputs, x0, xt, t_expanded = self.prepare_model_inputs(
             micro_batch=micro_batch, step=step
         )
 
         with self.use_adapter("old"), torch.no_grad():
-            old_prediction = tree_map(
-                lambda value: value.detach() if isinstance(value, torch.Tensor) else value,
-                forward(
-                    module=self.module,
-                    model_config=self.model_config,
-                    model_inputs=model_inputs,
-                    negative_model_inputs=negative_model_inputs,
-                ),
-            )
+            old_prediction = forward(
+                module=self.module,
+                model_config=self.model_config,
+                model_inputs=model_inputs,
+                negative_model_inputs=negative_model_inputs,
+            ).detach()
 
         forward_prediction = forward(
             module=self.module,
@@ -1498,15 +1440,12 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
 
         with torch.no_grad():
             with self.disable_adapter():
-                ref_forward_prediction = tree_map(
-                    lambda value: value.detach() if isinstance(value, torch.Tensor) else value,
-                    forward(
-                        module=self.module,
-                        model_config=self.model_config,
-                        model_inputs=model_inputs,
-                        negative_model_inputs=negative_model_inputs,
-                    ),
-                )
+                ref_forward_prediction = forward(
+                    module=self.module,
+                    model_config=self.model_config,
+                    model_inputs=model_inputs,
+                    negative_model_inputs=negative_model_inputs,
+                ).detach()
         self._set_adapter("default")
 
         model_output = self.prepare_model_outputs(
@@ -1526,7 +1465,7 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
             loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
-            loss = torch.tensor(1.0, device=_tensor_tree_device(x0))
+            loss = torch.tensor(1.0, device=x0.device)
             metrics = {}
 
         output = {
@@ -1539,6 +1478,8 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
 
 def _fsdp2_gradient_checkpointing_with_cast_func(param_dtype: Optional[torch.dtype]) -> Callable:
     """Build a non-reentrant checkpoint wrapper using the FSDP parameter dtype."""
+    from torch.utils._pytree import tree_map
+    from torch.utils.checkpoint import checkpoint
 
     def cast_fp_tensor(value):
         if (
@@ -1589,13 +1530,20 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
     def _build_module(self):
+        from verl_omni.pipelines.ltx2_omni_nft.compat import apply_ltx_npu_rms_norm_workaround
+
         module = super()._build_module()
         if self.model_config.enable_gradient_checkpointing:
             self._enable_omni_gradient_checkpointing(module)
         return apply_ltx_npu_rms_norm_workaround(module)
 
     def _enable_omni_gradient_checkpointing(self, module: torch.nn.Module) -> None:
-        param_dtype, _, _ = self._get_mixed_precision_dtypes()
+        from verl.utils.torch_dtypes import PrecisionType
+
+        mixed_precision_config = self.engine_config.mixed_precision
+        param_dtype = PrecisionType.to_dtype(
+            mixed_precision_config.get("param_dtype", "bf16") if mixed_precision_config is not None else "bf16"
+        )
         keep_in_fp32 = getattr(module, "_keep_in_fp32_modules", None)
         if keep_in_fp32 and DiffusionModelBase.get_class(self.model_config).preserve_fp32_modules():
             param_dtype = None
@@ -1677,6 +1625,80 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
             "audio_xt": audio_xt,
             "video_t_expanded": video_t,
             "audio_t_expanded": audio_t,
+        }
+
+    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
+        """Run paired video/audio NFT forwards without changing the shared NFT engine."""
+        from torch.utils._pytree import tree_map
+
+        model_inputs, negative_model_inputs, x0, xt, t_expanded = self.prepare_model_inputs(
+            micro_batch=micro_batch, step=step
+        )
+
+        def detach_tensors(value):
+            return value.detach() if isinstance(value, torch.Tensor) else value
+
+        with self.use_adapter("old"), torch.no_grad():
+            old_prediction = tree_map(
+                detach_tensors,
+                forward(
+                    module=self.module,
+                    model_config=self.model_config,
+                    model_inputs=model_inputs,
+                    negative_model_inputs=negative_model_inputs,
+                ),
+            )
+
+        current_prediction = forward(
+            module=self.module,
+            model_config=self.model_config,
+            model_inputs=model_inputs,
+            negative_model_inputs=negative_model_inputs,
+        )
+
+        with torch.no_grad(), self.disable_adapter():
+            ref_prediction = tree_map(
+                detach_tensors,
+                forward(
+                    module=self.module,
+                    model_config=self.model_config,
+                    model_inputs=model_inputs,
+                    negative_model_inputs=negative_model_inputs,
+                ),
+            )
+        self._set_adapter("default")
+
+        model_output = self.prepare_model_outputs(
+            output=(old_prediction, current_prediction, ref_prediction, x0, xt, t_expanded),
+            micro_batch=micro_batch,
+        )
+        if loss_function is not None:
+            loss_data = {"reward_prob": micro_batch["reward_prob"][:, step]}
+            loss_data.update(
+                {
+                    key: micro_batch[key]
+                    for key in micro_batch.keys()
+                    if isinstance(key, str) and key.startswith("_omnift_reward_metric::")
+                }
+            )
+            data = tu.get_tensordict(loss_data)
+            tu.assign_non_tensor(
+                data,
+                gradient_accumulation_steps=tu.get_non_tensor_data(
+                    micro_batch, "gradient_accumulation_steps", default=None
+                ),
+                sp_size=tu.get_non_tensor_data(micro_batch, "sp_size", default=None),
+            )
+            loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
+        else:
+            assert forward_only, "forward_only must be True when loss_function is None"
+            loss = torch.tensor(1.0, device=x0[0].device)
+            metrics = {}
+
+        return loss, {
+            "model_output": model_output,
+            "loss": loss.detach().item(),
+            "metrics": metrics,
         }
 
 

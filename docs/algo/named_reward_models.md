@@ -262,13 +262,13 @@ class TransformersRewardModel:
         device: torch.device,
         torch_dtype: str = "bfloat16",
     ):
-        self.device = torch.device(device)
+        self.device = device
         dtype = getattr(torch, torch_dtype)
         self.processor = AutoProcessor.from_pretrained(model_path)
         self.model = AutoModel.from_pretrained(
             model_path,
             torch_dtype=dtype,
-        ).to(self.device).eval()
+        ).eval().to(device)
 
     @torch.inference_mode()
     def infer(self, texts, images):
@@ -282,8 +282,8 @@ class TransformersRewardModel:
         return {"logits": outputs.logits_per_image.detach().cpu()}
 
     def close(self):
-        self.model = None
-        self.processor = None
+        del self.model
+        del self.processor
 ```
 
 Then add a separate score adapter. Its `reward_model` argument is the native
@@ -307,12 +307,10 @@ async def compute_quality_score(
 
 The names and shapes passed to `infer()` are an internal contract between these
 two adapters; the framework does not prescribe them. Both synchronous and
-asynchronous lifecycle and inference methods are accepted. Synchronous methods
-run outside the reward worker's event loop.
-
-An adapter may implement `close()` to release model, processor, buffer, and
-helper-module references. `sleep()` waits for real inference completion, calls
-`close()`, and drops the adapter instance.
+asynchronous `infer()` and `close()` implementations are accepted. Synchronous
+methods run outside the reward worker's event loop. `close()` is optional; the
+executor also runs garbage collection and clears the accelerator cache when a
+model sleeps.
 
 ## Mix engine and native models
 
@@ -383,15 +381,9 @@ whose size is controlled by `reward.reward_model.n_gpus_per_node` and `nnodes`.
 - `true` (default): wake before scoring and sleep afterward;
 - `false`: keep the model resident across training steps.
 
-Native models with `offload=true` are constructed on wake and closed on sleep.
-With `offload=false`, the model remains on its assigned device across training
-steps.
-
-Independent named models are woken, scored, and slept concurrently. The legacy
-`weighted_sum` path pads native batches for an even worker split. The
-`preserve_components` path uses balanced, non-padding shards and restores rows
-by sample identity before routing. There is currently no dynamic load balancing
-or work stealing.
+Independent named models are woken, scored, and slept concurrently. Native
+batches are padded and split evenly across the workers assigned to that model.
+There is currently no dynamic load balancing or work stealing.
 
 The reward loop exposes `async_compute_rm_score()` for asynchronous callers and
 keeps `compute_rm_score()` as the synchronous compatibility entrypoint used by
@@ -417,11 +409,9 @@ through `exp()` again.
 
 ## Current limitations
 
-- `weighted_sum` named-model aggregation uses the visual reward manager
-  contract. Multimodal component scoring requires a batch manager such as
-  `MultiModalRewardManager` and `aggregation=preserve_components`.
+- Named-model aggregation currently uses the visual reward manager contract.
 - Native models are replicated; FSDP and tensor parallelism are not supported.
-- CPU-only native worker placement is not supported.
+- CPU-native placement is not supported.
 - Native routing uses a static even split rather than dynamic load balancing.
 - Named models do not participate in streaming reward computation.
 - vLLM-Omni reward serving is not implemented.
