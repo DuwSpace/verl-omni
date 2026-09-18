@@ -29,6 +29,7 @@ from verl.workers.config.rollout import (
 __all__ = [
     "DiffusionRolloutAlgoConfig",
     "DiffusionPipelineConfig",
+    "LTXDiffusionPipelineConfig",
     "DiffusionSamplingConfig",
     "DiffusionRolloutConfig",
 ]
@@ -86,6 +87,30 @@ class DiffusionPipelineConfig(BaseConfig):
 
     # Flow-matching sigma-schedule shift for the video stream (maps to vllm-omni's flow_shift)
     video_flow_shift: float = 12.0
+
+
+@dataclass
+class LTXDiffusionPipelineConfig(DiffusionPipelineConfig):
+    """LTX guidance overrides for training or vLLM-Omni rollout.
+
+    Training resolves a None modality CFG through guidance_scale, then uses 1
+    if the result is None or zero. Rollout leaves None overrides to the LTX
+    recipe; an explicitly supplied common guidance_scale overrides both CFGs.
+    Modality/rescale controls below are consumed by rollout, not the training forward.
+    """
+
+    # Video CFG override; None follows the consumer-specific fallback above.
+    video_cfg_scale: Optional[float] = None
+    # Audio CFG override; None follows the consumer-specific fallback above.
+    audio_cfg_scale: Optional[float] = None
+    # Audio-to-video guidance override; None retains the rollout recipe value.
+    video_modality_scale: Optional[float] = None
+    # Video-to-audio guidance override; None retains the rollout recipe value.
+    audio_modality_scale: Optional[float] = None
+    # Video guidance rescaling override; None retains the rollout recipe value.
+    video_rescale_scale: Optional[float] = None
+    # Audio guidance rescaling override; None retains the rollout recipe value.
+    audio_rescale_scale: Optional[float] = None
 
 
 @dataclass

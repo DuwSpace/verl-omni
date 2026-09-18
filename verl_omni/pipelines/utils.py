@@ -241,6 +241,6 @@ def forward(
     model_config: DiffusionModelConfig,
     model_inputs: dict,
     negative_model_inputs: Optional[dict],
-) -> torch.Tensor:
-    """Forward the model for single-pass prediction-space objectives."""
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch a single prediction, preserving the adapter's Tensor or tensor-pair output."""
     return DiffusionModelBase.get_class(model_config).forward(module, model_config, model_inputs, negative_model_inputs)
