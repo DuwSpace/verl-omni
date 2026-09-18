@@ -950,15 +950,6 @@ class DiffusionNFTLoss(DiffusionLossFn):
         timestep_fraction: float,
         seed: int | None = None,
     ) -> torch.Tensor:
-        """Select per-sample training timesteps from the rollout grid.
-
-        Independently shuffle each row of ``[B, T]`` and take up to
-        ``max(1, int(T * timestep_fraction))`` entries, capped by slicing at T.
-        A supplied seed initializes one device-local generator shared across
-        row permutations. Return stacked model-scale values converted with
-        ``.long()`` (fractional values are truncated), without changing input.
-        Non-rank-2 input raises ``ValueError``.
-        """
         if train_timesteps.ndim != 2:
             raise ValueError(f"`train_timesteps` must have shape [B, T], got {train_timesteps.shape}.")
         num_timesteps = train_timesteps.shape[1]
@@ -979,22 +970,7 @@ class DiffusionNFTLoss(DiffusionLossFn):
         reward_tensor: torch.Tensor,
         config: Any,
     ) -> DataProto:
-        """Prepare final-latent rollout data for DiffusionNFT actor updates.
-
-        Accept one scalar reward per sample as ``[B]`` or ``[B, 1]``, flatten
-        to FP32, and reject other shapes. Write the selected timesteps,
-        probabilities, advantages, returns, and rewards into ``batch`` and
-        return the same DataProto.
-        """
-
-        if reward_tensor.ndim == 2 and reward_tensor.shape[1] == 1:
-            reward_tensor = reward_tensor[:, 0]
-        elif reward_tensor.ndim != 1:
-            raise ValueError(
-                "DiffusionNFT expects one scalar reward per sample with shape [B] or [B, 1], "
-                f"got {tuple(reward_tensor.shape)}."
-            )
-        reward_tensor = reward_tensor.float()
+        """Prepare final-latent rollout data for DiffusionNFT actor updates."""
 
         algorithm_cfg = config.algorithm
         actor_cfg = config.actor_rollout_ref.actor
@@ -1265,6 +1241,8 @@ class OmniNFTLoss(DiffusionNFTLoss):
             raise ValueError("OmniNFT actor batch requires `rm_scores` from the batch Reward Manager.")
 
         scores = batch.batch["rm_scores"].detach().float()
+        if reward_tensor.ndim == 1 and scores.ndim == 2 and scores.shape[1] == 1:
+            reward_tensor = reward_tensor.unsqueeze(-1)
         if reward_tensor.shape != scores.shape:
             raise ValueError(
                 f"OmniNFT extracted reward shape {tuple(reward_tensor.shape)} does not match "

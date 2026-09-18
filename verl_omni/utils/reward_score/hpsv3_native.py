@@ -218,8 +218,7 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
 
     Returns:
         CPU FP32 ``scores[B]`` in input order and all-true CPU bool
-        ``valid_mask[B]``, call/sampling ``metrics``, and model/base/definition
-        labels. Only logit 0 is used, capped above at 15; average the largest
+        ``valid_mask[B]``. Only logit 0 is used, capped above at 15; average the largest
         ``ceil(5 * 0.3) = 2`` scores per video. Higher is preferred; no lower
         bound or additional normalization is applied.
 
@@ -231,13 +230,11 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
         raise ValueError("HPSv3 micro_batch_size must be a positive integer.")
     frame_groups, prompts = _extract_inputs(batch)
     score_chunks = []
-    forward_calls = 0
     for start in range(0, len(frame_groups), micro_batch_size):
         stop = min(start + micro_batch_size, len(frame_groups))
         images = [frame for group in frame_groups[start:stop] for frame in group]
         repeated_prompts = [prompt for prompt in prompts[start:stop] for _ in range(_FRAME_COUNT)]
         logits = await reward_model.infer(images, repeated_prompts)
-        forward_calls += 1
         if not isinstance(logits, torch.Tensor) or logits.ndim != 2 or logits.shape != (len(images), 2):
             raise ValueError(f"HPSv3 model logits must have shape ({len(images)}, 2).")
         if not torch.isfinite(logits).all():
@@ -251,22 +248,9 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
     scores = torch.cat(score_chunks).to(dtype=torch.float32)
     if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
         raise ValueError("HPSv3 scores must be finite and sample-aligned.")
-    metadata = reward_model.metadata()
     return {
         "scores": scores,
         "valid_mask": torch.ones(len(batch), dtype=torch.bool),
-        "metrics": {
-            "batch_size": len(batch),
-            "micro_batch_size": micro_batch_size,
-            "forward_calls": forward_calls,
-            "frames_per_sample": _FRAME_COUNT,
-            "top_frame_count": top_count,
-            "reward_cap": _REWARD_CAP,
-            "base_model_revision": metadata["base_model_revision"],
-        },
-        "model_revision": metadata["model_revision"],
-        "base_model_revision": metadata["base_model_revision"],
-        "definition_version": _DEFINITION_VERSION,
     }
 
 
@@ -275,26 +259,8 @@ class HPSv3NativeModel:
 
     def __init__(self, model_path: str, device, **kwargs: Any) -> None:
         self._state = _load_state(model_path=model_path, **kwargs)
-        self._state.device = torch.device("cpu")
-        self.activate(device)
-
-    def activate(self, device) -> None:
-        """Move the owned HPSv3 model to the executor-assigned device."""
-        if self._state.model is None:
-            raise RuntimeError("Cannot activate a closed HPSv3 model.")
         self._state.device = torch.device(device)
         self._state.model.to(self._state.device).eval()
-
-    def metadata(self) -> dict[str, str]:
-        """Return configured model/base revision labels, without identity checks."""
-        return {
-            "model_revision": self._state.model_revision,
-            "base_model_revision": self._state.base_model_revision,
-        }
-
-    def offload_to_cpu(self) -> None:
-        """Move model parameters to CPU while retaining model and processor."""
-        self.activate(torch.device("cpu"))
 
     def close(self) -> None:
         """Drop model/processor references; reuse requires constructing a new adapter."""

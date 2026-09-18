@@ -327,16 +327,13 @@ def test_diffusion_nft_advantage_to_reward_prob(adv_mode: str) -> None:
         torch.testing.assert_close(reward_prob[3:5], torch.full((2,), 0.6), atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("column_reward", [False, True])
-def test_prepare_diffusion_nft_actor_batch(column_reward: bool) -> None:
+def test_prepare_diffusion_nft_actor_batch() -> None:
     from types import SimpleNamespace
 
     from verl import DataProto
 
     B, T, C, H, W = 4, 6, 4, 8, 8
     rewards = torch.randn(B)
-    if column_reward:
-        rewards = rewards[:, None]
     uid = np.array([f"uid-{i // 2}" for i in range(B)], dtype=object)
     batch = DataProto.from_dict(
         tensors={
@@ -371,6 +368,52 @@ def test_prepare_diffusion_nft_actor_batch(column_reward: bool) -> None:
     assert result.batch["returns"].shape == (B, num_train)
     assert result.batch["sample_level_rewards"].shape == (B, num_train)
     assert ((result.batch["reward_prob"] >= 0) & (result.batch["reward_prob"] <= 1)).all()
+
+
+def test_prepare_omni_nft_actor_batch_restores_single_component_axis() -> None:
+    from types import SimpleNamespace
+
+    from verl import DataProto
+
+    batch_size, num_timesteps = 4, 6
+    scores = torch.tensor([[1.0], [0.0], [0.2], [0.8]])
+    batch = DataProto.from_dict(
+        tensors={
+            "video_latents_clean": torch.randn(batch_size, 4, 2, 2),
+            "audio_latents_clean": torch.randn(batch_size, 4, 2),
+            "train_timesteps": torch.randint(0, 1000, (batch_size, num_timesteps)),
+            "rm_scores": scores,
+        },
+        non_tensors={"uid": np.array(["p0", "p0", "p1", "p1"], dtype=object)},
+        meta_info={"reward_names": ["quality"]},
+    )
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(
+            norm_adv_by_std_in_grpo=True,
+            global_std=True,
+            adv_mode="continuous",
+            timestep_fraction=0.5,
+        ),
+        actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(
+                diffusion_loss=SimpleNamespace(adv_clip_max=5.0),
+                data_loader_seed=42,
+            )
+        ),
+        reward=SimpleNamespace(
+            reward_functions={
+                "quality": {"routing_weights": {"video": 1.0, "audio": 1.0}},
+            }
+        ),
+    )
+
+    result = diffusion_algos.OmniNFTLoss.prepare_actor_batch(batch, scores.squeeze(-1), config)
+
+    selected_timesteps = max(1, int(num_timesteps * config.algorithm.timestep_fraction))
+    assert result.batch["reward_advantages"].shape == (batch_size, 1)
+    assert result.batch["modality_advantages"].shape == (batch_size, 2)
+    assert result.batch["reward_prob"].shape == (batch_size, selected_timesteps, 2)
+    assert result.batch["sample_level_rewards"].shape == (batch_size, 1)
 
 
 def test_prepare_online_dpo_actor_batch() -> None:

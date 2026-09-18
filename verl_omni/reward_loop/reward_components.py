@@ -19,6 +19,7 @@ components without cross-reward weighting or advantage normalization. Modality
 routing belongs to the algorithm layer. Missing or invalid cells abort assembly.
 """
 
+import asyncio
 from typing import Any, TypedDict
 from uuid import uuid4
 
@@ -26,24 +27,18 @@ import numpy as np
 import torch
 from verl import DataProto
 
-from .async_utils import gather_complete
-
-
 class ComponentRewardOutput(TypedDict):
     """One worker shard of named component rewards.
 
     ``rm_scores`` is CPU float32 ``[B, K]`` and ``reward_valid_mask`` is CPU
     bool with the same shape. ``sample_uid[B]`` identifies rows;
-    ``reward_names[K]`` identifies columns. ``reward_definitions`` contains one
-    configured or scorer-reported model/definition mapping for every column;
-    these labels do not certify local weight contents.
+    ``reward_names[K]`` identifies columns.
     """
 
     rm_scores: torch.Tensor
     reward_valid_mask: torch.Tensor
     reward_names: list[str]
     sample_uid: np.ndarray
-    reward_definitions: dict[str, dict[str, Any]]
 
 
 def ensure_sample_uids(data: DataProto) -> list[str]:
@@ -93,10 +88,8 @@ async def compute_component_rewards(
 
     ``data`` carries responses and scorer-specific media/text fields; sample_uid
     is ensured in place. Each group receives all samples through balanced,
-    unpadded shards. Once dispatch completes, drain remote calls through
-    ``gather_complete`` before propagating inference failures or cancellation,
-    then validate complete coverage of ``expected_reward_names`` for each row.
-    Synchronous dispatch failures propagate before reaching that drain.
+    unpadded shards, then validate complete coverage of
+    ``expected_reward_names`` for each row.
 
     Return a reward-only DataProto in input row order and sorted reward-name
     order, following ``ComponentRewardOutput`` tensor dtypes and shapes.
@@ -110,7 +103,7 @@ async def compute_component_rewards(
         for worker, chunk in zip(workers[: len(chunks)], chunks, strict=True):
             requests.append(worker.compute_score_components.remote(chunk))
             request_meta.append((group_name, chunk))
-    outputs = await gather_complete(requests)
+    outputs = await asyncio.gather(*requests)
     grouped = [(group_name, chunk, output) for (group_name, chunk), output in zip(request_meta, outputs, strict=True)]
     return assemble_component_rewards(data, grouped, expected_reward_names)
 
@@ -131,13 +124,13 @@ def assemble_component_rewards(
 
     Returns:
         CPU FP32 rm_scores and boolean reward_valid_mask, both ``[B, K]``,
-        plus sample IDs, per-component metric columns, and reported definitions.
+        plus sample IDs and reward column names.
         Scores retain their scorer-defined scale; no cross-reward aggregation
         or advantage normalization is performed.
 
     Raises:
         TypeError: A worker result is not a dict.
-        ValueError: IDs, names, shapes, or replica definitions disagree; coverage
+        ValueError: IDs, names, or shapes disagree; coverage
             is missing/extra/duplicated; or any score is nonfinite or invalid.
     """
     expected_uids = ensure_sample_uids(data)
@@ -145,7 +138,6 @@ def assemble_component_rewards(
         raise ValueError("Expected reward names must be non-empty.")
 
     cells: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
-    definitions: dict[str, dict[str, Any]] = {}
     for group_name, chunk, output in grouped_outputs:
         if not isinstance(output, dict):
             raise TypeError(f"Reward group {group_name!r} must return a dict.")
@@ -170,14 +162,6 @@ def assemble_component_rewards(
         scores = scores.detach().to(device="cpu", dtype=torch.float32)
         mask = mask.detach().to(device="cpu", dtype=torch.bool)
 
-        output_definitions = output.get("reward_definitions", {})
-        if set(output_definitions) != set(names):
-            raise ValueError(f"Reward group {group_name!r} definitions must match reward_names.")
-        for name in names:
-            definition = dict(output_definitions[name])
-            existing = definitions.setdefault(name, definition)
-            if existing != definition:
-                raise ValueError(f"Reward definition for {name!r} differs across replicas.")
         for row, sample_uid in enumerate(local_uids):
             for column, name in enumerate(names):
                 key = (sample_uid, name)
@@ -201,20 +185,10 @@ def assemble_component_rewards(
     if not torch.isfinite(scores).all() or not valid_mask.all():
         raise ValueError("Required component rewards must be finite and fully valid before actor update.")
 
-    non_tensors = {"sample_uid": np.asarray(expected_uids, dtype=object)}
-    reward_extra_keys = []
-    for column, name in enumerate(reward_names):
-        key = f"reward/{name}"
-        non_tensors[key] = scores[:, column].numpy()
-        reward_extra_keys.append(key)
     return DataProto.from_dict(
         tensors={"rm_scores": scores, "reward_valid_mask": valid_mask},
-        non_tensors=non_tensors,
-        meta_info={
-            "reward_names": reward_names,
-            "reward_definitions": definitions,
-            "reward_extra_keys": reward_extra_keys,
-        },
+        non_tensors={"sample_uid": np.asarray(expected_uids, dtype=object)},
+        meta_info={"reward_names": reward_names},
     )
 
 

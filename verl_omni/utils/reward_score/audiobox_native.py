@@ -181,8 +181,7 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
         **kwargs: Ignored scorer options.
 
     Returns:
-        ``scores`` as CPU FP32 ``[B]``, all-true CPU bool ``valid_mask[B]``,
-        preprocessing/call-count ``metrics``, and model/definition labels.
+        ``scores`` as CPU FP32 ``[B]`` and all-true CPU bool ``valid_mask[B]``.
         Each window's score is ``(CE + CU + PQ - PC) / 40`` after restoring
         target mean/std; higher is preferred. Scores are not clamped.
 
@@ -193,17 +192,13 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
     if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
         raise ValueError("AudioBox micro_batch_size must be a positive integer.")
 
-    waveforms, source_rates = _extract_inputs(batch)
+    waveforms, _ = _extract_inputs(batch)
     score_chunks = []
-    forward_calls = 0
-    window_count = 0
     for start in range(0, len(waveforms), micro_batch_size):
         stop = min(start + micro_batch_size, len(waveforms))
         windows, masks, sample_indices, weights = _make_windows(waveforms[start:stop])
         output = await reward_model.infer(windows, masks)
         local_scores = _score_windows(output, windows.shape[0])
-        forward_calls += 1
-        window_count += windows.shape[0]
         sample_scores = []
         for sample_index in range(stop - start):
             selected = [index for index, owner in enumerate(sample_indices) if owner == sample_index]
@@ -214,22 +209,9 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
     scores = torch.cat(score_chunks).to(dtype=torch.float32)
     if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
         raise ValueError("AudioBox scores must be finite and sample-aligned.")
-    metadata = reward_model.metadata()
     return {
         "scores": scores,
         "valid_mask": torch.ones(len(batch), dtype=torch.bool),
-        "metrics": {
-            "batch_size": len(batch),
-            "micro_batch_size": micro_batch_size,
-            "forward_calls": forward_calls,
-            "window_count": window_count,
-            "source_sample_rates": sorted(set(source_rates)),
-            "target_sample_rate": _AUDIOBOX_SAMPLE_RATE,
-            "window_seconds": 10,
-            "hop_seconds": 10,
-        },
-        "model_revision": metadata["model_revision"],
-        "definition_version": _DEFINITION_VERSION,
     }
 
 
@@ -238,23 +220,8 @@ class AudioBoxNativeModel:
 
     def __init__(self, model_path: str, device, **kwargs: Any) -> None:
         self._state = _load_state(model_path=model_path, **kwargs)
-        self._state.device = torch.device("cpu")
-        self.activate(device)
-
-    def activate(self, device) -> None:
-        """Move the owned AudioBox model to the executor-assigned device."""
-        if self._state.model is None:
-            raise RuntimeError("Cannot activate a closed AudioBox model.")
         self._state.device = torch.device(device)
         self._state.model.to(self._state.device).eval()
-
-    def metadata(self) -> dict[str, str]:
-        """Return the configured revision label, not a verified weight identity."""
-        return {"model_revision": self._state.model_revision}
-
-    def offload_to_cpu(self) -> None:
-        """Move model parameters to CPU while retaining the loaded instance."""
-        self.activate(torch.device("cpu"))
 
     def close(self) -> None:
         """Drop model/transform references; further inference requires a new adapter."""

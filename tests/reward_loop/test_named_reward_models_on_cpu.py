@@ -42,7 +42,6 @@ from verl_omni.reward_loop.reward_model import (
 )
 from verl_omni.reward_loop.reward_model_executor import (
     NativeRewardExecutor,
-    NativeRewardModelState,
     build_engine_reward_executors,
 )
 from verl_omni.workers.config.reward import (
@@ -242,10 +241,10 @@ def test_native_only_model_uses_parent_pool_and_batch_scoring():
 
 
 def test_named_models_require_explicit_multi_visual_reward_manager():
-    _validate_named_reward_manager_cls(MultiVisualRewardManager, preserve_components=False)
+    _validate_named_reward_manager_cls(MultiVisualRewardManager)
 
     with pytest.raises(ValueError, match="currently requires.*MultiVisualRewardManager"):
-        _validate_named_reward_manager_cls(VisualRewardManager, preserve_components=False)
+        _validate_named_reward_manager_cls(VisualRewardManager)
 
 
 def test_accelerator_worker_setting_keeps_the_legacy_alias():
@@ -278,7 +277,6 @@ def test_named_model_entries_parse_to_backend_specific_base_configs():
         OmegaConf.create(
             {
                 "backend": "native",
-                "offload_mode": "cpu",
                 "placement": {"devices": [0]},
                 "executor": {"model": "tests.fake:Model", "kwargs": {"threshold": 0.5}},
             }
@@ -287,7 +285,6 @@ def test_named_model_entries_parse_to_backend_specific_base_configs():
 
     assert isinstance(engine, EngineRewardModelConfig)
     assert isinstance(native, NativeRewardModelConfig)
-    assert native.offload_mode == "cpu"
     assert native.executor.kwargs == {"threshold": 0.5}
 
 
@@ -306,25 +303,6 @@ def test_named_model_entries_parse_to_backend_specific_base_configs():
             },
             "unsupported fields: rollout",
         ),
-        (
-            {
-                "backend": "native",
-                "offload_mode": "unknown",
-                "placement": {"devices": [0]},
-                "executor": {"model": "tests.fake:Model"},
-            },
-            "offload_mode must be one of",
-        ),
-        (
-            {
-                "backend": "native",
-                "offload": False,
-                "offload_mode": "cpu",
-                "placement": {"devices": [0]},
-                "executor": {"model": "tests.fake:Model"},
-            },
-            "cannot use offload_mode='cpu' when offload=false",
-        ),
     ],
 )
 def test_backend_schema_rejects_invalid_single_model_fields(model, message):
@@ -338,7 +316,6 @@ def test_native_model_uses_configured_executor_class():
         OmegaConf.create(
             {
                 "backend": "native",
-                "offload_mode": "cpu",
                 "executor": {"model": "my_package.reward:QualityModel"},
                 "model_path": "/models/quality",
                 "placement": {"devices": [0]},
@@ -348,7 +325,6 @@ def test_native_model_uses_configured_executor_class():
 
     assert model.executor_spec.executor_config["model"] == "my_package.reward:QualityModel"
     assert model.executor_spec.model_path == "/models/quality"
-    assert model.executor_spec.offload_mode == "cpu"
 
 
 def test_native_model_requires_configured_executor_class():
@@ -895,7 +871,6 @@ async def test_native_executor_wakes_infers_and_sleeps(monkeypatch):
     assert _FakeModel.instances[0].device == torch.device("cpu", 0)
     assert _FakeModel.instances[0].closed
     assert executor._model is None
-    assert executor.state is NativeRewardModelState.CLOSED
 
 
 @pytest.mark.asyncio
@@ -1010,66 +985,17 @@ async def test_native_executor_does_not_serialize_async_model_calls(monkeypatch)
     assert _BatchingModel.instances[0].closed
 
 
-def test_worker_exposes_native_model_lifecycle():
-    async def run():
-        worker = object.__new__(OmniRewardLoopWorker)
-        executor = SimpleNamespace(wake_up=AsyncMock(), sleep=AsyncMock(), close=AsyncMock())
-        worker.native_reward_executors = {"native": executor}
-        worker.reward_manager = SimpleNamespace(shutdown=lambda: None)
+@pytest.mark.asyncio
+async def test_worker_exposes_native_model_lifecycle():
+    worker = object.__new__(OmniRewardLoopWorker)
+    executor = SimpleNamespace(wake_up=AsyncMock(), sleep=AsyncMock())
+    worker.native_reward_executors = {"native": executor}
 
-        await worker.wake_up_reward_model("native")
-        await worker.sleep_reward_model("native")
-        await worker.shutdown()
+    await worker.wake_up_reward_model("native")
+    await worker.sleep_reward_model("native")
 
-        executor.wake_up.assert_awaited_once_with()
-        executor.sleep.assert_awaited_once_with()
-        executor.close.assert_awaited_once_with()
-
-    asyncio.run(run())
-
-
-def test_manager_shutdown_drains_all_workers_and_retries_only_failure(monkeypatch):
-    calls = []
-    attempts = {"flaky": 0}
-
-    class _Worker:
-        def __init__(self, name):
-            self.name = name
-            self.shutdown = SimpleNamespace(remote=self._remote)
-
-        def _remote(self):
-            calls.append(f"dispatch_{self.name}")
-            return self.name
-
-    def fake_get(request):
-        calls.append(f"get_{request}")
-        if request == "flaky":
-            attempts["flaky"] += 1
-            if attempts["flaky"] == 1:
-                raise RuntimeError("worker failed")
-
-    stable = _Worker("stable")
-    flaky = _Worker("flaky")
-    manager = object.__new__(OmniRewardLoopManager)
-    manager._shutdown = False
-    manager._shutdown_worker_ids = set()
-    manager._reward_worker_groups = {"all": [stable, flaky]}
-    manager.reward_loop_workers = [stable, flaky]
-    monkeypatch.setattr("verl_omni.reward_loop.reward_loop.ray.get", fake_get)
-
-    with pytest.raises(RuntimeError, match="worker failed"):
-        manager.shutdown()
-    manager.shutdown()
-    manager.shutdown()
-
-    assert calls == [
-        "dispatch_stable",
-        "dispatch_flaky",
-        "get_stable",
-        "get_flaky",
-        "dispatch_flaky",
-        "get_flaky",
-    ]
+    executor.wake_up.assert_awaited_once_with()
+    executor.sleep.assert_awaited_once_with()
 
 
 def test_model_manager_rejects_existing_and_named_models():
@@ -1196,7 +1122,6 @@ async def test_async_compute_rm_score_brackets_scoring_with_one_lifecycle():
     calls = []
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
-    manager._preserve_reward_components = False
 
     async def wake_up():
         calls.append("wake_up")
@@ -1228,7 +1153,6 @@ async def test_async_compute_rm_score_serializes_lifecycle_brackets():
     release_first_score = asyncio.Event()
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
-    manager._preserve_reward_components = False
 
     async def wake_up():
         calls.append("wake_up")

@@ -216,7 +216,6 @@ reward:
     quality:
       backend: native
       offload: true
-      offload_mode: cpu
       model_path: /models/quality
       placement:
         devices: [0, 1]
@@ -263,21 +262,13 @@ class TransformersRewardModel:
         device: torch.device,
         torch_dtype: str = "bfloat16",
     ):
-        self.device = torch.device("cpu")
+        self.device = torch.device(device)
         dtype = getattr(torch, torch_dtype)
         self.processor = AutoProcessor.from_pretrained(model_path)
         self.model = AutoModel.from_pretrained(
             model_path,
             torch_dtype=dtype,
-        ).eval()
-        self.activate(device)
-
-    def activate(self, device):
-        self.device = torch.device(device)
-        self.model.to(self.device).eval()
-
-    def offload_to_cpu(self):
-        self.activate(torch.device("cpu"))
+        ).to(self.device).eval()
 
     @torch.inference_mode()
     def infer(self, texts, images):
@@ -319,13 +310,9 @@ two adapters; the framework does not prescribe them. Both synchronous and
 asynchronous lifecycle and inference methods are accepted. Synchronous methods
 run outside the reward worker's event loop.
 
-With `offload_mode=cpu`, an adapter must implement `activate(device)`,
-`offload_to_cpu()`, and `close()`. The adapter only moves or releases the model,
-buffers, and helper modules it owns; the executor decides when those methods
-run. `sleep()` waits for real inference completion and calls only
-`offload_to_cpu()`, preserving the loaded instance. Final worker shutdown calls
-`close()` and releases the instance. This includes a cancelled caller whose
-synchronous inference is still running in a background thread.
+An adapter may implement `close()` to release model, processor, buffer, and
+helper-module references. `sleep()` waits for real inference completion, calls
+`close()`, and drops the adapter instance.
 
 ## Mix engine and native models
 
@@ -396,15 +383,9 @@ whose size is controlled by `reward.reward_model.n_gpus_per_node` and `nnodes`.
 - `true` (default): wake before scoring and sleep afterward;
 - `false`: keep the model resident across training steps.
 
-Native models additionally support `offload_mode` when `offload=true`:
-
-- `recreate` (default): preserve the existing behavior by constructing on wake
-  and closing on sleep;
-- `cpu`: construct once on CPU, activate on wake, move back to CPU on sleep,
-  and close only at final worker shutdown.
-
-`offload=false` keeps the native model on its assigned device and therefore
-does not accept `offload_mode=cpu`.
+Native models with `offload=true` are constructed on wake and closed on sleep.
+With `offload=false`, the model remains on its assigned device across training
+steps.
 
 Independent named models are woken, scored, and slept concurrently. The legacy
 `weighted_sum` path pads native batches for an even worker split. The
@@ -440,8 +421,7 @@ through `exp()` again.
   contract. Multimodal component scoring requires a batch manager such as
   `MultiModalRewardManager` and `aggregation=preserve_components`.
 - Native models are replicated; FSDP and tensor parallelism are not supported.
-- CPU-only native worker placement is not supported; CPU-resident offload
-  between accelerator scoring phases is supported.
+- CPU-only native worker placement is not supported.
 - Native routing uses a static even split rather than dynamic load balancing.
 - Named models do not participate in streaming reward computation.
 - vLLM-Omni reward serving is not implemented.

@@ -128,8 +128,7 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
     Returns:
         CPU FP32 ``scores[B]`` equal to ``clamp((cosine + 1) / 2, 0, 1)``;
         higher means greater alignment. Also returns all-true CPU bool
-        ``valid_mask[B]``, preprocessing/call-count ``metrics``, and
-        ``model_revision``/``definition_version`` labels. Row order is preserved.
+        ``valid_mask[B]``. Row order is preserved.
 
     Raises:
         ValueError: Invalid inputs, micro-batch size, embedding shapes, or scores.
@@ -138,13 +137,11 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
     if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
         raise ValueError("CLAP micro_batch_size must be a positive integer.")
 
-    waveforms, prompts, source_rates = _extract_inputs(batch)
+    waveforms, prompts, _ = _extract_inputs(batch)
     score_chunks = []
-    forward_calls = 0
     for start in range(0, len(batch), micro_batch_size):
         stop = min(start + micro_batch_size, len(batch))
         output = await reward_model.infer(waveforms[start:stop], prompts[start:stop])
-        forward_calls += 1
         audio_embeddings = F.normalize(output["audio_embeddings"].float(), p=2, dim=-1)
         text_embeddings = F.normalize(output["text_embeddings"].float(), p=2, dim=-1)
         if (
@@ -158,19 +155,9 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
     scores = torch.cat(score_chunks).to(dtype=torch.float32)
     if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
         raise ValueError("CLAP scores must be finite and sample-aligned.")
-    metadata = reward_model.metadata()
     return {
         "scores": scores,
         "valid_mask": torch.ones(len(batch), dtype=torch.bool),
-        "metrics": {
-            "batch_size": len(batch),
-            "micro_batch_size": micro_batch_size,
-            "forward_calls": forward_calls,
-            "source_sample_rates": sorted(set(source_rates)),
-            "target_sample_rate": _CLAP_SAMPLE_RATE,
-        },
-        "model_revision": metadata["model_revision"],
-        "definition_version": _DEFINITION_VERSION,
     }
 
 
@@ -179,23 +166,8 @@ class CLAPNativeModel:
 
     def __init__(self, model_path: str, device, **kwargs: Any) -> None:
         self._state = _load_state(model_path=model_path, **kwargs)
-        self._state.device = torch.device("cpu")
-        self.activate(device)
-
-    def activate(self, device) -> None:
-        """Move the owned CLAP model to the executor-assigned device."""
-        if self._state.model is None:
-            raise RuntimeError("Cannot activate a closed CLAP model.")
         self._state.device = torch.device(device)
         self._state.model.to(self._state.device).eval()
-
-    def metadata(self) -> dict[str, str]:
-        """Return the configured revision label, not a verified weight identity."""
-        return {"model_revision": self._state.model_revision}
-
-    def offload_to_cpu(self) -> None:
-        """Move model parameters to CPU while retaining model and processor."""
-        self.activate(torch.device("cpu"))
 
     def close(self) -> None:
         """Drop model/processor references; reuse requires constructing a new adapter."""

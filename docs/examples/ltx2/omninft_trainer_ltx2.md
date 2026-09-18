@@ -80,10 +80,9 @@ as video, audio. The shared DiffusionNFT engine executes old, current, and
 reference policy forwards, while the OmniNFT adapter only packs and unpacks the
 two modalities.
 
-Each named reward model owns an upstream native worker group. With
-`REWARD_OFFLOAD_MODE=cpu`, the executor loads a model once, moves it to its NPU
-for inference, and returns it to CPU on sleep. Set
-`REWARD_OFFLOAD_MODE=recreate` for the compatible close-and-reload lifecycle.
+Each named reward model owns an upstream native worker group. The executor loads
+the model on wake and closes it on sleep, releasing accelerator memory between
+reward phases.
 
 ## Launch on Ascend NPU
 

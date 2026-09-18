@@ -19,7 +19,6 @@ import torch
 from verl import DataProto
 
 from verl_omni.trainer.diffusion.diffusion_metric_utils import (
-    compute_component_reward_metrics_diffusion,
     compute_data_metrics_diffusion,
     compute_old_policy_metrics,
     compute_throughput_metrics_diffusion,
@@ -146,23 +145,9 @@ class TestComputeDataMetricsDiffusion:
         assert "critic/returns/mean" not in metrics
 
 
-def test_component_metrics_do_not_override_public_reward_scalar_or_group_std():
-    scores = torch.tensor([[0.0, 0.0], [2.0, 4.0]])
-    batch = DataProto.from_dict(
-        tensors={"sample_level_rewards": scores, "rm_scores": scores},
-        non_tensors={"uid": np.array(["prompt", "prompt"], dtype=object)},
-        meta_info={"reward_names": ["video", "audio"]},
-    )
-
-    metrics = compute_data_metrics_diffusion(batch)
-    metrics.update(compute_component_reward_metrics_diffusion(batch))
-
-    assert metrics["critic/rewards/mean"] == pytest.approx(1.5)
-    assert metrics["critic/rewards/max"] == pytest.approx(3.0)
-    assert metrics["critic/rewards/min"] == pytest.approx(0.0)
-    assert metrics["critic/rewards/std_mean"] == pytest.approx(1.5)
-    assert metrics["train/reward/sum/mean"] == pytest.approx(3.0)
-    assert metrics["train/reward/sum/std"] == pytest.approx(3.0)
+# ---------------------------------------------------------------------------
+# compute_old_policy_metrics
+# ---------------------------------------------------------------------------
 
 
 class TestComputeOldPolicyMetrics:
