@@ -142,7 +142,6 @@ class MultiModalRewardManager(RewardManagerBase):
 
         columns = []
         masks = []
-        definitions = {}
         for component in self._components:
             executor = self._executor(component["model"])
             kwargs = {
@@ -177,22 +176,11 @@ class MultiModalRewardManager(RewardManagerBase):
                 raise ValueError(f"Required component {component['name']!r} must return finite, fully valid scores.")
             columns.append(scores)
             masks.append(valid_mask)
-            definition = {
-                "model": component["model"],
-                "model_revision": result.get("model_revision"),
-                "definition_version": result.get("definition_version"),
-            }
-            for identity_key in ("base_model_revision", "source_revision"):
-                if identity_key in result:
-                    definition[identity_key] = result[identity_key]
-            definitions[component["name"]] = definition
-
         return {
             "rm_scores": torch.stack(columns, dim=1),
             "reward_valid_mask": torch.stack(masks, dim=1),
             "reward_names": list(self.component_names),
             "sample_uid": np.asarray(sample_uids, dtype=object),
-            "reward_definitions": definitions,
         }
 
     async def run_single(self, data: DataProto) -> dict[str, Any]:

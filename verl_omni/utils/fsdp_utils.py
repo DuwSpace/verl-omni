@@ -573,8 +573,7 @@ def collect_lora_params(
         base_sync_done: If ``True``, collect only LoRA weights; else full base weights.
         is_diffusers: Use the diffusers-specific layered summon helper.
         adapter_name: LoRA adapter name (usually ``"default"``).
-        layer_prefixes: FSDP layer name prefixes (for example,
-            ``["transformer_blocks."]``).
+        layer_prefixes: FSDP layer name prefixes (``["transformer_blocks."]``
     """
     use_diffusers_layered = is_diffusers and layered_summon and fsdp_version(module) > 0
     if adapter_name == "default" and not use_diffusers_layered and fsdp_version(module) != 2:

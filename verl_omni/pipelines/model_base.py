@@ -255,16 +255,13 @@ class DiffusionModelBase(ABC):
         model_config: DiffusionModelConfig,
         model_inputs: dict[str, torch.Tensor],
         negative_model_inputs: Optional[dict[str, torch.Tensor]] = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Run a single model prediction.
         Used both for forward-process objectives (noising clean latents ``x0 -> xt``
         then optimizing predictions directly) and as the prediction step inside
         reverse-sampling algorithms (FlowGRPO et al.). Model adapters only need to
         override this when prediction requires extra handling such as CFG, negative
         inputs, or output conversion.
-
-        Returns a prediction tensor by default. Joint-modality adapters may
-        return a pair of tensors whose order is defined by that adapter.
         """
         return module(**model_inputs)[0]
 

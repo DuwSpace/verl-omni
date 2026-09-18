@@ -26,7 +26,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .reward_utils import load_torch_state_dict
 
 _DEFAULT_MODEL_REVISION = "zghhui/OmniNFT-Reward-Series@9e30061a1392d03bafdcf717e80a385ddf411b4d"
 _DEFAULT_SOURCE_REVISION = "fb9237f6e74edf0d0f2a683f4d975b79fde588fe"
@@ -149,7 +148,7 @@ def _load_components(model_path: str, source_root: str) -> tuple[Any, Any]:
         raise RuntimeError("Imported Synchformer does not belong to the configured source_root.")
 
     model = module.Synchformer()
-    state_dict = load_torch_state_dict(model_path)
+    state_dict = _load_torch_state_dict(model_path)
     if not isinstance(state_dict, dict) or not all(isinstance(value, torch.Tensor) for value in state_dict.values()):
         raise ValueError("DeSync checkpoint must be a tensor state dict.")
     model.load_state_dict(state_dict, strict=True)
@@ -330,9 +329,8 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
         **kwargs: Ignored scorer options.
 
     Returns:
-        CPU FP32 ``scores[B]`` in input order, all-true CPU bool
-        ``valid_mask[B]``, preprocessing/call-count ``metrics``, and model,
-        source, and definition labels. Each comparison selects its argmax on
+        CPU FP32 ``scores[B]`` in input order and all-true CPU bool
+        ``valid_mask[B]``. Each comparison selects its argmax on
         the 21-class [-2, 2] second grid; reward is ``1 / (1 + mean(abs(offset)))``.
         Higher is better, reaching 1 when both predicted offsets are zero.
 
@@ -342,7 +340,7 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
     del kwargs
     if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
         raise ValueError("DeSync micro_batch_size must be a positive integer.")
-    videos, audio, source_fps, source_rates = _extract_inputs(batch)
+    videos, audio, _, _ = _extract_inputs(batch)
     chunks = []
     for start in range(0, len(batch), micro_batch_size):
         stop = min(start + micro_batch_size, len(batch))
@@ -355,27 +353,9 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
     scores = torch.cat(chunks).to(torch.float32)
     if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
         raise ValueError("DeSync scores must be finite and sample-aligned.")
-    forward_calls = math.ceil(len(batch) / micro_batch_size)
-    metadata = reward_model.metadata()
     return {
         "scores": scores,
         "valid_mask": torch.ones(len(batch), dtype=torch.bool),
-        "metrics": {
-            "batch_size": len(batch),
-            "micro_batch_size": micro_batch_size,
-            "video_forward_calls": forward_calls,
-            "audio_forward_calls": forward_calls,
-            "compare_forward_calls": 2 * forward_calls,
-            "segments_per_sample": _SEGMENTS,
-            "source_fps": sorted(set(source_fps)),
-            "source_sample_rates": sorted(set(source_rates)),
-            "target_fps": _TARGET_VIDEO_FPS,
-            "target_sample_rate": _TARGET_AUDIO_RATE,
-            "source_revision": metadata["source_revision"],
-        },
-        "model_revision": metadata["model_revision"],
-        "source_revision": metadata["source_revision"],
-        "definition_version": _DEFINITION_VERSION,
     }
 
 
@@ -384,27 +364,9 @@ class DeSyncNativeModel:
 
     def __init__(self, model_path: str, device, **kwargs: Any) -> None:
         self._state = _load_state(model_path=model_path, **kwargs)
-        self._state.device = torch.device("cpu")
-        self.activate(device)
-
-    def activate(self, device) -> None:
-        """Move Synchformer and its mel transform to the assigned device."""
-        if self._state.model is None or self._state.mel is None:
-            raise RuntimeError("Cannot activate a closed DeSync model.")
         self._state.device = torch.device(device)
         self._state.model.to(self._state.device).eval()
         self._state.mel.to(self._state.device)
-
-    def metadata(self) -> dict[str, str]:
-        """Return the configured checkpoint and source revision labels."""
-        return {
-            "model_revision": self._state.model_revision,
-            "source_revision": self._state.source_revision,
-        }
-
-    def offload_to_cpu(self) -> None:
-        """Move every device-owning DeSync component back to CPU."""
-        self.activate(torch.device("cpu"))
 
     def close(self) -> None:
         """Drop model/mel references; reuse requires constructing a new adapter."""
@@ -429,3 +391,10 @@ class DeSyncNativeModel:
                 return _infer_micro_batch(self._state, video, audio)
             finally:
                 torch.backends.mha.set_fastpath_enabled(fastpath_enabled)
+def _load_torch_state_dict(path: str):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    except RuntimeError as exc:
+        if "mmap can only be used with files saved with" not in str(exc):
+            raise
+        return torch.load(path, map_location="cpu", weights_only=True)

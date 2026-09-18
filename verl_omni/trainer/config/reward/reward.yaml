@@ -34,9 +34,8 @@ accelerator_workers:
 # Weighted entries use path/name/weight; component-preserving entries use path/required/micro_batch_size.
 reward_functions: {}
 
-# Named reward models. Native entries may set offload_mode to "recreate"
-# (default) or "cpu" when offload is true. See docs/algo/named_reward_models.md
-# for lifecycle contracts and extension instructions.
+# Named reward models. See docs/algo/named_reward_models.md for configuration
+# and extension instructions.
 models: {}
 
 # Aggregation method for multi-reward: "weighted_sum" or "preserve_components".

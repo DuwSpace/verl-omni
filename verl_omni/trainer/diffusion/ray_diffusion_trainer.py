@@ -66,7 +66,6 @@ from verl_omni.trainer.diffusion.diffusion_algos import (
     get_diffusion_loss_fn,
 )
 from verl_omni.trainer.diffusion.diffusion_metric_utils import (
-    compute_component_reward_metrics_diffusion,
     compute_data_metrics_diffusion,
     compute_old_policy_metrics,
     compute_reward_extra_metrics_diffusion,
@@ -547,19 +546,6 @@ class BaseRayDiffusionTrainer(ABC):
         except (KeyError, TypeError, AttributeError, OmegaConf.errors.OmegaConfBaseException) as e:
             raise RuntimeError("Failed to propagate trainer.total_training_steps to actor optimizer config.") from e
 
-    def shutdown(self) -> None:
-        """Shut down the optional reward manager, then drop the trainer's reference.
-
-        Propagate cleanup errors and retain the reference for retry on failure.
-        This hook does not terminate actor/rollout workers.
-        """
-        manager = getattr(self, "reward_loop_manager", None)
-        if manager is not None:
-            shutdown = getattr(manager, "shutdown", None)
-            if shutdown is not None:
-                shutdown()
-            self.reward_loop_manager = None
-
     def _dump_generations(
         self,
         inputs,
@@ -771,8 +757,6 @@ class BaseRayDiffusionTrainer(ABC):
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-            # Rollout replaces meta_info; restore the validation media contract.
-            test_output_gen_batch_padded.meta_info["validate"] = True
 
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
@@ -1754,12 +1738,9 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
         return DataProto.from_tensordict(tu.get_tensordict(ref_output))
 
     def _prepare_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> DataProto:
-        """Delegate batch preparation with FP32 rewards, preserving component axes.
-
-        Scalar losses handle their own flattening; OmniNFT consumes ``[B, K]``
-        even when K is one. Batch mutation follows the selected loss's contract.
-        """
-        return self._loss_fn.prepare_actor_batch(batch, reward_tensor.float(), self.config)
+        """Delegate algorithm-specific rollout-to-actor batch preparation."""
+        reward_tensor = reward_tensor.squeeze(-1).float() if reward_tensor.ndim > 1 else reward_tensor.float()
+        return self._loss_fn.prepare_actor_batch(batch, reward_tensor, self.config)
 
     def _update_old_policy(self) -> tuple[bool, float, Literal["none", "copy", "ema"]]:
         algo_cfg = self.config.algorithm
@@ -1776,6 +1757,11 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
         else:
             self.actor_rollout_wg.ema_update_adapter(source="default", target="old", decay=decay)
             return True, float(decay), "ema"
+
+    def _initialize_old_policy(self) -> None:
+        """Initialize old from current only for a fresh run, not after resume."""
+        if self._has_old_adapter and self.global_steps == 0:
+            self.actor_rollout_wg.copy_adapter(source="default", target="old")
 
     def fit(self):
         """
@@ -1797,9 +1783,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
-        if self._has_old_adapter and self.global_steps == 0:
-            # Resumed checkpoints already contain the old-policy EMA state.
-            self.actor_rollout_wg.copy_adapter(source="default", target="old")
+        self._initialize_old_policy()
         self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
@@ -2012,8 +1996,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics_diffusion(batch))
-                metrics.update(compute_component_reward_metrics_diffusion(batch))
+                metrics.update(compute_data_metrics_diffusion(batch=batch))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 num_images = (
                     batch.batch["advantages"].shape[0]

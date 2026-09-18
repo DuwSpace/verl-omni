@@ -21,7 +21,7 @@ from omegaconf import OmegaConf
 
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
 from verl_omni.workers.config import DiffusionModelConfig
-from verl_omni.workers.config.diffusion.rollout import LTXDiffusionPipelineConfig
+from verl_omni.pipelines.ltx2_omni_nft.config import LTXDiffusionPipelineConfig
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
@@ -45,7 +45,7 @@ def test_diffusion_model_config_preserves_custom_pipeline_target(tmp_path):
             "load_tokenizer": False,
             "attn_backend": "native",
             "pipeline": {
-                "_target_": "verl_omni.workers.config.diffusion.rollout.LTXDiffusionPipelineConfig",
+                "_target_": "verl_omni.pipelines.ltx2_omni_nft.config.LTXDiffusionPipelineConfig",
                 "video_cfg_scale": 1.5,
                 "audio_cfg_scale": 3.0,
             },

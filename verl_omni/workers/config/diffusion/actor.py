@@ -27,7 +27,6 @@ from .model import DiffusionModelConfig
 
 __all__ = [
     "DiffusionLossConfig",
-    "OmniNFTLossConfig",
     "VeOmniDiffusionEngineConfig",
     "VeOmniDiffusionOptimizerConfig",
     "DiffusionActorConfig",
@@ -72,32 +71,6 @@ class DiffusionLossConfig(BaseConfig):
             raise ValueError(f"adaptive_weight_min must be positive, got {self.adaptive_weight_min}.")
         if self.kl_mask_threshold <= 0:
             raise ValueError(f"kl_mask_threshold must be positive, got {self.kl_mask_threshold}.")
-
-
-@dataclass
-class OmniNFTLossConfig(DiffusionLossConfig):
-    """Combine modality losses independently of reward-to-modality routing."""
-
-    loss_mode: str = "omni_nft"
-    # Relative video loss weight; normalized jointly with audio_weight in the loss.
-    video_weight: float = 1.0
-    # Relative audio loss weight, not a component-reward routing weight.
-    audio_weight: float = 1.0
-    # Coefficient of video reference-velocity MSE (the metric retains the KL name).
-    video_ref_kl_coef: float = 0.0
-    # Coefficient of audio reference-velocity MSE.
-    audio_ref_kl_coef: float = 0.0
-
-    def __post_init__(self):
-        super().__post_init__()
-        if self.loss_mode != "omni_nft":
-            raise ValueError(f"OmniNFT loss_mode must be 'omni_nft', got {self.loss_mode!r}.")
-        for name in ("video_weight", "audio_weight", "video_ref_kl_coef", "audio_ref_kl_coef"):
-            value = getattr(self, name)
-            if value < 0:
-                raise ValueError(f"{name} must be non-negative, got {value}.")
-        if self.video_weight == 0 and self.audio_weight == 0:
-            raise ValueError("At least one of video_weight or audio_weight must be positive.")
 
 
 @dataclass

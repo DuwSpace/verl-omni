@@ -71,7 +71,7 @@ actor_rollout_ref:
       - audio_ff.net.2
     fsdp_layer_prefixes: [transformer_blocks.]
     pipeline:
-      _target_: verl_omni.workers.config.diffusion.rollout.LTXDiffusionPipelineConfig
+      _target_: verl_omni.pipelines.ltx2_omni_nft.config.LTXDiffusionPipelineConfig
       video_cfg_scale: 1.0
       audio_cfg_scale: 1.0
   actor:
@@ -82,7 +82,7 @@ actor_rollout_ref:
     ppo_mini_batch_size: 32
     ppo_micro_batch_size_per_gpu: 8
     diffusion_loss:
-      _target_: verl_omni.workers.config.diffusion.actor.OmniNFTLossConfig
+      _target_: verl_omni.pipelines.ltx2_omni_nft.config.OmniNFTLossConfig
       loss_mode: omni_nft
       video_weight: 1.0
       audio_weight: 1.0
@@ -110,7 +110,7 @@ actor_rollout_ref:
     calculate_log_probs: false
     rollout_adapter: old
     pipeline:
-      _target_: verl_omni.workers.config.diffusion.rollout.LTXDiffusionPipelineConfig
+      _target_: verl_omni.pipelines.ltx2_omni_nft.config.LTXDiffusionPipelineConfig
       height: 256
       width: 384
       num_frames: 121
@@ -126,7 +126,7 @@ actor_rollout_ref:
       output_type: pt
     val_kwargs:
       pipeline:
-        _target_: verl_omni.workers.config.diffusion.rollout.LTXDiffusionPipelineConfig
+        _target_: verl_omni.pipelines.ltx2_omni_nft.config.LTXDiffusionPipelineConfig
         height: 256
         width: 384
         num_frames: 121

@@ -23,7 +23,6 @@ import torch.nn.functional as F
 
 from .hpsv3_reward import _Qwen2VLRewardModelBT, _smart_resize
 from .qwen2vl_reward_compat import ensure_omninft_qwen2vl_layout, omninft_qwen2vl_reward_forward
-from .reward_utils import load_torch_state_dict
 
 _DEFAULT_MODEL_REVISION = "KlingTeam/VideoReward@4f26600130683e6f1de9f5d463887f28e8ef995c"
 _DEFAULT_BASE_MODEL_REVISION = "Qwen/Qwen2-VL-2B-Instruct@895c3a49bc3fa70a340399125c650a463535e71c"
@@ -182,7 +181,7 @@ def _load_components(model_path: str, base_model_path: str) -> tuple[Any, Any]:
             ),
         )
 
-    state_dict = load_torch_state_dict(model_path)
+    state_dict = _load_torch_state_dict(model_path)
     if not isinstance(state_dict, dict) or not all(isinstance(value, torch.Tensor) for value in state_dict.values()):
         raise ValueError("VideoAlign checkpoint must be a tensor state dict.")
     state_dict = _remap_checkpoint_state_dict(state_dict)
@@ -344,9 +343,8 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
         **kwargs: Ignored scorer options.
 
     Returns:
-        CPU FP32 ``scores[B]`` in input order, all-true CPU bool
-        ``valid_mask[B]``, sampling/call-count ``metrics``, and model/base/
-        definition labels. Reward averages ``(VQ - 3.6757) / 2.2476`` and
+        CPU FP32 ``scores[B]`` in input order and all-true CPU bool
+        ``valid_mask[B]``. Reward averages ``(VQ - 3.6757) / 2.2476`` and
         ``(TA - 2.8105) / 2.5121``; MQ is not used. Higher is preferred and
         scores are not clamped.
 
@@ -357,13 +355,11 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
     if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
         raise ValueError("VideoAlign micro_batch_size must be a positive integer.")
 
-    videos, prompts, frame_indices, source_fps = _extract_inputs(batch)
+    videos, prompts, _, _ = _extract_inputs(batch)
     score_chunks = []
-    forward_calls = 0
     for start in range(0, len(batch), micro_batch_size):
         stop = min(start + micro_batch_size, len(batch))
         logits = await reward_model.infer(videos[start:stop], prompts[start:stop])
-        forward_calls += 1
         if not isinstance(logits, torch.Tensor) or logits.shape != (stop - start, 3):
             raise ValueError(f"VideoAlign model logits must have shape ({stop - start}, 3).")
         if not torch.isfinite(logits).all():
@@ -376,23 +372,9 @@ async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **k
     scores = torch.cat(score_chunks).to(dtype=torch.float32)
     if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
         raise ValueError("VideoAlign scores must be finite and sample-aligned.")
-    metadata = reward_model.metadata()
     return {
         "scores": scores,
         "valid_mask": torch.ones(len(batch), dtype=torch.bool),
-        "metrics": {
-            "batch_size": len(batch),
-            "micro_batch_size": micro_batch_size,
-            "forward_calls": forward_calls,
-            "source_fps": sorted(set(source_fps)),
-            "target_fps": _TARGET_FPS,
-            "frame_indices": frame_indices,
-            "frames_per_sample": [len(indices) for indices in frame_indices],
-            "base_model_revision": metadata["base_model_revision"],
-        },
-        "model_revision": metadata["model_revision"],
-        "base_model_revision": metadata["base_model_revision"],
-        "definition_version": _DEFINITION_VERSION,
     }
 
 
@@ -401,26 +383,8 @@ class VideoAlignNativeModel:
 
     def __init__(self, model_path: str, device, **kwargs: Any) -> None:
         self._state = _load_state(model_path=model_path, **kwargs)
-        self._state.device = torch.device("cpu")
-        self.activate(device)
-
-    def activate(self, device) -> None:
-        """Move the owned VideoAlign model to the executor-assigned device."""
-        if self._state.model is None:
-            raise RuntimeError("Cannot activate a closed VideoAlign model.")
         self._state.device = torch.device(device)
         self._state.model.to(self._state.device).eval()
-
-    def metadata(self) -> dict[str, str]:
-        """Return configured model/base revision labels, without identity checks."""
-        return {
-            "model_revision": self._state.model_revision,
-            "base_model_revision": self._state.base_model_revision,
-        }
-
-    def offload_to_cpu(self) -> None:
-        """Move model parameters to CPU while retaining model and processor."""
-        self.activate(torch.device("cpu"))
 
     def close(self) -> None:
         """Drop model/processor references; reuse requires constructing a new adapter."""
@@ -440,3 +404,10 @@ class VideoAlignNativeModel:
         output = self._state.model(return_dict=True, **inputs)
         logits = output["logits"] if isinstance(output, dict) else output.logits
         return logits.detach().cpu()
+def _load_torch_state_dict(path: str):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    except RuntimeError as exc:
+        if "mmap can only be used with files saved with" not in str(exc):
+            raise
+        return torch.load(path, map_location="cpu", weights_only=True)
