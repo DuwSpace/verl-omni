@@ -20,14 +20,18 @@ import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
 import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from verl.protocol import DataProto
+from verl.trainer.ppo.metric_utils import process_validation_metrics
+from verl.trainer.ppo.reward import extract_reward
 
 from verl_omni.reward_loop import reward_model as reward_model_module
 from verl_omni.reward_loop import reward_model_executor as executor_module
+from verl_omni.reward_loop.reward_components import assemble_component_rewards
 from verl_omni.reward_loop.reward_loop import (
     OmniRewardLoopManager,
     OmniRewardLoopWorker,
@@ -69,6 +73,51 @@ def _config(models=None):
 
 def _parsed_models(config):
     return [(name, parse_reward_model_config(name, model)) for name, model in config.reward.models.items()]
+
+
+def test_component_rewards_publish_standard_reward_extras():
+    data = DataProto.from_dict(
+        tensors={"responses": torch.zeros(2, 3, 2, 2, dtype=torch.uint8)},
+        non_tensors={"sample_uid": ["sample-0", "sample-1"]},
+    )
+    grouped_outputs = [
+        (
+            "video_align",
+            data,
+            {
+                "rm_scores": torch.tensor([[0.25], [0.5]]),
+                "reward_valid_mask": torch.ones(2, 1, dtype=torch.bool),
+                "reward_names": ["video_align"],
+                "sample_uid": ["sample-0", "sample-1"],
+            },
+        ),
+        (
+            "audiobox",
+            data,
+            {
+                "rm_scores": torch.tensor([[0.75], [1.0]]),
+                "reward_valid_mask": torch.ones(2, 1, dtype=torch.bool),
+                "reward_names": ["audiobox"],
+                "sample_uid": ["sample-0", "sample-1"],
+            },
+        ),
+    ]
+
+    result = assemble_component_rewards(data, grouped_outputs, {"video_align", "audiobox"})
+    reward_tensor, reward_extras = extract_reward(result)
+
+    torch.testing.assert_close(reward_tensor, torch.tensor([[0.75, 0.25], [1.0, 0.5]]))
+    assert result.meta_info["reward_names"] == ["audiobox", "video_align"]
+    assert result.meta_info["reward_extra_keys"] == ["reward/audiobox", "reward/video_align"]
+    assert reward_extras["reward/audiobox"].tolist() == pytest.approx([0.75, 1.0])
+    assert reward_extras["reward/video_align"].tolist() == pytest.approx([0.25, 0.5])
+    validation_metrics = process_validation_metrics(
+        np.asarray(["omninft", "omninft"], dtype=object),
+        ["prompt-0", "prompt-1"],
+        {"reward": reward_tensor.sum(dim=1).tolist(), **reward_extras},
+    )
+    assert validation_metrics["omninft"]["reward/audiobox"]["mean@1"] == pytest.approx(0.875)
+    assert validation_metrics["omninft"]["reward/video_align"]["mean@1"] == pytest.approx(0.375)
 
 
 def test_engine_models_require_parent_pool():
