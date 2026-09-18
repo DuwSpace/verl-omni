@@ -185,10 +185,15 @@ def assemble_component_rewards(
     if not torch.isfinite(scores).all() or not valid_mask.all():
         raise ValueError("Required component rewards must be finite and fully valid before actor update.")
 
+    reward_extra_keys = [f"reward/{name}" for name in reward_names]
+    component_scores = scores.numpy()
     return DataProto.from_dict(
         tensors={"rm_scores": scores, "reward_valid_mask": valid_mask},
-        non_tensors={"sample_uid": np.asarray(expected_uids, dtype=object)},
-        meta_info={"reward_names": reward_names},
+        non_tensors={
+            "sample_uid": np.asarray(expected_uids, dtype=object),
+            **{key: component_scores[:, index] for index, key in enumerate(reward_extra_keys)},
+        },
+        meta_info={"reward_names": reward_names, "reward_extra_keys": reward_extra_keys},
     )
 
 
