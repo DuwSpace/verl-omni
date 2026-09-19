@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Batch-native AudioBox Aesthetics reward adapted from zghhui/OmniNFT."""
+"""Native AudioBox Aesthetics reward adapted from zghhui/OmniNFT."""
 
 from dataclasses import dataclass
 from typing import Any
@@ -167,52 +167,38 @@ def _score_windows(output: dict[str, Any], window_count: int) -> torch.Tensor:
     return (restored["CE"] + restored["CU"] + restored["PQ"] - restored["PC"]) / 40.0
 
 
-async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **kwargs) -> dict[str, Any]:
+async def compute_score(batch, reward_model, **kwargs) -> dict[str, float]:
     """Score audio aesthetics, averaging window rewards by valid duration.
 
     Args:
-        batch: Nonempty batch with finite floating ``audio[B, C, S]`` and
+        batch: Single-sample batch with finite floating ``audio[B, C, S]`` and
             positive integer ``audio_sample_rate[B]``. Audio is detached to CPU,
             channel-averaged, and resampled to 16 kHz; text is not used.
         reward_model: Active executor exposing AudioBox inference and metadata.
-        micro_batch_size: Positive number of original samples per call. All
-            their 10 s windows are expanded into one model batch, so this does
-            not bound the number of windows.
         **kwargs: Ignored scorer options.
 
     Returns:
-        ``scores`` as CPU FP32 ``[B]`` and all-true CPU bool ``valid_mask[B]``.
+        A scalar ``score`` in a dict.
         Each window's score is ``(CE + CU + PQ - PC) / 40`` after restoring
         target mean/std; higher is preferred. Scores are not clamped.
 
     Raises:
-        ValueError: Invalid inputs, micro-batch size, predictions, or final scores.
+        ValueError: Invalid inputs, predictions, or final scores.
     """
     del kwargs
-    if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
-        raise ValueError("AudioBox micro_batch_size must be a positive integer.")
-
+    if len(batch) != 1:
+        raise ValueError("compute_score requires exactly one sample.")
+    if "audio_sample_rate" not in batch.batch and "audio_sample_rate" in batch.non_tensor_batch:
+        batch.batch["audio_sample_rate"] = torch.as_tensor(batch.non_tensor_batch["audio_sample_rate"].tolist())
     waveforms, _ = _extract_inputs(batch)
-    score_chunks = []
-    for start in range(0, len(waveforms), micro_batch_size):
-        stop = min(start + micro_batch_size, len(waveforms))
-        windows, masks, sample_indices, weights = _make_windows(waveforms[start:stop])
-        output = await reward_model.infer(windows, masks)
-        local_scores = _score_windows(output, windows.shape[0])
-        sample_scores = []
-        for sample_index in range(stop - start):
-            selected = [index for index, owner in enumerate(sample_indices) if owner == sample_index]
-            selected_weights = torch.tensor([weights[index] for index in selected], dtype=torch.float32)
-            sample_scores.append((local_scores[selected] * selected_weights).sum() / selected_weights.sum())
-        score_chunks.append(torch.stack(sample_scores))
-
-    scores = torch.cat(score_chunks).to(dtype=torch.float32)
+    windows, masks, _, weights = _make_windows(waveforms)
+    output = await reward_model.infer(windows, masks)
+    local_scores = _score_windows(output, windows.shape[0])
+    window_weights = torch.tensor(weights, dtype=torch.float32)
+    scores = ((local_scores * window_weights).sum() / window_weights.sum()).reshape(1)
     if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
         raise ValueError("AudioBox scores must be finite and sample-aligned.")
-    return {
-        "scores": scores,
-        "valid_mask": torch.ones(len(batch), dtype=torch.bool),
-    }
+    return {"score": float(scores[0])}
 
 
 class AudioBoxNativeModel:

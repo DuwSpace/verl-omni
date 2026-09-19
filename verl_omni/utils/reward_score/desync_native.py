@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Batch-native DeSync reward adapted from zghhui/OmniNFT."""
+"""Native DeSync reward adapted from zghhui/OmniNFT."""
 
 import importlib
 import math
@@ -315,48 +315,40 @@ def _infer_micro_batch(state: _DeSyncNativeState, video: torch.Tensor, audio: to
     return torch.stack(logits_batches)
 
 
-async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **kwargs) -> dict[str, Any]:
+async def compute_score(batch, reward_model, **kwargs) -> dict[str, float]:
     """Score audiovisual synchrony from two Synchformer offset predictions.
 
     Args:
-        batch: Nonempty batch of uint8 RGB ``responses[B, T, 3, H, W]``, finite
+        batch: Single-sample batch of uint8 RGB ``responses[B, T, 3, H, W]``, finite
             floating ``audio[B, C, S]``, positive floating ``fps[B]``, and
             positive integer ``audio_sample_rate[B]``. No text is used. Media
             are prepared on CPU as 8 s of 25 fps video and 16 kHz mono audio.
         reward_model: Active executor returning offset logits ``[2, M, 21]``.
-        micro_batch_size: Positive number of original AV samples per call,
-            each expanded to 24 segments and two 14-segment comparisons.
         **kwargs: Ignored scorer options.
 
     Returns:
-        CPU FP32 ``scores[B]`` in input order and all-true CPU bool
-        ``valid_mask[B]``. Each comparison selects its argmax on
+        A scalar ``score`` in a dict. Each comparison selects its argmax on
         the 21-class [-2, 2] second grid; reward is ``1 / (1 + mean(abs(offset)))``.
         Higher is better, reaching 1 when both predicted offsets are zero.
 
     Raises:
-        ValueError: Invalid inputs, micro-batch size, logits shape, or scores.
+        ValueError: Invalid inputs, logits shape, or scores.
     """
     del kwargs
-    if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
-        raise ValueError("DeSync micro_batch_size must be a positive integer.")
+    if len(batch) != 1:
+        raise ValueError("compute_score requires exactly one sample.")
+    if "audio_sample_rate" not in batch.batch and "audio_sample_rate" in batch.non_tensor_batch:
+        batch.batch["audio_sample_rate"] = torch.as_tensor(batch.non_tensor_batch["audio_sample_rate"].tolist())
     videos, audio, _, _ = _extract_inputs(batch)
-    chunks = []
-    for start in range(0, len(batch), micro_batch_size):
-        stop = min(start + micro_batch_size, len(batch))
-        logits = await reward_model.infer(torch.stack(videos[start:stop]), torch.stack(audio[start:stop]))
-        if not isinstance(logits, torch.Tensor) or logits.shape != (2, stop - start, 21):
-            raise ValueError(f"DeSync logits must have shape (2, {stop - start}, 21).")
-        offsets = _CLASS_GRID[logits.argmax(dim=-1)].abs()
-        distance = offsets.mean(dim=0)
-        chunks.append((1.0 / (1.0 + distance)).float())
-    scores = torch.cat(chunks).to(torch.float32)
+    logits = await reward_model.infer(torch.stack(videos), torch.stack(audio))
+    if not isinstance(logits, torch.Tensor) or logits.shape != (2, 1, 21):
+        raise ValueError("DeSync logits must have shape (2, 1, 21).")
+    offsets = _CLASS_GRID[logits.argmax(dim=-1)].abs()
+    distance = offsets.mean(dim=0)
+    scores = (1.0 / (1.0 + distance)).float()
     if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
         raise ValueError("DeSync scores must be finite and sample-aligned.")
-    return {
-        "scores": scores,
-        "valid_mask": torch.ones(len(batch), dtype=torch.bool),
-    }
+    return {"score": float(scores[0])}
 
 
 class DeSyncNativeModel:

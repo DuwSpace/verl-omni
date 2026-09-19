@@ -108,6 +108,7 @@ def _read_records(location: str, split: str, max_samples: int) -> list[dict[str,
                     "negative_prompt": [{"role": "user", "content": ""}],
                     "ability": "text_to_audio_video",
                     "uid": uid,
+                    "reward_model": {"style": "model", "ground_truth": record["prompt_av"]},
                     "reward_inputs": {"text": {"video": record["prompt_v"], "audio": record["prompt_a"]}},
                     "extra_info": {
                         "split": split,
