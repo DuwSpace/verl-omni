@@ -15,6 +15,7 @@
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -27,7 +28,6 @@ from tensordict import TensorDict
 from verl import DataProto
 from verl.utils import tensordict_utils as tu
 
-from verl_omni.trainer.diffusion.modality_advantage import ModalityAdvantageRouter
 from verl_omni.workers.config import DiffusionActorConfig
 
 
@@ -1251,6 +1251,97 @@ class OmniNFTLoss(DiffusionNFTLoss):
                 device=scores.device,
             )
 
+    @staticmethod
+    def _compute_component_advantages(
+        scores: torch.Tensor,
+        uid: Sequence[Any],
+        *,
+        norm_by_std: bool,
+        global_std: bool,
+        epsilon: float = 1e-4,
+    ) -> torch.Tensor:
+        """Center each reward column by prompt group and optionally scale its spread.
+
+        Args:
+            scores: Finite component scores, ``[B, K]`` with ``K > 0``.
+            uid: Prompt-group keys for B rows, not unique sample row identities.
+            norm_by_std: Divide centered scores by standard deviation plus epsilon.
+            global_std: Use each column's full-batch standard deviation when true;
+                otherwise use its prompt-group standard deviation. Both use
+                population variance (``correction=0``).
+            epsilon: Positive denominator offset.
+
+        Returns:
+            Detached FP32 ``[B, K]`` advantages on the score device, in the
+            original row/column order. Input scores are not modified.
+
+        Raises:
+            ValueError: Shape, UID count, or epsilon is invalid.
+        """
+        if scores.ndim != 2:
+            raise ValueError(f"OmniNFT reward scores must have shape [B, K], got {tuple(scores.shape)}.")
+        if scores.shape[1] == 0:
+            raise ValueError("OmniNFT reward scores must contain at least one component.")
+        if len(uid) != scores.shape[0]:
+            raise ValueError(f"OmniNFT uid count {len(uid)} does not match reward batch size {scores.shape[0]}.")
+        if epsilon <= 0:
+            raise ValueError(f"OmniNFT advantage epsilon must be positive, got {epsilon}.")
+
+        scores = scores.detach().float()
+        groups: dict[Any, list[int]] = defaultdict(list)
+        for index, group_id in enumerate(uid):
+            groups[group_id].append(index)
+
+        advantages = torch.empty_like(scores)
+        batch_std = scores.std(dim=0, correction=0) if global_std and norm_by_std else None
+        for indices in groups.values():
+            index_tensor = torch.tensor(indices, device=scores.device)
+            group_scores = scores.index_select(0, index_tensor)
+            centered = group_scores - group_scores.mean(dim=0, keepdim=True)
+            if norm_by_std:
+                std = batch_std if batch_std is not None else group_scores.std(dim=0, correction=0)
+                centered = centered / (std.unsqueeze(0) + epsilon)
+            advantages.index_copy_(0, index_tensor, centered)
+        return advantages
+
+    @staticmethod
+    def _build_reward_routing_matrix(
+        *,
+        reward_names: Sequence[str],
+        reward_functions: Mapping[str, Any],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Build routing weights in reward_names order with video/audio columns.
+
+        Return ``[K, 2]`` on the requested device/dtype. Reward names must be
+        unique and exactly match configuration keys; each row requires
+        nonnegative video/audio weights with at least one nonzero entry.
+        Weights are not normalized.
+        """
+        reward_names = list(reward_names)
+        if not reward_names or len(reward_names) != len(set(reward_names)):
+            raise ValueError("OmniNFT reward_names must be non-empty and unique.")
+        if set(reward_functions) != set(reward_names):
+            raise ValueError("OmniNFT reward_names must match reward.reward_functions keys.")
+
+        rows: list[list[float]] = []
+        for name in reward_names:
+            entry = reward_functions[name]
+            routing_weights = entry.get("routing_weights")
+            if routing_weights is None:
+                raise ValueError(f"Reward '{name}' must define routing_weights.video and routing_weights.audio.")
+            row = []
+            for modality in ("video", "audio"):
+                value = routing_weights.get(modality)
+                if value < 0:
+                    raise ValueError(f"Reward '{name}' routing weight for {modality} must be non-negative.")
+                row.append(float(value))
+            if not any(row):
+                raise ValueError(f"Reward '{name}' must route to at least one modality.")
+            rows.append(row)
+        return torch.tensor(rows, device=device, dtype=dtype)
+
     @classmethod
     def prepare_actor_batch(cls, batch: DataProto, reward_tensor: torch.Tensor, config: Any) -> DataProto:
         """Populate the actor batch in place and return the same DataProto.
@@ -1306,20 +1397,29 @@ class OmniNFTLoss(DiffusionNFTLoss):
         reward_names = list(reward_names)
         cls._attach_reward_metrics(batch, scores, reward_names)
 
-        reward_advantages = ModalityAdvantageRouter.compute_reward_advantages(
+        reward_advantages = cls._compute_component_advantages(
             scores=scores,
             uid=batch.non_tensor_batch["uid"],
             norm_by_std=algorithm_cfg.norm_adv_by_std_in_grpo,
             global_std=algorithm_cfg.global_std,
         )
-        routing_matrix = ModalityAdvantageRouter.build_routing_matrix(
+        routing_matrix = cls._build_reward_routing_matrix(
             reward_names=reward_names,
             reward_functions=reward_cfg.reward_functions,
             device=reward_advantages.device,
             dtype=reward_advantages.dtype,
         )
-        modality_advantages = ModalityAdvantageRouter.route(reward_advantages, routing_matrix)
-        modality_reward_probs = ModalityAdvantageRouter.to_probability(
+        if routing_matrix.shape != (reward_advantages.shape[1], 2):
+            raise ValueError(
+                f"OmniNFT routing matrix must have shape {(reward_advantages.shape[1], 2)}, "
+                f"got {tuple(routing_matrix.shape)}."
+            )
+        modality_advantages = reward_advantages @ routing_matrix
+        if actor_cfg.diffusion_loss.adv_clip_max <= 0:
+            raise ValueError(f"OmniNFT adv_clip_max must be positive, got {actor_cfg.diffusion_loss.adv_clip_max}.")
+        if algorithm_cfg.adv_mode not in {"continuous", "positive_only", "negative_only", "one_only", "binary"}:
+            raise ValueError(f"Unsupported OmniNFT adv_mode: {algorithm_cfg.adv_mode!r}.")
+        modality_reward_probs = cls._advantage_to_reward_prob(
             modality_advantages,
             adv_clip_max=actor_cfg.diffusion_loss.adv_clip_max,
             adv_mode=algorithm_cfg.adv_mode,
