@@ -17,6 +17,7 @@ import logging
 
 import numpy as np
 import ray
+import torch
 from omegaconf import open_dict
 from tensordict import TensorDict
 from verl.experimental.reward_loop import RewardLoopManager
@@ -44,22 +45,14 @@ from .reward_model_executor import (
 logger = logging.getLogger(__name__)
 
 
-def _validate_named_reward_manager_cls(reward_manager_cls, *, preserve_components: bool = False) -> None:
+def _validate_named_reward_manager_cls(reward_manager_cls) -> None:
     from .reward_manager.multi import MultiVisualRewardManager
 
-    if preserve_components:
-        if callable(getattr(reward_manager_cls, "run_batch", None)):
-            return
+    if not issubclass(reward_manager_cls, MultiVisualRewardManager):
         raise ValueError(
-            "reward.aggregation='preserve_components' requires a reward manager with an async run_batch() method; "
-            f"got {reward_manager_cls.__name__!r}."
+            "reward.models currently requires reward.reward_manager.name=MultiVisualRewardManager; "
+            f"got {reward_manager_cls.__name__!r}. Support for other modalities is follow-up work."
         )
-    if issubclass(reward_manager_cls, MultiVisualRewardManager):
-        return
-    raise ValueError(
-        "reward.models currently requires reward.reward_manager.name=MultiVisualRewardManager; "
-        f"got {reward_manager_cls.__name__!r}. Support for other modalities is follow-up work."
-    )
 
 
 class OmniRewardLoopWorker(RewardLoopWorker):
@@ -87,17 +80,6 @@ class OmniRewardLoopWorker(RewardLoopWorker):
                 self.engine_reward_executors,
                 self.native_reward_executors,
             )
-
-    async def compute_score_components(self, data: DataProto):
-        """Delegate a local shard to ``run_batch`` and return its component output.
-
-        The manager owns input validation, sample identity, column order, and any
-        in-place batch preparation. Raise TypeError if it has no batch entrypoint.
-        """
-        run_batch = getattr(self.reward_manager, "run_batch", None)
-        if not callable(run_batch):
-            raise TypeError(f"{type(self.reward_manager).__name__} does not support component scoring.")
-        return await run_batch(data)
 
     async def wake_up_reward_model(self, model_name: str) -> None:
         try:
@@ -128,15 +110,14 @@ class OmniRewardLoopManager(RewardLoopManager):
     def __init__(self, config, rm_resource_pool=None, accelerator_resource_pool=None):
         self._score_lock = asyncio.Lock()
         self._preserve_reward_components = config.reward.get("aggregation") == "preserve_components"
+        if self._preserve_reward_components and not has_reward_models(config):
+            raise ValueError("preserve_components requires named reward.models.")
         self.accelerator_resource_pool = accelerator_resource_pool
         named_reward_manager_cls = None
         if has_reward_models(config):
             validate_reward_model_terms(config)
             named_reward_manager_cls = resolve_reward_manager_cls(config)
-            _validate_named_reward_manager_cls(
-                named_reward_manager_cls,
-                preserve_components=self._preserve_reward_components,
-            )
+            _validate_named_reward_manager_cls(named_reward_manager_cls)
         self.multi_reward_model_manager = MultiRewardModelManager(
             config,
             # The trainer maps Role.RewardModel to global_pool or reward_pool.
@@ -299,14 +280,6 @@ class OmniRewardLoopManager(RewardLoopManager):
             scoring_error = None
             try:
                 await self.multi_reward_model_manager.wake_up()
-                if getattr(self, "_preserve_reward_components", False):
-                    from .reward_components import compute_component_rewards
-
-                    return await compute_component_rewards(
-                        self._reward_worker_groups,
-                        data,
-                        set(self.config.reward.reward_functions),
-                    )
                 return await self._compute_named_model_scores(data)
             except BaseException as exc:
                 scoring_error = exc
@@ -356,14 +329,30 @@ class OmniRewardLoopManager(RewardLoopManager):
             merged_scores.append(total)
             merged_infos.append(info)
 
-        rm_scores = self.reward_manager_cls.assemble_rm_scores(data, merged_scores)
+        meta_info = {}
+        if getattr(self, "_preserve_reward_components", False):
+            reward_names = sorted(self.config.reward.reward_functions)
+            if not reward_names or not merged_infos:
+                raise ValueError("Component rewards require non-empty reward functions and samples.")
+            try:
+                rm_scores = torch.tensor(
+                    [[info[f"reward/{name}"] for name in reward_names] for info in merged_infos],
+                    dtype=torch.float32,
+                )
+            except KeyError as exc:
+                raise ValueError(f"Missing required component reward: {exc}") from exc
+            if not torch.isfinite(rm_scores).all():
+                raise ValueError("Required component rewards must be finite before actor update.")
+            meta_info["reward_names"] = reward_names
+        else:
+            rm_scores = self.reward_manager_cls.assemble_rm_scores(data, merged_scores)
         batch = TensorDict({"rm_scores": rm_scores}, batch_size=len(data))
         reward_extra_keys = list(dict.fromkeys(key for info in merged_infos for key in info))
         non_tensor_batch = {key: np.array([info.get(key) for info in merged_infos]) for key in reward_extra_keys}
         return DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,
-            meta_info={"reward_extra_keys": reward_extra_keys},
+            meta_info={"reward_extra_keys": reward_extra_keys, **meta_info},
         )
 
     def start_profile(self, **kwargs) -> None:

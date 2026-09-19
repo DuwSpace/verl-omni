@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Batch-native VideoAlign reward adapted from zghhui/OmniNFT."""
+"""Native VideoAlign reward adapted from zghhui/OmniNFT."""
 
 from dataclasses import dataclass
 from typing import Any
@@ -328,54 +328,42 @@ def _prepare_batch(state: _VideoAlignNativeState, videos: list[torch.Tensor], pr
     return {key: value.to(state.device) if isinstance(value, torch.Tensor) else value for key, value in inputs.items()}
 
 
-async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **kwargs) -> dict[str, Any]:
+async def compute_score(batch, reward_model, **kwargs) -> dict[str, float]:
     """Score visual quality and text alignment from VideoReward's three heads.
 
     Args:
-        batch: Nonempty ``responses[B, T, C, H, W]`` with T>=2 and C=1 or 3,
+        batch: Single-sample ``responses[B, T, C, H, W]`` with T>=2 and C=1 or 3,
             positive floating ``fps[B]``, and per-row ``reward_inputs.text.video``.
             Pixels are uint8 or floating [0, 1] at sampled frames. Sampling
             targets 24 fps with an even count capped by available frames and
             768; grayscale becomes RGB. Audio is not used.
         reward_model: Active executor returning ``[M, 3]`` VQ/MQ/TA logits.
-        micro_batch_size: Positive number of original videos per inference call,
-            not a limit on sampled frames or visual tokens.
         **kwargs: Ignored scorer options.
 
     Returns:
-        CPU FP32 ``scores[B]`` in input order and all-true CPU bool
-        ``valid_mask[B]``. Reward averages ``(VQ - 3.6757) / 2.2476`` and
+        A scalar ``score`` in a dict. Reward averages ``(VQ - 3.6757) / 2.2476`` and
         ``(TA - 2.8105) / 2.5121``; MQ is not used. Higher is preferred and
         scores are not clamped.
 
     Raises:
-        ValueError: Invalid inputs, micro-batch size, logits, or final scores.
+        ValueError: Invalid inputs, logits, or final scores.
     """
     del kwargs
-    if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
-        raise ValueError("VideoAlign micro_batch_size must be a positive integer.")
-
+    if len(batch) != 1:
+        raise ValueError("compute_score requires exactly one sample.")
     videos, prompts, _, _ = _extract_inputs(batch)
-    score_chunks = []
-    for start in range(0, len(batch), micro_batch_size):
-        stop = min(start + micro_batch_size, len(batch))
-        logits = await reward_model.infer(videos[start:stop], prompts[start:stop])
-        if not isinstance(logits, torch.Tensor) or logits.shape != (stop - start, 3):
-            raise ValueError(f"VideoAlign model logits must have shape ({stop - start}, 3).")
-        if not torch.isfinite(logits).all():
-            raise ValueError("VideoAlign model logits must contain only finite values.")
-        logits = logits.float()
-        vq = (logits[:, 0] - _VQ_MEAN) / _VQ_STD
-        ta = (logits[:, 2] - _TA_MEAN) / _TA_STD
-        score_chunks.append(((vq + ta) / 2).cpu())
-
-    scores = torch.cat(score_chunks).to(dtype=torch.float32)
+    logits = await reward_model.infer(videos, prompts)
+    if not isinstance(logits, torch.Tensor) or logits.shape != (1, 3):
+        raise ValueError("VideoAlign model logits must have shape (1, 3).")
+    if not torch.isfinite(logits).all():
+        raise ValueError("VideoAlign model logits must contain only finite values.")
+    logits = logits.float()
+    vq = (logits[:, 0] - _VQ_MEAN) / _VQ_STD
+    ta = (logits[:, 2] - _TA_MEAN) / _TA_STD
+    scores = ((vq + ta) / 2).cpu()
     if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
         raise ValueError("VideoAlign scores must be finite and sample-aligned.")
-    return {
-        "scores": scores,
-        "valid_mask": torch.ones(len(batch), dtype=torch.bool),
-    }
+    return {"score": float(scores[0])}
 
 
 class VideoAlignNativeModel:
