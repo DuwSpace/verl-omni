@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Batch-native CLAP reward adapted from zghhui/OmniNFT."""
+"""Native CLAP reward adapted from zghhui/OmniNFT."""
 
 from dataclasses import dataclass
 from typing import Any
@@ -113,52 +113,43 @@ def _extract_inputs(batch) -> tuple[list[np.ndarray], list[str], list[int]]:
     return waveforms, prompts, rates
 
 
-async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **kwargs) -> dict[str, Any]:
+async def compute_score(batch, reward_model, **kwargs) -> dict[str, float]:
     """Score aligned audio/text pairs with rescaled CLAP cosine similarity.
 
     Args:
-        batch: Nonempty batch with finite floating ``audio[B, C, S]``, positive
+        batch: Single-sample batch with finite floating ``audio[B, C, S]``, positive
             integer ``audio_sample_rate[B]``, and per-row
             ``reward_inputs.text.audio`` strings. Audio is detached to CPU,
             channel-averaged, and resampled to 48 kHz.
         reward_model: Active executor returning aligned audio/text embeddings.
-        micro_batch_size: Positive number of original audio/text pairs per call.
         **kwargs: Ignored scorer options.
 
     Returns:
-        CPU FP32 ``scores[B]`` equal to ``clamp((cosine + 1) / 2, 0, 1)``;
-        higher means greater alignment. Also returns all-true CPU bool
-        ``valid_mask[B]``. Row order is preserved.
+        A scalar ``score`` equal to ``clamp((cosine + 1) / 2, 0, 1)``;
+        higher means greater alignment. Returned in a dict.
 
     Raises:
-        ValueError: Invalid inputs, micro-batch size, embedding shapes, or scores.
+        ValueError: Invalid inputs, embedding shapes, or scores.
     """
     del kwargs
-    if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
-        raise ValueError("CLAP micro_batch_size must be a positive integer.")
-
+    if len(batch) != 1:
+        raise ValueError("compute_score requires exactly one sample.")
+    if "audio_sample_rate" not in batch.batch and "audio_sample_rate" in batch.non_tensor_batch:
+        batch.batch["audio_sample_rate"] = torch.as_tensor(batch.non_tensor_batch["audio_sample_rate"].tolist())
     waveforms, prompts, _ = _extract_inputs(batch)
-    score_chunks = []
-    for start in range(0, len(batch), micro_batch_size):
-        stop = min(start + micro_batch_size, len(batch))
-        output = await reward_model.infer(waveforms[start:stop], prompts[start:stop])
-        audio_embeddings = F.normalize(output["audio_embeddings"].float(), p=2, dim=-1)
-        text_embeddings = F.normalize(output["text_embeddings"].float(), p=2, dim=-1)
-        if (
-            audio_embeddings.ndim != 2
-            or text_embeddings.shape != audio_embeddings.shape
-            or audio_embeddings.shape[0] != stop - start
-        ):
-            raise ValueError("CLAP embeddings must preserve the aligned audio/text micro-batch dimension.")
-        score_chunks.append(((audio_embeddings * text_embeddings).sum(dim=-1) + 1.0).div(2.0).clamp(0, 1).cpu())
-
-    scores = torch.cat(score_chunks).to(dtype=torch.float32)
+    output = await reward_model.infer(waveforms, prompts)
+    audio_embeddings = F.normalize(output["audio_embeddings"].float(), p=2, dim=-1)
+    text_embeddings = F.normalize(output["text_embeddings"].float(), p=2, dim=-1)
+    if (
+        audio_embeddings.ndim != 2
+        or text_embeddings.shape != audio_embeddings.shape
+        or audio_embeddings.shape[0] != 1
+    ):
+        raise ValueError("CLAP embeddings must preserve the single aligned audio/text pair.")
+    scores = ((audio_embeddings * text_embeddings).sum(dim=-1) + 1.0).div(2.0).clamp(0, 1).cpu()
     if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
         raise ValueError("CLAP scores must be finite and sample-aligned.")
-    return {
-        "scores": scores,
-        "valid_mask": torch.ones(len(batch), dtype=torch.bool),
-    }
+    return {"score": float(scores[0])}
 
 
 class CLAPNativeModel:

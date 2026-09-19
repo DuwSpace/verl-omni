@@ -31,7 +31,6 @@ from verl.trainer.ppo.reward import extract_reward
 
 from verl_omni.reward_loop import reward_model as reward_model_module
 from verl_omni.reward_loop import reward_model_executor as executor_module
-from verl_omni.reward_loop.reward_components import assemble_component_rewards
 from verl_omni.reward_loop.reward_loop import (
     OmniRewardLoopManager,
     OmniRewardLoopWorker,
@@ -75,40 +74,33 @@ def _parsed_models(config):
     return [(name, parse_reward_model_config(name, model)) for name, model in config.reward.models.items()]
 
 
-def test_component_rewards_publish_standard_reward_extras():
-    data = DataProto.from_dict(
-        tensors={"responses": torch.zeros(2, 3, 2, 2, dtype=torch.uint8)},
-        non_tensors={"sample_uid": ["sample-0", "sample-1"]},
-    )
-    grouped_outputs = [
-        (
-            "video_align",
-            data,
-            {
-                "rm_scores": torch.tensor([[0.25], [0.5]]),
-                "reward_valid_mask": torch.ones(2, 1, dtype=torch.bool),
-                "reward_names": ["video_align"],
-                "sample_uid": ["sample-0", "sample-1"],
-            },
-        ),
-        (
-            "audiobox",
-            data,
-            {
-                "rm_scores": torch.tensor([[0.75], [1.0]]),
-                "reward_valid_mask": torch.ones(2, 1, dtype=torch.bool),
-                "reward_names": ["audiobox"],
-                "sample_uid": ["sample-0", "sample-1"],
-            },
-        ),
-    ]
+@pytest.mark.asyncio
+async def test_component_rewards_publish_standard_reward_extras():
+    data = DataProto.from_dict(tensors={"responses": torch.zeros(2, 3, 2, 2, dtype=torch.uint8)})
 
-    result = assemble_component_rewards(data, grouped_outputs, {"video_align", "audiobox"})
+    class Worker:
+        def __init__(self, name, scores):
+            async def compute(chunk):
+                return [
+                    {"reward_score": score, "reward_extra_info": {f"reward/{name}": score}}
+                    for score in scores[: len(chunk)]
+                ]
+
+            self.compute_score_batch = SimpleNamespace(remote=compute)
+
+    manager = object.__new__(OmniRewardLoopManager)
+    manager._preserve_reward_components = True
+    manager.config = SimpleNamespace(reward=SimpleNamespace(reward_functions={"video_align": {}, "audiobox": {}}))
+    manager._reward_worker_groups = {
+        "video_align": [Worker("video_align", [0.25, 0.5])],
+        "audiobox": [Worker("audiobox", [0.75, 1.0])],
+    }
+    result = await manager._compute_named_model_scores(data)
     reward_tensor, reward_extras = extract_reward(result)
 
     torch.testing.assert_close(reward_tensor, torch.tensor([[0.75, 0.25], [1.0, 0.5]]))
     assert result.meta_info["reward_names"] == ["audiobox", "video_align"]
-    assert result.meta_info["reward_extra_keys"] == ["reward/audiobox", "reward/video_align"]
+    assert set(result.meta_info["reward_extra_keys"]) == {"reward/audiobox", "reward/video_align", "reward/combined"}
     assert reward_extras["reward/audiobox"].tolist() == pytest.approx([0.75, 1.0])
     assert reward_extras["reward/video_align"].tolist() == pytest.approx([0.25, 0.5])
     validation_metrics = process_validation_metrics(

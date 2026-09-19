@@ -31,7 +31,7 @@ accelerator_workers:
 
 # Multi-reward configuration (dict-based, mutually exclusive with custom_reward_function).
 # Keys are user-chosen names used for metric logging (e.g., "ocr", "jpeg").
-# Weighted entries use path/name/weight; component-preserving entries use path/required/micro_batch_size.
+# Each entry uses path/name/weight; preserve_components requires required=true and weight=1.0.
 reward_functions: {}
 
 # Named reward models. See docs/algo/named_reward_models.md for configuration

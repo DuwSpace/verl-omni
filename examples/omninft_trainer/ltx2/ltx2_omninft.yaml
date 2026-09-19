@@ -149,7 +149,7 @@ reward:
   accelerator_workers:
     enabled: false
   reward_manager:
-    name: MultiModalRewardManager
+    name: MultiVisualRewardManager
   aggregation: preserve_components
   models:
     video_align:
@@ -180,41 +180,36 @@ reward:
   reward_functions:
     video_align:
       path: pkg://verl_omni.utils.reward_score.videoalign_native
-      name: compute_score_batch
+      name: compute_score
       model: video_align
       weight: 1.0
       required: true
-      micro_batch_size: 2
       routing_weights: {video: 1.0, audio: 0.0}
     hpsv3:
       path: pkg://verl_omni.utils.reward_score.hpsv3_native
-      name: compute_score_batch
+      name: compute_score
       model: hpsv3
       weight: 1.0
       required: true
-      micro_batch_size: 8
       routing_weights: {video: 1.5, audio: 0.0}
     audiobox:
       path: pkg://verl_omni.utils.reward_score.audiobox_native
-      name: compute_score_batch
+      name: compute_score
       model: audiobox
       weight: 1.0
       required: true
-      micro_batch_size: 8
       routing_weights: {video: 0.0, audio: 0.5}
     clap:
       path: pkg://verl_omni.utils.reward_score.clap_native
-      name: compute_score_batch
+      name: compute_score
       model: clap
       weight: 1.0
       required: true
-      micro_batch_size: 8
       routing_weights: {video: 0.0, audio: 1.0}
     desync:
       path: pkg://verl_omni.utils.reward_score.desync_native
-      name: compute_score_batch
+      name: compute_score
       model: desync
       weight: 1.0
       required: true
-      micro_batch_size: 2
       routing_weights: {video: 1.0, audio: 1.0}

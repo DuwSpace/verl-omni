@@ -41,9 +41,13 @@ By default, the converter downloads `train_metadata_20k.jsonl` and
 `fb9237f6e74edf0d0f2a683f4d975b79fde588fe` and writes `train.parquet` and
 `test.parquet` under `data/omninft/vggsound/verl_omni`. This is the same
 revision used by the pinned reward reference source. Use `--train_file` and
-`--val_file` for local metadata files. Each generated sample receives a unique
-`sample_uid`; samples from the same prompt retain their shared `uid` for
-group-wise advantage normalization.
+`--val_file` for local metadata files. Samples from the same prompt retain their shared `uid` for group-wise
+advantage normalization. Reward workers preserve input order through the existing
+single-sample scoring path; a separate reward sample ID is unnecessary.
+`MultiVisualRewardManager` records each raw component, and `preserve_components`
+assembles these into named columns before OmniNFT normalization and modality
+routing. Cross-sample reward inference batching is disabled; model-specific
+frame and audio-window processing is retained.
 
 ## Prepare model assets
 

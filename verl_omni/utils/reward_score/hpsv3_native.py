@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Batch-native HPSv3 reward adapted from zghhui/OmniNFT."""
+"""Native HPSv3 reward adapted from zghhui/OmniNFT."""
 
 from dataclasses import dataclass
 from typing import Any
@@ -203,55 +203,45 @@ def _prepare_batch(state: _HPSv3NativeState, images: list[Image.Image], prompts:
     return {key: value.to(state.device) if isinstance(value, torch.Tensor) else value for key, value in inputs.items()}
 
 
-async def compute_score_batch(batch, reward_model, *, micro_batch_size: int, **kwargs) -> dict[str, Any]:
+async def compute_score(batch, reward_model, **kwargs) -> dict[str, float]:
     """Score video preference using the best two of five sampled frame scores.
 
     Args:
-        batch: Nonempty ``responses[B, T, C, H, W]`` videos (C=1 or 3), uint8
+        batch: Single-sample ``responses[B, T, C, H, W]`` videos (C=1 or 3), uint8
             or finite floating pixels, and per-row ``reward_inputs.text.video``.
             Floating pixels are clamped to [0, 1]. Five rounded, uniformly spaced
             frame indices span each clip; indices may repeat. Audio is not used.
         reward_model: Active executor returning two logits per frame/prompt pair.
-        micro_batch_size: Positive number of original videos per call, expanded
-            to five frame/prompt pairs each for model inference.
         **kwargs: Ignored scorer options.
 
     Returns:
-        CPU FP32 ``scores[B]`` in input order and all-true CPU bool
-        ``valid_mask[B]``. Only logit 0 is used, capped above at 15; average the largest
+        A scalar ``score`` in a dict. Only logit 0 is used, capped above at 15; average the largest
         ``ceil(5 * 0.3) = 2`` scores per video. Higher is preferred; no lower
         bound or additional normalization is applied.
 
     Raises:
-        ValueError: Invalid inputs, micro-batch size, logits, or final scores.
+        ValueError: Invalid inputs, logits, or final scores.
     """
     del kwargs
-    if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
-        raise ValueError("HPSv3 micro_batch_size must be a positive integer.")
+    if len(batch) != 1:
+        raise ValueError("compute_score requires exactly one sample.")
     frame_groups, prompts = _extract_inputs(batch)
-    score_chunks = []
-    for start in range(0, len(frame_groups), micro_batch_size):
-        stop = min(start + micro_batch_size, len(frame_groups))
-        images = [frame for group in frame_groups[start:stop] for frame in group]
-        repeated_prompts = [prompt for prompt in prompts[start:stop] for _ in range(_FRAME_COUNT)]
-        logits = await reward_model.infer(images, repeated_prompts)
-        if not isinstance(logits, torch.Tensor) or logits.ndim != 2 or logits.shape != (len(images), 2):
-            raise ValueError(f"HPSv3 model logits must have shape ({len(images)}, 2).")
-        if not torch.isfinite(logits).all():
-            raise ValueError("HPSv3 model logits must contain only finite values.")
-        frame_scores = torch.minimum(
-            logits[:, 0].float(),
-            torch.tensor(_REWARD_CAP, device=logits.device),
-        ).reshape(stop - start, _FRAME_COUNT)
-        top_count = max(1, int(np.ceil(_FRAME_COUNT * _TOP_FRACTION)))
-        score_chunks.append(frame_scores.topk(top_count, dim=1).values.mean(dim=1).cpu())
-    scores = torch.cat(score_chunks).to(dtype=torch.float32)
+    images = [frame for group in frame_groups for frame in group]
+    repeated_prompts = [prompt for prompt in prompts for _ in range(_FRAME_COUNT)]
+    logits = await reward_model.infer(images, repeated_prompts)
+    if not isinstance(logits, torch.Tensor) or logits.ndim != 2 or logits.shape != (len(images), 2):
+        raise ValueError(f"HPSv3 model logits must have shape ({len(images)}, 2).")
+    if not torch.isfinite(logits).all():
+        raise ValueError("HPSv3 model logits must contain only finite values.")
+    frame_scores = torch.minimum(
+        logits[:, 0].float(),
+        torch.tensor(_REWARD_CAP, device=logits.device),
+    ).reshape(1, _FRAME_COUNT)
+    top_count = max(1, int(np.ceil(_FRAME_COUNT * _TOP_FRACTION)))
+    scores = frame_scores.topk(top_count, dim=1).values.mean(dim=1).cpu()
     if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
         raise ValueError("HPSv3 scores must be finite and sample-aligned.")
-    return {
-        "scores": scores,
-        "valid_mask": torch.ones(len(batch), dtype=torch.bool),
-    }
+    return {"score": float(scores[0])}
 
 
 class HPSv3NativeModel:
