@@ -15,6 +15,7 @@
 """Native AudioBox Aesthetics reward adapted from zghhui/OmniNFT."""
 
 from dataclasses import dataclass
+import threading
 from typing import Any
 
 import torch
@@ -208,6 +209,7 @@ class AudioBoxNativeModel:
         self._state = _load_state(model_path=model_path, **kwargs)
         self._state.device = torch.device(device)
         self._state.model.to(self._state.device).eval()
+        self._infer_lock = threading.Lock()
 
     def close(self) -> None:
         """Drop model/transform references; further inference requires a new adapter."""
@@ -223,9 +225,10 @@ class AudioBoxNativeModel:
         CPU ``[W]`` predictions for CE/CU/PC/PQ in model-output dtype, plus the
         retained target-transform mapping; calibration belongs to the scorer.
         """
-        inputs = {"wav": windows.to(self._state.device), "mask": masks.to(self._state.device)}
-        predictions = self._state.model(inputs)
-        return {
-            "predictions": {name: predictions[name].detach().cpu() for name in _AXES},
-            "target_transform": self._state.target_transform,
-        }
+        with self._infer_lock:
+            inputs = {"wav": windows.to(self._state.device), "mask": masks.to(self._state.device)}
+            predictions = self._state.model(inputs)
+            return {
+                "predictions": {name: predictions[name].detach().cpu() for name in _AXES},
+                "target_transform": self._state.target_transform,
+            }

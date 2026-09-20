@@ -15,6 +15,7 @@
 """Native CLAP reward adapted from zghhui/OmniNFT."""
 
 from dataclasses import dataclass
+import threading
 from typing import Any
 
 import numpy as np
@@ -159,6 +160,7 @@ class CLAPNativeModel:
         self._state = _load_state(model_path=model_path, **kwargs)
         self._state.device = torch.device(device)
         self._state.model.to(self._state.device).eval()
+        self._infer_lock = threading.Lock()
 
     def close(self) -> None:
         """Drop model/processor references; reuse requires constructing a new adapter."""
@@ -175,20 +177,21 @@ class CLAPNativeModel:
         ``text_embeddings``, each ``[B, D]`` in model-output dtype. Cosine
         normalization and score scaling are performed by the scorer.
         """
-        inputs = self._state.processor(
-            text=prompts,
-            audio=waveforms,
-            sampling_rate=_CLAP_SAMPLE_RATE,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        )
-        inputs = {
-            key: value.to(self._state.device) if isinstance(value, torch.Tensor) else value
-            for key, value in inputs.items()
-        }
-        outputs = self._state.model(**inputs)
-        return {
-            "audio_embeddings": outputs.audio_embeds.detach().cpu(),
-            "text_embeddings": outputs.text_embeds.detach().cpu(),
-        }
+        with self._infer_lock:
+            inputs = self._state.processor(
+                text=prompts,
+                audio=waveforms,
+                sampling_rate=_CLAP_SAMPLE_RATE,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            )
+            inputs = {
+                key: value.to(self._state.device) if isinstance(value, torch.Tensor) else value
+                for key, value in inputs.items()
+            }
+            outputs = self._state.model(**inputs)
+            return {
+                "audio_embeddings": outputs.audio_embeds.detach().cpu(),
+                "text_embeddings": outputs.text_embeds.detach().cpu(),
+            }

@@ -15,6 +15,7 @@
 """Native HPSv3 reward adapted from zghhui/OmniNFT."""
 
 from dataclasses import dataclass
+import threading
 from typing import Any
 
 import numpy as np
@@ -251,6 +252,7 @@ class HPSv3NativeModel:
         self._state = _load_state(model_path=model_path, **kwargs)
         self._state.device = torch.device(device)
         self._state.model.to(self._state.device).eval()
+        self._infer_lock = threading.Lock()
 
     def close(self) -> None:
         """Drop model/processor references; reuse requires constructing a new adapter."""
@@ -266,7 +268,8 @@ class HPSv3NativeModel:
         CPU ``[N, 2]`` reward logits from the FP32 head. ``N`` counts frames,
         not videos; frame selection and per-video aggregation belong to the scorer.
         """
-        inputs = _prepare_batch(self._state, images, prompts)
-        output = self._state.model(return_dict=True, **inputs)
-        logits = output["logits"] if isinstance(output, dict) else output.logits
-        return logits.detach().cpu()
+        with self._infer_lock:
+            inputs = _prepare_batch(self._state, images, prompts)
+            output = self._state.model(return_dict=True, **inputs)
+            logits = output["logits"] if isinstance(output, dict) else output.logits
+            return logits.detach().cpu()

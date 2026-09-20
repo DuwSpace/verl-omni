@@ -15,6 +15,7 @@
 """Native VideoAlign reward adapted from zghhui/OmniNFT."""
 
 from dataclasses import dataclass
+import threading
 from typing import Any
 
 import numpy as np
@@ -373,6 +374,7 @@ class VideoAlignNativeModel:
         self._state = _load_state(model_path=model_path, **kwargs)
         self._state.device = torch.device(device)
         self._state.model.to(self._state.device).eval()
+        self._infer_lock = threading.Lock()
 
     def close(self) -> None:
         """Drop model/processor references; reuse requires constructing a new adapter."""
@@ -388,10 +390,11 @@ class VideoAlignNativeModel:
         Return detached CPU FP32 ``[B, 3]`` logits in VQ, MQ, TA token order;
         the scorer owns temporal sampling, calibration, and scalar aggregation.
         """
-        inputs = _prepare_batch(self._state, videos, prompts)
-        output = self._state.model(return_dict=True, **inputs)
-        logits = output["logits"] if isinstance(output, dict) else output.logits
-        return logits.detach().cpu()
+        with self._infer_lock:
+            inputs = _prepare_batch(self._state, videos, prompts)
+            output = self._state.model(return_dict=True, **inputs)
+            logits = output["logits"] if isinstance(output, dict) else output.logits
+            return logits.detach().cpu()
 def _load_torch_state_dict(path: str):
     try:
         return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
