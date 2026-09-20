@@ -12,22 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native VideoAlign reward adapted from zghhui/OmniNFT."""
+"""VideoAlign reward adapted from zghhui/OmniNFT."""
 
-from dataclasses import dataclass
+import math
 import threading
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
 from .hpsv3_reward import _Qwen2VLRewardModelBT, _smart_resize
-from .qwen2vl_reward_compat import ensure_omninft_qwen2vl_layout, omninft_qwen2vl_reward_forward
 
-_DEFAULT_MODEL_REVISION = "KlingTeam/VideoReward@4f26600130683e6f1de9f5d463887f28e8ef995c"
-_DEFAULT_BASE_MODEL_REVISION = "Qwen/Qwen2-VL-2B-Instruct@895c3a49bc3fa70a340399125c650a463535e71c"
-_DEFINITION_VERSION = "omninft-videoalign-vq-ta-v3"
 _SPECIAL_TOKENS = ("<|VQ_reward|>", "<|MQ_reward|>", "<|TA_reward|>")
 _TARGET_FPS = 24.0
 _FRAME_FACTOR = 2
@@ -108,21 +103,6 @@ _PROMPT_TEMPLATE = (
 )
 
 
-@dataclass
-class _VideoAlignNativeState:
-    model: Any
-    processor: Any
-    model_revision: str
-    base_model_revision: str
-    device: torch.device | None = None
-
-
-class _VideoAlignNativeModel(_Qwen2VLRewardModelBT):
-    """VideoReward model using the OmniNFT RewardModelBT forward."""
-
-    forward = omninft_qwen2vl_reward_forward
-
-
 def _find_target_linear_names(model: Any) -> list[str]:
     excluded = ("lm_head", "rm_head", "embed_tokens", "visual")
     return [
@@ -161,12 +141,13 @@ def _load_components(model_path: str, base_model_path: str) -> tuple[Any, Any]:
     special_token_ids = processor.tokenizer.convert_tokens_to_ids(list(_SPECIAL_TOKENS))
 
     with init_empty_weights():
-        model = _VideoAlignNativeModel(
+        model = _Qwen2VLRewardModelBT(
             config,
             output_dim=1,
             reward_token="special",
             special_token_ids=special_token_ids,
             rm_head_type="linear",
+            use_sequential_position_ids=True,
         )
         model.resize_token_embeddings(len(processor.tokenizer))
         model = get_peft_model(
@@ -187,7 +168,6 @@ def _load_components(model_path: str, base_model_path: str) -> tuple[Any, Any]:
         raise ValueError("VideoAlign checkpoint must be a tensor state dict.")
     state_dict = _remap_checkpoint_state_dict(state_dict)
     model.load_state_dict(state_dict, strict=True, assign=True)
-    ensure_omninft_qwen2vl_layout(model)
     model.rm_head.to(torch.float32)
     model.config.tokenizer_padding_side = processor.tokenizer.padding_side
     model.config.pad_token_id = processor.tokenizer.pad_token_id
@@ -195,25 +175,6 @@ def _load_components(model_path: str, base_model_path: str) -> tuple[Any, Any]:
     for parameter in model.parameters():
         parameter.requires_grad = False
     return model, processor
-
-
-def _load_state(
-    model_path: str,
-    base_model_path: str,
-    model_revision: str = _DEFAULT_MODEL_REVISION,
-    base_model_revision: str = _DEFAULT_BASE_MODEL_REVISION,
-) -> _VideoAlignNativeState:
-    """Load VideoReward and its Qwen2-VL processor."""
-    for name, value in (
-        ("model_path", model_path),
-        ("base_model_path", base_model_path),
-        ("model_revision", model_revision),
-        ("base_model_revision", base_model_revision),
-    ):
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"VideoAlign Native Reward requires a non-empty {name}.")
-    model, processor = _load_components(model_path, base_model_path)
-    return _VideoAlignNativeState(model, processor, model_revision, base_model_revision)
 
 
 def _sample_video(video: torch.Tensor, source_fps: float) -> tuple[torch.Tensor, list[int]]:
@@ -259,47 +220,7 @@ def _resize_video(video: torch.Tensor) -> torch.Tensor:
     return resized.clamp(0, 255).round()
 
 
-def _extract_inputs(batch) -> tuple[list[torch.Tensor], list[str], list[list[int]], list[float]]:
-    """Validate video/text/rate fields and sample each clip without mutating it."""
-    batch_size = len(batch)
-    if batch_size <= 0:
-        raise ValueError("VideoAlign Native Reward requires a non-empty local batch.")
-    videos = batch.batch.get("responses")
-    if not isinstance(videos, torch.Tensor) or videos.ndim != 5 or videos.shape[0] != batch_size:
-        shape = None if not isinstance(videos, torch.Tensor) else tuple(videos.shape)
-        raise ValueError(f"VideoAlign responses must have shape [B,T,C,H,W] with B={batch_size}, got {shape}.")
-    if videos.shape[1] < _FRAME_FACTOR or videos.shape[2] not in (1, 3) or min(videos.shape[3:]) <= 0:
-        raise ValueError("VideoAlign video must have at least two frames and non-empty RGB or grayscale pixels.")
-
-    fps = batch.batch.get("fps")
-    if not isinstance(fps, torch.Tensor) or fps.shape != (batch_size,) or not fps.dtype.is_floating_point:
-        raise ValueError(f"VideoAlign fps must be a floating-point tensor with shape ({batch_size},).")
-    source_fps = [float(value) for value in fps.detach().cpu().tolist()]
-    if any(not np.isfinite(value) or value <= 0 for value in source_fps):
-        raise ValueError("VideoAlign fps values must be finite and positive.")
-
-    reward_inputs = batch.non_tensor_batch.get("reward_inputs")
-    if reward_inputs is None or np.asarray(reward_inputs, dtype=object).shape != (batch_size,):
-        raise ValueError(f"VideoAlign reward_inputs must have shape ({batch_size},).")
-
-    sampled_videos = []
-    prompts = []
-    frame_indices = []
-    for index, (video, sample_fps) in enumerate(zip(videos, source_fps, strict=True)):
-        try:
-            prompt = reward_inputs[index]["text"]["video"]
-        except (KeyError, TypeError) as exc:
-            raise ValueError(f"VideoAlign reward_inputs[{index}] must contain text.video.") from exc
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise ValueError(f"VideoAlign reward_inputs[{index}].text.video must be a non-empty string.")
-        sampled, indices = _sample_video(video, sample_fps)
-        sampled_videos.append(sampled)
-        prompts.append(prompt)
-        frame_indices.append(indices)
-    return sampled_videos, prompts, frame_indices, source_fps
-
-
-def _prepare_batch(state: _VideoAlignNativeState, videos: list[torch.Tensor], prompts: list[str]) -> dict[str, Any]:
+def _prepare_batch(state: "VideoAlignModel", videos: list[torch.Tensor], prompts: list[str]) -> dict[str, Any]:
     """Resize sampled RGB clips and tokenize video/prompt pairs on the active device.
 
     Spatial sizes are multiples of 28 within the configured pixel budget; the
@@ -329,58 +250,78 @@ def _prepare_batch(state: _VideoAlignNativeState, videos: list[torch.Tensor], pr
     return {key: value.to(state.device) if isinstance(value, torch.Tensor) else value for key, value in inputs.items()}
 
 
-async def compute_score(batch, reward_model, **kwargs) -> dict[str, float]:
-    """Score visual quality and text alignment from VideoReward's three heads.
+async def compute_score(
+    data_source=None,
+    solution_image=None,
+    ground_truth=None,
+    extra_info=None,
+    *,
+    reward_model,
+    batch=None,
+    prompt_key: str | None = None,
+    fps: float | None = None,
+    score_weights=None,
+    score_means=None,
+    score_stds=None,
+    **kwargs,
+) -> dict[str, float]:
+    """Score video preference with configurable VQ/MQ/TA calibration and weights.
 
-    Args:
-        batch: Single-sample ``responses[B, T, C, H, W]`` with T>=2 and C=1 or 3,
-            positive floating ``fps[B]``, and per-row ``reward_inputs.text.video``.
-            Pixels are uint8 or floating [0, 1] at sampled frames. Sampling
-            targets 24 fps with an even count capped by available frames and
-            768; grayscale becomes RGB. Audio is not used.
-        reward_model: Active executor returning ``[M, 3]`` VQ/MQ/TA logits.
-        **kwargs: Ignored scorer options.
-
-    Returns:
-        A scalar ``score`` in a dict. Reward averages ``(VQ - 3.6757) / 2.2476`` and
-        ``(TA - 2.8105) / 2.5121``; MQ is not used. Higher is preferred and
-        scores are not clamped.
-
-    Raises:
-        ValueError: Invalid inputs, logits, or final scores.
+    Text defaults to ground_truth; prompt_key selects batch.reward_inputs.text.
+    Read the source frame rate from batch, extra_info, or an explicit fps option.
     """
-    del kwargs
-    if len(batch) != 1:
-        raise ValueError("compute_score requires exactly one sample.")
-    videos, prompts, _, _ = _extract_inputs(batch)
-    logits = await reward_model.infer(videos, prompts)
+    del data_source, kwargs
+    prompt = ground_truth or ""
+    extra_info = extra_info or {}
+    if batch is not None:
+        if len(batch) != 1:
+            raise ValueError("VideoAlign scoring requires exactly one sample.")
+        item = batch[0]
+        if solution_image is None:
+            solution_image = item.batch["responses"]
+        if fps is None:
+            fps = item.batch.get("fps", item.non_tensor_batch.get("fps"))
+        if prompt_key is not None:
+            prompt = item.non_tensor_batch["reward_inputs"]["text"][prompt_key]
+    elif prompt_key is not None:
+        raise ValueError("VideoAlign prompt_key requires a single-sample batch.")
+    if fps is None:
+        fps = extra_info["fps"]
+    fps = float(fps)
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError("VideoAlign fps must be finite and positive.")
+    if solution_image.ndim != 4 or solution_image.shape[0] < 2 or solution_image.shape[1] not in (1, 3):
+        raise ValueError("VideoAlign requires video with shape [T,C,H,W], at least two frames, and 1 or 3 channels.")
+    video, _ = _sample_video(solution_image, fps)
+    logits = await reward_model.infer([video], [prompt])
     if not isinstance(logits, torch.Tensor) or logits.shape != (1, 3):
         raise ValueError("VideoAlign model logits must have shape (1, 3).")
-    if not torch.isfinite(logits).all():
-        raise ValueError("VideoAlign model logits must contain only finite values.")
-    logits = logits.float()
-    vq = (logits[:, 0] - _VQ_MEAN) / _VQ_STD
-    ta = (logits[:, 2] - _TA_MEAN) / _TA_STD
-    scores = ((vq + ta) / 2).cpu()
-    if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
-        raise ValueError("VideoAlign scores must be finite and sample-aligned.")
-    return {"score": float(scores[0])}
+    values = logits.float().cpu()
+    weights = values.new_tensor(score_weights if score_weights is not None else [0.5, 0.0, 0.5])
+    means = values.new_tensor(score_means if score_means is not None else [_VQ_MEAN, 0.0, _TA_MEAN])
+    stds = values.new_tensor(score_stds if score_stds is not None else [_VQ_STD, 1.0, _TA_STD])
+    if weights.shape != (3,) or means.shape != (3,) or stds.shape != (3,) or (stds <= 0).any():
+        raise ValueError("VideoAlign calibration requires three weights/means and three positive standard deviations.")
+    score = (((values - means) / stds) * weights).sum()
+    if not torch.isfinite(score):
+        raise ValueError("VideoAlign score must be finite.")
+    return {"score": float(score)}
 
 
-class VideoAlignNativeModel:
+class VideoAlignModel:
     """Raw VideoAlign inference adapter owned by a native reward executor."""
 
-    def __init__(self, model_path: str, device, **kwargs: Any) -> None:
-        self._state = _load_state(model_path=model_path, **kwargs)
-        self._state.device = torch.device(device)
-        self._state.model.to(self._state.device).eval()
+    def __init__(self, model_path: str, device, base_model_path: str) -> None:
+        self.model, self.processor = _load_components(model_path, base_model_path)
+        self.device = torch.device(device)
+        self.model.to(self.device).eval()
         self._infer_lock = threading.Lock()
 
     def close(self) -> None:
         """Drop model/processor references; reuse requires constructing a new adapter."""
-        self._state.model = None
-        self._state.processor = None
-        self._state.device = None
+        self.model = None
+        self.processor = None
+        self.device = None
 
     @torch.inference_mode()
     def infer(self, videos: list[torch.Tensor], prompts: list[str]) -> torch.Tensor:
@@ -391,10 +332,12 @@ class VideoAlignNativeModel:
         the scorer owns temporal sampling, calibration, and scalar aggregation.
         """
         with self._infer_lock:
-            inputs = _prepare_batch(self._state, videos, prompts)
-            output = self._state.model(return_dict=True, **inputs)
+            inputs = _prepare_batch(self, videos, prompts)
+            output = self.model(return_dict=True, **inputs)
             logits = output["logits"] if isinstance(output, dict) else output.logits
             return logits.detach().cpu()
+
+
 def _load_torch_state_dict(path: str):
     try:
         return torch.load(path, map_location="cpu", weights_only=True, mmap=True)

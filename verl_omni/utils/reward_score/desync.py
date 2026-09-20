@@ -12,24 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native DeSync reward adapted from zghhui/OmniNFT."""
+"""DeSync reward adapted from zghhui/OmniNFT."""
 
 import importlib
 import math
 import sys
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
+from .clap import _get_audio
 
-_DEFAULT_MODEL_REVISION = "zghhui/OmniNFT-Reward-Series@9e30061a1392d03bafdcf717e80a385ddf411b4d"
-_DEFAULT_SOURCE_REVISION = "fb9237f6e74edf0d0f2a683f4d975b79fde588fe"
-_DEFINITION_VERSION = "omninft-desync-synchformer-v3"
+
 _TARGET_VIDEO_FPS = 25.0
 _TARGET_AUDIO_RATE = 16_000
 _MAX_SECONDS = 8
@@ -45,15 +43,6 @@ _MEL_TIME = 66
 _CLASS_GRID = torch.linspace(-2.0, 2.0, 21)
 _MHA_FASTPATH_LOCK = threading.Lock()
 _SOURCE_IMPORT_LOCK = threading.Lock()
-
-
-@dataclass
-class _DeSyncNativeState:
-    model: Any
-    mel: Any
-    model_revision: str
-    source_revision: str
-    device: torch.device | None = None
 
 
 @contextmanager
@@ -115,7 +104,7 @@ def _import_synchformer(root: Path, module_path: Path):
     Temporary path/symbol changes are restored after import. Imported modules
     remain cached, and a missing AST ``get_head_mask`` is installed permanently
     on that source class. Reject an already imported different source path;
-    neither paths nor configured revision labels verify source contents.
+    the path check does not verify source contents.
     """
     module_name = "flow_grpo.audio_video_align.synchformer.synchformer"
     ast_module_name = "flow_grpo.audio_video_align.synchformer.hf_src.modeling_ast"
@@ -142,7 +131,7 @@ def _load_components(model_path: str, source_root: str) -> tuple[Any, Any]:
     module_path = root / "flow_grpo/audio_video_align/synchformer/synchformer.py"
     config_path = module_path.parent / "divided_224_16x4.yaml"
     if not module_path.is_file() or not config_path.is_file():
-        raise ValueError("DeSync source_root is missing the OmniNFT Synchformer source or fixed config.")
+        raise ValueError("DeSync source_root is missing the Synchformer source or fixed config.")
     module = _import_synchformer(root, module_path)
     if Path(module.__file__).resolve() != module_path:
         raise RuntimeError("Imported Synchformer does not belong to the configured source_root.")
@@ -162,25 +151,6 @@ def _load_components(model_path: str, source_root: str) -> tuple[Any, Any]:
         sample_rate=_TARGET_AUDIO_RATE, win_length=400, hop_length=160, n_fft=1024, n_mels=128
     )
     return model, mel
-
-
-def _load_state(
-    model_path: str,
-    source_root: str,
-    model_revision: str = _DEFAULT_MODEL_REVISION,
-    source_revision: str = _DEFAULT_SOURCE_REVISION,
-) -> _DeSyncNativeState:
-    """Load local Synchformer assets and retain configured revision metadata."""
-    for name, value in (
-        ("model_path", model_path),
-        ("source_root", source_root),
-        ("model_revision", model_revision),
-        ("source_revision", source_revision),
-    ):
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"DeSync Native Reward requires a non-empty {name}.")
-    model, mel = _load_components(model_path, source_root)
-    return _DeSyncNativeState(model, mel, model_revision, source_revision)
 
 
 def _temporal_resample_video(video: torch.Tensor, source_fps: float) -> torch.Tensor:
@@ -229,57 +199,13 @@ def _prepare_audio(audio: torch.Tensor, source_rate: int) -> torch.Tensor:
     return F.pad(waveform, (0, _AUDIO_SAMPLES - waveform.shape[0]))
 
 
-def _extract_inputs(batch) -> tuple[list[torch.Tensor], list[torch.Tensor], list[float], list[int]]:
-    """Validate paired media/rates and prepare CPU video/audio plus source rates.
-
-    Video is resampled to 25 fps, resized and center-cropped to 224 square,
-    scaled around [-1, 1], and padded/truncated to 200 frames. Audio is averaged
-    across channels, resampled to 16 kHz, and padded/truncated to 128000 samples.
-    """
-    batch_size = len(batch)
-    videos = batch.batch.get("responses")
-    audio = batch.batch.get("audio")
-    fps = batch.batch.get("fps")
-    sample_rates = batch.batch.get("audio_sample_rate")
-    if batch_size <= 0:
-        raise ValueError("DeSync Native Reward requires a non-empty local batch.")
-    if not isinstance(videos, torch.Tensor) or videos.ndim != 5 or videos.shape[0] != batch_size:
-        raise ValueError(f"DeSync responses must have shape [B,T,3,H,W] with B={batch_size}.")
-    if videos.shape[1] <= 0 or videos.shape[2] != 3 or videos.dtype != torch.uint8:
-        raise ValueError("DeSync responses must be non-empty uint8 RGB video.")
-    if not isinstance(audio, torch.Tensor) or audio.ndim != 3 or audio.shape[0] != batch_size:
-        raise ValueError(f"DeSync audio must have shape [B,C,S] with B={batch_size}.")
-    if audio.shape[1] <= 0 or audio.shape[2] <= 0 or not audio.dtype.is_floating_point:
-        raise ValueError("DeSync audio must be a non-empty floating-point tensor.")
-    if not torch.isfinite(audio).all():
-        raise ValueError("DeSync audio must contain only finite values.")
-    if not isinstance(fps, torch.Tensor) or fps.shape != (batch_size,) or not fps.dtype.is_floating_point:
-        raise ValueError(f"DeSync fps must be a floating-point tensor with shape ({batch_size},).")
-    if not torch.isfinite(fps).all():
-        raise ValueError("DeSync fps must contain only finite values.")
-    if (
-        not isinstance(sample_rates, torch.Tensor)
-        or sample_rates.shape != (batch_size,)
-        or sample_rates.dtype.is_floating_point
-        or sample_rates.dtype == torch.bool
-    ):
-        raise ValueError(f"DeSync audio_sample_rate must be an integer tensor with shape ({batch_size},).")
-    rates = [int(value) for value in sample_rates.cpu().tolist()]
-    source_fps = [float(value) for value in fps.cpu().tolist()]
-    if any(value <= 0 for value in source_fps) or any(value <= 0 for value in rates):
-        raise ValueError("DeSync source rates must be positive.")
-    prepared_video = [_prepare_video(sample.cpu(), rate) for sample, rate in zip(videos, source_fps, strict=True)]
-    prepared_audio = [_prepare_audio(sample.cpu(), rate) for sample, rate in zip(audio, rates, strict=True)]
-    return prepared_video, prepared_audio, source_fps, rates
-
-
 def _pad_mel_time(mel: torch.Tensor) -> torch.Tensor:
     if mel.shape[-1] < _MEL_TIME:
         return F.pad(mel, (0, _MEL_TIME - mel.shape[-1]))
     return mel[..., :_MEL_TIME]
 
 
-def _infer_micro_batch(state: _DeSyncNativeState, video: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
+def _infer_micro_batch(state: "DeSyncModel", video: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
     """Expand each prepared AV sample into 24 overlapping aligned segments.
 
     Extract video and normalized log-mel features on the active device, then
@@ -315,56 +241,67 @@ def _infer_micro_batch(state: _DeSyncNativeState, video: torch.Tensor, audio: to
     return torch.stack(logits_batches)
 
 
-async def compute_score(batch, reward_model, **kwargs) -> dict[str, float]:
-    """Score audiovisual synchrony from two Synchformer offset predictions.
+async def compute_score(
+    data_source=None,
+    solution_image=None,
+    ground_truth=None,
+    extra_info=None,
+    *,
+    reward_model,
+    batch=None,
+    fps: float | None = None,
+    **kwargs,
+) -> dict[str, float]:
+    """Score AV synchrony as 1 / (1 + mean absolute predicted offset).
 
-    Args:
-        batch: Single-sample batch of uint8 RGB ``responses[B, T, 3, H, W]``, finite
-            floating ``audio[B, C, S]``, positive floating ``fps[B]``, and
-            positive integer ``audio_sample_rate[B]``. No text is used. Media
-            are prepared on CPU as 8 s of 25 fps video and 16 kHz mono audio.
-        reward_model: Active executor returning offset logits ``[2, M, 21]``.
-        **kwargs: Ignored scorer options.
-
-    Returns:
-        A scalar ``score`` in a dict. Each comparison selects its argmax on
-        the 21-class [-2, 2] second grid; reward is ``1 / (1 + mean(abs(offset)))``.
-        Higher is better, reaching 1 when both predicted offsets are zero.
-
-    Raises:
-        ValueError: Invalid inputs, logits shape, or scores.
+    Read audio/rates from extra_info or a single-sample batch. The checkpoint's
+    21 offset classes and fixed segment preprocessing define this model's score.
     """
-    del kwargs
-    if len(batch) != 1:
-        raise ValueError("compute_score requires exactly one sample.")
-    if "audio_sample_rate" not in batch.batch and "audio_sample_rate" in batch.non_tensor_batch:
-        batch.batch["audio_sample_rate"] = torch.as_tensor(batch.non_tensor_batch["audio_sample_rate"].tolist())
-    videos, audio, _, _ = _extract_inputs(batch)
-    logits = await reward_model.infer(torch.stack(videos), torch.stack(audio))
+    del data_source, ground_truth, kwargs
+    extra_info = dict(extra_info or {})
+    if batch is not None:
+        if len(batch) != 1:
+            raise ValueError("DeSync scoring requires exactly one sample.")
+        item = batch[0]
+        if solution_image is None:
+            solution_image = item.batch["responses"]
+        for key in ("audio", "audio_sample_rate", "fps"):
+            if key in item.batch:
+                extra_info[key] = item.batch[key]
+            elif key in item.non_tensor_batch:
+                extra_info[key] = item.non_tensor_batch[key]
+    fps = float(extra_info["fps"] if fps is None else fps)
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError("DeSync fps must be finite and positive.")
+    if solution_image.ndim != 4 or solution_image.shape[1] != 3 or solution_image.dtype != torch.uint8:
+        raise ValueError("DeSync requires uint8 RGB video with shape [T,3,H,W].")
+    waveform, source_rate = _get_audio(extra_info)
+    video = _prepare_video(solution_image.detach().cpu(), fps)
+    audio = _prepare_audio(waveform.unsqueeze(0), source_rate)
+    logits = await reward_model.infer(video.unsqueeze(0), audio.unsqueeze(0))
     if not isinstance(logits, torch.Tensor) or logits.shape != (2, 1, 21):
         raise ValueError("DeSync logits must have shape (2, 1, 21).")
     offsets = _CLASS_GRID[logits.argmax(dim=-1)].abs()
-    distance = offsets.mean(dim=0)
-    scores = (1.0 / (1.0 + distance)).float()
-    if scores.shape != (len(batch),) or not torch.isfinite(scores).all():
-        raise ValueError("DeSync scores must be finite and sample-aligned.")
-    return {"score": float(scores[0])}
+    score = (1.0 / (1.0 + offsets.mean())).float()
+    if not torch.isfinite(score):
+        raise ValueError("DeSync score must be finite.")
+    return {"score": float(score)}
 
 
-class DeSyncNativeModel:
+class DeSyncModel:
     """Raw Synchformer inference adapter owned by a native reward executor."""
 
-    def __init__(self, model_path: str, device, **kwargs: Any) -> None:
-        self._state = _load_state(model_path=model_path, **kwargs)
-        self._state.device = torch.device(device)
-        self._state.model.to(self._state.device).eval()
-        self._state.mel.to(self._state.device)
+    def __init__(self, model_path: str, device, source_root: str) -> None:
+        self.model, self.mel = _load_components(model_path, source_root)
+        self.device = torch.device(device)
+        self.model.to(self.device).eval()
+        self.mel.to(self.device)
 
     def close(self) -> None:
         """Drop model/mel references; reuse requires constructing a new adapter."""
-        self._state.model = None
-        self._state.mel = None
-        self._state.device = None
+        self.model = None
+        self.mel = None
+        self.device = None
 
     @torch.inference_mode()
     def infer(self, video: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
@@ -380,9 +317,11 @@ class DeSyncNativeModel:
             fastpath_enabled = torch.backends.mha.get_fastpath_enabled()
             torch.backends.mha.set_fastpath_enabled(False)
             try:
-                return _infer_micro_batch(self._state, video, audio)
+                return _infer_micro_batch(self, video, audio)
             finally:
                 torch.backends.mha.set_fastpath_enabled(fastpath_enabled)
+
+
 def _load_torch_state_dict(path: str):
     try:
         return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
