@@ -49,6 +49,36 @@ assembles these into named columns before OmniNFT normalization and modality
 routing. Cross-sample reward inference batching is disabled; model-specific
 frame and audio-window processing is retained.
 
+CLAP uses the existing `clap.py::compute_score` with an executor-owned model,
+`prompt_key: audio`, scale/offset of `0.5`, and score bounds `[0, 1]`. Without
+these options, it retains the existing cached cosine scorer. The supplied model
+path selects the checkpoint; optional `model_kwargs` and `processor_kwargs`
+are passed to the Transformers loaders. HPSv3 uses the existing
+`hpsv3_reward.py::compute_score_hpsv3` with `prompt_key: video`, `num_frames: 5`,
+`top_fraction: 0.3`, `score_cap: 15.0`, and `reward_scale: 1.0`. Its managed
+model enables `use_sequential_position_ids` to preserve the reference reward's
+position handling while using the standard Transformers multimodal forward.
+Both paths share model loading and input preparation. Without these options,
+HPSv3 retains interval sampling, mean aggregation, scale `0.1`, and cached
+cross-request batching. Managed inference batches frames within each sample.
+AudioBox, VideoAlign, and DeSync are separate modules directly under
+`verl_omni/utils/reward_score/`. Like CLAP and HPSv3, each separates score
+computation from executor-owned model loading/inference. Their scorers accept
+standard reward arguments and optionally read media metadata from a single-sample
+batch; they do not modify that batch. AudioBox exposes `axis_weights` and
+`score_scale`; VideoAlign exposes `prompt_key`, `score_weights`, `score_means`,
+and `score_stds` (in VQ/MQ/TA order). The recipe sets these choices explicitly.
+Checkpoint/source versions are selected when downloading assets, rather than
+checked through revision labels in the scorers.
+
+HPSv3 and VideoAlign share the standard Qwen2-VL multimodal reward forward.
+Transformers builds and merges visual embeddings; explicit sequential position
+IDs preserve the original reward models' decoder behavior. VideoAlign always
+uses this position policy; HPSv3 enables it through the recipe option above.
+The reward head receives inputs cast to its parameter dtype. No visual-module
+wrapping or model-layout aliases are needed. Numerical parity with the reference
+checkpoints still requires accelerator validation.
+
 ## Prepare model assets
 
 Download the pinned LTX-2.3 base model, install the optional reward packages,

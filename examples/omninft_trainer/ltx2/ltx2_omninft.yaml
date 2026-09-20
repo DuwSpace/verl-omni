@@ -156,58 +156,77 @@ reward:
       backend: native
       offload: true
       executor:
-        model: verl_omni.utils.reward_score.videoalign_native:VideoAlignNativeModel
+        model: verl_omni.utils.reward_score.videoalign:VideoAlignModel
     hpsv3:
       backend: native
       offload: true
       executor:
-        model: verl_omni.utils.reward_score.hpsv3_native:HPSv3NativeModel
+        model: verl_omni.utils.reward_score.hpsv3_reward:HPSv3Model
+        kwargs:
+          use_sequential_position_ids: true
     audiobox:
       backend: native
       offload: true
       executor:
-        model: verl_omni.utils.reward_score.audiobox_native:AudioBoxNativeModel
+        model: verl_omni.utils.reward_score.audiobox:AudioBoxModel
     clap:
       backend: native
       offload: true
       executor:
-        model: verl_omni.utils.reward_score.clap_native:CLAPNativeModel
+        model: verl_omni.utils.reward_score.clap:CLAPModel
     desync:
       backend: native
       offload: true
       executor:
-        model: verl_omni.utils.reward_score.desync_native:DeSyncNativeModel
+        model: verl_omni.utils.reward_score.desync:DeSyncModel
   reward_functions:
     video_align:
-      path: pkg://verl_omni.utils.reward_score.videoalign_native
+      path: pkg://verl_omni.utils.reward_score.videoalign
       name: compute_score
       model: video_align
+      prompt_key: video
+      score_weights: [0.5, 0.0, 0.5]
+      score_means: [3.6757, 0.0, 2.8105]
+      score_stds: [2.2476, 1.0, 2.5121]
       weight: 1.0
       required: true
       routing_weights: {video: 1.0, audio: 0.0}
     hpsv3:
-      path: pkg://verl_omni.utils.reward_score.hpsv3_native
-      name: compute_score
+      path: pkg://verl_omni.utils.reward_score.hpsv3_reward
+      name: compute_score_hpsv3
       model: hpsv3
+      prompt_key: video
+      num_frames: 5
+      top_fraction: 0.3
+      score_cap: 15.0
+      reward_scale: 1.0
+      max_batch_size: 5
       weight: 1.0
       required: true
       routing_weights: {video: 1.5, audio: 0.0}
     audiobox:
-      path: pkg://verl_omni.utils.reward_score.audiobox_native
+      path: pkg://verl_omni.utils.reward_score.audiobox
       name: compute_score
       model: audiobox
+      axis_weights: {CE: 1.0, CU: 1.0, PC: -1.0, PQ: 1.0}
+      score_scale: 0.025
       weight: 1.0
       required: true
       routing_weights: {video: 0.0, audio: 0.5}
     clap:
-      path: pkg://verl_omni.utils.reward_score.clap_native
+      path: pkg://verl_omni.utils.reward_score.clap
       name: compute_score
       model: clap
+      prompt_key: audio
+      score_scale: 0.5
+      score_offset: 0.5
+      score_min: 0.0
+      score_max: 1.0
       weight: 1.0
       required: true
       routing_weights: {video: 0.0, audio: 1.0}
     desync:
-      path: pkg://verl_omni.utils.reward_score.desync_native
+      path: pkg://verl_omni.utils.reward_score.desync
       name: compute_score
       model: desync
       weight: 1.0
