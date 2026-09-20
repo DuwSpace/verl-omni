@@ -292,6 +292,35 @@ class TestDiffusionModelConfigPolicyAdapters:
                 omega_conf_to_dataclass(cfg)
 
 
+def test_ltx2_omninft_example_config_composes_into_global_training_config():
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    import verl_omni
+
+    repo_root = Path(verl_omni.__file__).resolve().parent.parent
+    config_dir = repo_root / "examples/omninft_trainer/ltx2"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(config_name="ltx2_omninft")
+
+    assert "recipe" not in cfg
+    assert cfg.algorithm.trainer_type == "direct_preference"
+    assert cfg.actor_rollout_ref.model.algorithm == "omni_nft"
+    assert cfg.actor_rollout_ref.actor.diffusion_loss.loss_mode == "omni_nft"
+    assert cfg.actor_rollout_ref.actor.optim.lr == pytest.approx(3.0e-5)
+    assert cfg.actor_rollout_ref.actor.ppo_mini_batch_size == 32
+    assert cfg.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu == 8
+    assert cfg.actor_rollout_ref.rollout.pipeline.video_cfg_scale == pytest.approx(1.5)
+    assert cfg.actor_rollout_ref.rollout.pipeline.height == 256
+    assert cfg.actor_rollout_ref.rollout.pipeline.width == 384
+    assert cfg.actor_rollout_ref.rollout.val_kwargs.pipeline.height == 256
+    assert cfg.actor_rollout_ref.rollout.val_kwargs.pipeline.width == 384
+    assert cfg.actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps == 40
+    assert cfg.reward.aggregation == "preserve_components"
+    assert cfg.reward.reward_functions.hpsv3.routing_weights.video == pytest.approx(1.5)
+
+
 # ---------------------------------------------------------------------------
 # FSDPDiffusionActorConfig (instantiation via Hydra / omega_conf)
 # ---------------------------------------------------------------------------
