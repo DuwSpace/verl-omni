@@ -27,6 +27,14 @@ from .visual import VisualRewardManager, _validate_visual_response
 logger = logging.getLogger(__name__)
 
 
+def _validate_reward_aggregation(config) -> str:
+    """Return the configured aggregation mode or fail closed on a typo."""
+    aggregation = config.reward.get("aggregation", "weighted_sum")
+    if aggregation not in {"weighted_sum", "preserve_components"}:
+        raise ValueError(f"reward.aggregation must be 'weighted_sum' or 'preserve_components', got {aggregation!r}.")
+    return aggregation
+
+
 def _multi_reward_placeholder(**kwargs):
     """Sentinel function used as the upstream custom_reward_function placeholder.
 
@@ -68,12 +76,13 @@ class MultiVisualRewardManager(VisualRewardManager):
 
         reward_functions_cfg = config.reward.reward_functions
         reward_models_cfg = get_reward_model_entries(config)
+        aggregation = _validate_reward_aggregation(config)
         if not reward_functions_cfg:
             raise ValueError("MultiVisualRewardManager requires non-empty reward.reward_functions config")
 
         self._sub_rewards = []
         total_weight = 0.0
-        _reserved_keys = {"path", "name", "weight", "required", "model"}
+        _reserved_keys = {"path", "name", "weight", "required", "model", "routing_weights"}
         for key, entry in reward_functions_cfg.items():
             model_name = resolve_reward_model_name(key, entry, reward_models_cfg)
             path = entry.get("path")
@@ -95,6 +104,8 @@ class MultiVisualRewardManager(VisualRewardManager):
                 required = required_value
             else:
                 raise TypeError(f"required must be a boolean, got {type(required_value).__name__}")
+            if aggregation == "preserve_components" and (not required or weight != 1.0):
+                raise ValueError("Component rewards require required=true and weight=1.0; use routing_weights instead.")
             total_weight += weight
 
             # Collect non-manager fields to pass to compute_score.
@@ -184,6 +195,10 @@ class MultiVisualRewardManager(VisualRewardManager):
 
             # Merge per-reward extra config fields into kwargs
             sub_kwargs = {**all_kwargs, **extra_args}
+            # Multimodal scorers may explicitly request the complete single sample.
+            # Do not change kwargs received by existing **kwargs-only scorers.
+            if sig is not None and "batch" in sig.parameters:
+                sub_kwargs["batch"] = data
             filtered_kwargs = _filter_kwargs(sub_kwargs, sig) if sig is not None else {}
 
             if model_name is not None:
