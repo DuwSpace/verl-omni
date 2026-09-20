@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config import OmniNFTLossConfig
+from .config import LTXDiffusionPipelineConfig, OmniNFTLossConfig
+from .diffusers_training_adapter import LTX23OmniNFT
+from .vllm_omni_rollout_adapter import LTX23OmniNFTPipeline
 
-__all__ = ["OmniNFTLossConfig"]
+__all__ = [
+    "LTXDiffusionPipelineConfig",
+    "LTX23OmniNFT",
+    "LTX23OmniNFTPipeline",
+    "OmniNFTLossConfig",
+]

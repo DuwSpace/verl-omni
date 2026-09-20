@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OmniNFT objective configuration."""
+"""LTX-2.3 OmniNFT-specific actor and pipeline configuration."""
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 from verl_omni.workers.config.diffusion.actor import DiffusionLossConfig
+from verl_omni.workers.config.diffusion.rollout import DiffusionPipelineConfig
 
 
 @dataclass
@@ -42,4 +44,16 @@ class OmniNFTLossConfig(DiffusionLossConfig):
             raise ValueError("At least one of video_weight or audio_weight must be positive.")
 
 
-__all__ = ["OmniNFTLossConfig"]
+@dataclass
+class LTXDiffusionPipelineConfig(DiffusionPipelineConfig):
+    """LTX guidance overrides for training and vLLM-Omni rollout."""
+
+    video_cfg_scale: Optional[float] = None
+    audio_cfg_scale: Optional[float] = None
+    video_modality_scale: Optional[float] = None
+    audio_modality_scale: Optional[float] = None
+    video_rescale_scale: Optional[float] = None
+    audio_rescale_scale: Optional[float] = None
+
+
+__all__ = ["LTXDiffusionPipelineConfig", "OmniNFTLossConfig"]
