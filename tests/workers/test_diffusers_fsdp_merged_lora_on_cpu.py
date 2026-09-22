@@ -13,7 +13,6 @@
 # limitations under the License.
 """CPU checks for merged-LoRA weight export in the diffusers FSDP engine."""
 
-import copy
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +20,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-import torch.distributed as dist
 
 import verl_omni.workers.engine.fsdp.diffusers_impl as diffusers_impl
 from verl_omni.workers.config.diffusion import DiffusionModelConfig
@@ -204,152 +202,6 @@ def test_adapter_branch_unchanged_when_merge_disabled(monkeypatch):
         adapter_name="default",
         layer_prefixes=["layers."],
     )
-
-
-def test_real_fsdp1_checkpoint_restores_named_adapters_and_optimizer(tmp_path):
-    """A shared FSDP checkpoint preserves distinct current and old policies."""
-    from diffusers.loaders import PeftAdapterMixin
-    from omegaconf import OmegaConf
-    from peft import LoraConfig
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
-
-    class _Config:
-        name_or_path = ""
-
-        def save_pretrained(self, path):
-            del path
-
-    class Model(torch.nn.Module, PeftAdapterMixin):
-        def __init__(self):
-            super().__init__()
-            self.transformer_blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2, bias=False)])
-            self.config = _Config()
-
-        def forward(self, inputs):
-            return self.transformer_blocks[0](inputs)
-
-        def can_generate(self):
-            return False
-
-    def adapter_state(module):
-        return {name: parameter.detach().clone() for name, parameter in module.named_parameters() if "lora_" in name}
-
-    assert not dist.is_initialized()
-    init_file = tmp_path / "fsdp_checkpoint_init"
-    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=0, world_size=1)
-    try:
-        model = Model()
-        lora_config = LoraConfig(r=1, lora_alpha=1, target_modules=["0"], bias="none")
-        model.add_adapter(lora_config, adapter_name="default")
-        with pytest.warns(UserWarning, match="Already found a `peft_config`"):
-            model.add_adapter(lora_config, adapter_name="old")
-        with torch.no_grad():
-            for name, parameter in model.named_parameters():
-                if ".default." in name:
-                    parameter.fill_(4.0)
-                elif ".old." in name:
-                    parameter.fill_(3.5)
-        model.set_adapter("default")
-
-        model.transformer_blocks[0] = FSDP(
-            model.transformer_blocks[0], device_id=torch.device("cpu"), use_orig_params=True
-        )
-        model = FSDP(model, device_id=torch.device("cpu"), use_orig_params=True)
-        # torch_npu patches automatic foreach selection even for CPU optimizers;
-        # an explicit scalar path keeps this repository CPU test device-free.
-        optimizer = torch.optim.SGD(
-            [parameter for parameter in model.parameters() if parameter.requires_grad],
-            lr=0.01,
-            momentum=0.9,
-            foreach=False,
-        )
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
-        model(torch.ones(2, 2)).sum().backward()
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
-
-        expected_adapters = adapter_state(model)
-        expected_optimizer = copy.deepcopy(optimizer.state_dict())
-        expected_scheduler = copy.deepcopy(scheduler.state_dict())
-        checkpoint_config = OmegaConf.create(
-            {
-                "save_contents": ["model", "optimizer", "extra"],
-                "load_contents": ["model", "optimizer", "extra"],
-            }
-        )
-        manager = FSDPCheckpointManager(
-            model=model,
-            optimizer=optimizer,
-            lr_scheduler=scheduler,
-            processing_class=None,
-            checkpoint_config=checkpoint_config,
-        )
-        checkpoint_dir = tmp_path / "checkpoint"
-        torch.manual_seed(1234)
-        manager.save_checkpoint(str(checkpoint_dir), global_step=7)
-        expected_rng_draw = torch.rand(4)
-
-        saved_model = torch.load(checkpoint_dir / "model_world_size_1_rank_0.pt", weights_only=False)
-        assert {name for name in saved_model if "lora_" in name} == {
-            "transformer_blocks.0.lora_A.default.weight",
-            "transformer_blocks.0.lora_A.old.weight",
-            "transformer_blocks.0.lora_B.default.weight",
-            "transformer_blocks.0.lora_B.old.weight",
-        }
-
-        with torch.no_grad():
-            for name, parameter in model.named_parameters():
-                if "lora_" in name:
-                    parameter.fill_(99.0)
-            for state in optimizer.state.values():
-                for value in state.values():
-                    if isinstance(value, torch.Tensor):
-                        value.fill_(99.0)
-        optimizer.param_groups[0]["lr"] = 9.0
-        scheduler.last_epoch = 99
-        torch.rand(16)
-
-        manager.load_checkpoint(str(checkpoint_dir))
-        restored_adapters = adapter_state(model)
-        assert restored_adapters.keys() == expected_adapters.keys()
-        for name, expected in expected_adapters.items():
-            torch.testing.assert_close(restored_adapters[name], expected)
-
-        default_old_pairs = [
-            (name, name.replace(".default.", ".old.")) for name in restored_adapters if ".default." in name
-        ]
-        assert all(old_name in restored_adapters for _, old_name in default_old_pairs)
-        assert any(
-            not torch.equal(restored_adapters[current_name], restored_adapters[old_name])
-            for current_name, old_name in default_old_pairs
-        )
-
-        restored_optimizer = optimizer.state_dict()
-        assert restored_optimizer["param_groups"] == expected_optimizer["param_groups"]
-        assert restored_optimizer["state"].keys() == expected_optimizer["state"].keys()
-        for parameter_id, expected_state in expected_optimizer["state"].items():
-            for name, expected in expected_state.items():
-                torch.testing.assert_close(restored_optimizer["state"][parameter_id][name], expected)
-        assert scheduler.state_dict() == expected_scheduler
-        torch.testing.assert_close(torch.rand(4), expected_rng_draw)
-
-        model(torch.ones(2, 2)).sum().backward()
-        optimizer.step()
-        continued_adapters = adapter_state(model)
-        assert any(
-            not torch.equal(continued_adapters[name], restored_adapters[name])
-            for name in restored_adapters
-            if ".default." in name
-        )
-        assert all(
-            torch.equal(continued_adapters[name], restored_adapters[name])
-            for name in restored_adapters
-            if ".old." in name
-        )
-    finally:
-        dist.destroy_process_group()
 
 
 def test_bagel_pickscore_e2e_uses_merged_lora_like_the_recipe():

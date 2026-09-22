@@ -19,9 +19,9 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from verl_omni.pipelines.ltx2_omni_nft.config import LTXDiffusionPipelineConfig
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
 from verl_omni.workers.config import DiffusionModelConfig
-from verl_omni.pipelines.ltx2_omni_nft.config import LTXDiffusionPipelineConfig
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 

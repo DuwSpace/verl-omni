@@ -1520,9 +1520,13 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
 
         return gradient_checkpointing_func
 
-    @staticmethod
-    def _validate_omni_nft_fsdp2_config(engine_config: FSDPEngineConfig) -> None:
-        """Require FSDP2 without sequence parallelism for OmniNFT."""
+    def __init__(
+        self,
+        model_config: DiffusionModelConfig,
+        engine_config: FSDPEngineConfig,
+        optimizer_config: FSDPOptimizerConfig,
+        checkpoint_config: CheckpointConfig,
+    ):
         if engine_config.strategy != "fsdp2":
             raise NotImplementedError(
                 f"OmniNFT currently supports only actor.strategy=fsdp2, got {engine_config.strategy!r}."
@@ -1532,15 +1536,6 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
                 "OmniNFT FSDP2 does not implement Ulysses/context parallelism yet; "
                 "set actor.fsdp_config.ulysses_sequence_parallel_size=1."
             )
-
-    def __init__(
-        self,
-        model_config: DiffusionModelConfig,
-        engine_config: FSDPEngineConfig,
-        optimizer_config: FSDPOptimizerConfig,
-        checkpoint_config: CheckpointConfig,
-    ):
-        self._validate_omni_nft_fsdp2_config(engine_config)
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
     def _build_module(self):
@@ -1576,14 +1571,12 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         video_x0 = micro_batch["video_latents_clean"]
         audio_x0 = micro_batch["audio_latents_clean"]
         timestep = micro_batch["train_timesteps"][:, step]
-        t = timestep.float() / 1000.0
-        video_t = t.view(-1, *([1] * (video_x0.ndim - 1)))
-        audio_t = t.view(-1, *([1] * (audio_x0.ndim - 1)))
+        t = (timestep.float() / 1000.0).view(-1, 1, 1)
 
         video_noise = self._select_forward_noise(micro_batch, "video_forward_noise", video_x0, step)
         audio_noise = self._select_forward_noise(micro_batch, "audio_forward_noise", audio_x0, step)
-        video_xt = (1.0 - video_t) * video_x0 + video_t * video_noise
-        audio_xt = (1.0 - audio_t) * audio_x0 + audio_t * audio_noise
+        video_xt = (1.0 - t) * video_x0 + t * video_noise
+        audio_xt = (1.0 - t) * audio_x0 + t * audio_noise
 
         prompt_embeds = micro_batch["prompt_embeds"]
         prompt_embeds_mask = micro_batch["prompt_embeds_mask"]
@@ -1608,18 +1601,11 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
             micro_batch=micro_batch,
             step=step,
         )
-        return model_inputs, negative_model_inputs, (video_x0, audio_x0), (video_xt, audio_xt), (video_t, audio_t)
+        return model_inputs, negative_model_inputs, (video_x0, audio_x0), (video_xt, audio_xt), (t, t)
 
     @staticmethod
     def prepare_model_outputs(output, micro_batch: TensorDict) -> dict[str, torch.Tensor]:
-        del micro_batch
         old_prediction, current_prediction, ref_prediction, x0, xt, t_expanded = output
-        predictions = (old_prediction, current_prediction, ref_prediction)
-        if not all(isinstance(value, tuple) and len(value) == 2 for value in predictions):
-            raise TypeError("LTX-2.3 OmniNFT expects (video, audio) predictions from every policy forward.")
-        contexts = (x0, xt, t_expanded)
-        if not all(isinstance(value, tuple) and len(value) == 2 for value in contexts):
-            raise TypeError("LTX-2.3 OmniNFT expects paired video/audio forward-process context.")
         video_old, audio_old = old_prediction
         video_current, audio_current = current_prediction
         video_ref, audio_ref = ref_prediction
@@ -1643,24 +1629,19 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
         """Run paired video/audio NFT forwards without changing the shared NFT engine."""
-        from torch.utils._pytree import tree_map
-
         model_inputs, negative_model_inputs, x0, xt, t_expanded = self.prepare_model_inputs(
             micro_batch=micro_batch, step=step
         )
 
-        def detach_tensors(value):
-            return value.detach() if isinstance(value, torch.Tensor) else value
-
         with self.use_adapter("old"), torch.no_grad():
-            old_prediction = tree_map(
-                detach_tensors,
-                forward(
+            old_prediction = tuple(
+                prediction.detach()
+                for prediction in forward(
                     module=self.module,
                     model_config=self.model_config,
                     model_inputs=model_inputs,
                     negative_model_inputs=negative_model_inputs,
-                ),
+                )
             )
 
         current_prediction = forward(
@@ -1671,14 +1652,14 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         )
 
         with torch.no_grad(), self.disable_adapter():
-            ref_prediction = tree_map(
-                detach_tensors,
-                forward(
+            ref_prediction = tuple(
+                prediction.detach()
+                for prediction in forward(
                     module=self.module,
                     model_config=self.model_config,
                     model_inputs=model_inputs,
                     negative_model_inputs=negative_model_inputs,
-                ),
+                )
             )
         self._set_adapter("default")
 

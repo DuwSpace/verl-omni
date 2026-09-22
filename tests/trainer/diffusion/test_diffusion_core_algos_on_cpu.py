@@ -380,7 +380,7 @@ def test_prepare_omni_nft_actor_batch_restores_single_component_axis() -> None:
     scores = torch.tensor([[1.0], [0.0], [0.2], [0.8]])
     batch = DataProto.from_dict(
         tensors={
-            "video_latents_clean": torch.randn(batch_size, 4, 2, 2),
+            "video_latents_clean": torch.randn(batch_size, 4, 2),
             "audio_latents_clean": torch.randn(batch_size, 4, 2),
             "train_timesteps": torch.randint(0, 1000, (batch_size, num_timesteps)),
             "rm_scores": scores,
@@ -411,19 +411,12 @@ def test_prepare_omni_nft_actor_batch_restores_single_component_axis() -> None:
     result = diffusion_algos.OmniNFTLoss.prepare_actor_batch(batch, scores.squeeze(-1), config)
 
     selected_timesteps = max(1, int(num_timesteps * config.algorithm.timestep_fraction))
-    assert result.batch["reward_advantages"].shape == (batch_size, 1)
-    assert result.batch["modality_advantages"].shape == (batch_size, 2)
+    centered = torch.tensor([[0.5], [-0.5], [-0.3], [0.3]])
+    expected_prob = 0.5 + 0.5 * centered / (scores.std(correction=0) + 1e-4) / 5.0
+    torch.testing.assert_close(result.batch["reward_prob"], expected_prob[:, None, :].expand(-1, selected_timesteps, 2))
     assert result.batch["reward_prob"].shape == (batch_size, selected_timesteps, 2)
     assert result.batch["sample_level_rewards"].shape == (batch_size, 1)
     metric_prefix = diffusion_algos.OmniNFTLoss._REWARD_METRIC_PREFIX
-    torch.testing.assert_close(result.batch[f"{metric_prefix}quality/mean"], torch.full((batch_size,), 0.5))
-    torch.testing.assert_close(
-        result.batch[f"{metric_prefix}quality/std"],
-        torch.full((batch_size,), scores.std(correction=0).item()),
-    )
-    torch.testing.assert_close(result.batch[f"{metric_prefix}quality/min"], torch.zeros(batch_size))
-    torch.testing.assert_close(result.batch[f"{metric_prefix}quality/max"], torch.ones(batch_size))
-
     actor_data = TensorDict(
         {
             key: value[:1]

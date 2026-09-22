@@ -10,8 +10,8 @@ reward-model lifecycle. OmniNFT adds the dual-modal direct-preference loss and
 routes independent reward components to its video and audio branches.
 
 The configuration uses FSDP2, sequence-parallel size one, and four TP=4
-rollout replicas. Each replica serves up to two concurrent samples, for 0.5
-concurrent samples per NPU, with rollout CPU offload disabled.
+rollout replicas. Each replica serves one sample at a time, with rollout CPU
+offload disabled. The recipe sets `actor_rollout_ref.rollout.max_num_seqs=1`.
 
 ## Paper feature coverage
 

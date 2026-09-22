@@ -98,6 +98,7 @@ actor_rollout_ref:
       wrap_policy:
         transformer_layer_cls_to_wrap: [LTX2VideoTransformerBlock]
   rollout:
+    max_num_seqs: 1
     name: vllm_omni
     rollout_attn_backend: TORCH_SDPA
     free_cache_engine: true
