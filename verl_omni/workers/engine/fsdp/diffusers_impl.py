@@ -1490,48 +1490,48 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
         return loss, output
 
 
-def _fsdp2_gradient_checkpointing_with_cast_func(param_dtype: Optional[torch.dtype]) -> Callable:
-    """Build a non-reentrant checkpoint wrapper using the FSDP parameter dtype."""
-    from torch.utils._pytree import tree_map
-    from torch.utils.checkpoint import checkpoint
-
-    def cast_fp_tensor(value):
-        if (
-            param_dtype is None
-            or not isinstance(value, torch.Tensor)
-            or not torch.is_floating_point(value)
-            or value.dtype == param_dtype
-        ):
-            return value
-        return value.to(param_dtype)
-
-    def gradient_checkpointing_func(module, *args, **kwargs):
-        def checkpointed_forward(*inner_args, **inner_kwargs):
-            cast_args = tree_map(cast_fp_tensor, inner_args)
-            cast_kwargs = tree_map(cast_fp_tensor, inner_kwargs)
-            return module.__call__(*cast_args, **cast_kwargs)
-
-        return checkpoint(checkpointed_forward, *args, use_reentrant=False, **kwargs)
-
-    return gradient_checkpointing_func
-
-
-def _validate_omni_nft_fsdp2_config(engine_config: FSDPEngineConfig) -> None:
-    """Require FSDP2 without sequence parallelism for OmniNFT."""
-    if engine_config.strategy != "fsdp2":
-        raise NotImplementedError(
-            f"OmniNFT currently supports only actor.strategy=fsdp2, got {engine_config.strategy!r}."
-        )
-    if engine_config.ulysses_sequence_parallel_size != 1:
-        raise NotImplementedError(
-            "OmniNFT FSDP2 does not implement Ulysses/context parallelism yet; "
-            "set actor.fsdp_config.ulysses_sequence_parallel_size=1."
-        )
-
-
 @EngineRegistry.register(model_type="omni_nft_model", backend=["fsdp2"], device=[device_name])
 class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
     """FSDP2 actor engine for joint LTX video/audio DiffusionNFT updates."""
+
+    @staticmethod
+    def _fsdp2_gradient_checkpointing_with_cast_func(param_dtype: Optional[torch.dtype]) -> Callable:
+        """Build a non-reentrant checkpoint wrapper using the FSDP parameter dtype."""
+        from torch.utils._pytree import tree_map
+        from torch.utils.checkpoint import checkpoint
+
+        def cast_fp_tensor(value):
+            if (
+                param_dtype is None
+                or not isinstance(value, torch.Tensor)
+                or not torch.is_floating_point(value)
+                or value.dtype == param_dtype
+            ):
+                return value
+            return value.to(param_dtype)
+
+        def gradient_checkpointing_func(module, *args, **kwargs):
+            def checkpointed_forward(*inner_args, **inner_kwargs):
+                cast_args = tree_map(cast_fp_tensor, inner_args)
+                cast_kwargs = tree_map(cast_fp_tensor, inner_kwargs)
+                return module.__call__(*cast_args, **cast_kwargs)
+
+            return checkpoint(checkpointed_forward, *args, use_reentrant=False, **kwargs)
+
+        return gradient_checkpointing_func
+
+    @staticmethod
+    def _validate_omni_nft_fsdp2_config(engine_config: FSDPEngineConfig) -> None:
+        """Require FSDP2 without sequence parallelism for OmniNFT."""
+        if engine_config.strategy != "fsdp2":
+            raise NotImplementedError(
+                f"OmniNFT currently supports only actor.strategy=fsdp2, got {engine_config.strategy!r}."
+            )
+        if engine_config.ulysses_sequence_parallel_size != 1:
+            raise NotImplementedError(
+                "OmniNFT FSDP2 does not implement Ulysses/context parallelism yet; "
+                "set actor.fsdp_config.ulysses_sequence_parallel_size=1."
+            )
 
     def __init__(
         self,
@@ -1540,7 +1540,7 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         optimizer_config: FSDPOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
-        _validate_omni_nft_fsdp2_config(engine_config)
+        self._validate_omni_nft_fsdp2_config(engine_config)
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
     def _build_module(self):
@@ -1562,7 +1562,7 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         if keep_in_fp32 and DiffusionModelBase.get_class(self.model_config).preserve_fp32_modules():
             param_dtype = None
         module.enable_gradient_checkpointing(
-            gradient_checkpointing_func=_fsdp2_gradient_checkpointing_with_cast_func(param_dtype)
+            gradient_checkpointing_func=self._fsdp2_gradient_checkpointing_with_cast_func(param_dtype)
         )
 
     @staticmethod
