@@ -26,8 +26,6 @@ from verl_omni.pipelines.ltx2_flow_grpo.common import apply_x0_cfg, set_ltx23_ti
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.workers.config import DiffusionModelConfig
 
-from .prompt_utils import shared_ltx_int
-
 __all__ = ["LTX23OmniNFT"]
 
 
@@ -73,51 +71,34 @@ class LTX23OmniNFT(DiffusionModelBase):
         audio = audio if audio is not None else common
         return float(video or 1.0), float(audio or 1.0)
 
-    @staticmethod
-    def _build_joint_model_inputs(
-        *,
+    @classmethod
+    def prepare_model_inputs(
+        cls,
+        module: ModelMixin,
         model_config: DiffusionModelConfig,
-        video_latents: torch.Tensor,
-        audio_latents: torch.Tensor,
-        timestep: torch.Tensor,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
         prompt_embeds: torch.Tensor,
         prompt_embeds_mask: torch.Tensor,
         negative_prompt_embeds: Optional[torch.Tensor],
         negative_prompt_embeds_mask: Optional[torch.Tensor],
         micro_batch: TensorDict,
-        video_guidance_scale: float,
-        audio_guidance_scale: float,
+        step: int,
     ) -> tuple[dict, Optional[dict]]:
-        """Build positive and optional negative joint-transformer kwargs.
+        """Split packed noised tokens and build positive/optional CFG transformer inputs.
 
-        Args:
-            model_config: Pixel/frame geometry and frame rate for the sample.
-            video_latents: Noised video tokens, ``[B, S_video, D]``.
-            audio_latents: Noised audio tokens, ``[B, S_audio, D]``.
-            timestep: Shared model-scale time, ``[B]``, used as both
-                ``timestep`` and ``sigma`` without division by 1000.
-            prompt_embeds: Video connector embeddings for positive text.
-            prompt_embeds_mask: Positive text mask shared by both modalities.
-            negative_prompt_embeds: Video connector embeddings for negative text.
-            negative_prompt_embeds_mask: Negative mask shared by both modalities.
-            micro_batch: Supplies ``audio_prompt_embeds`` and, for CFG,
-                ``negative_audio_prompt_embeds`` from rollout.
-            video_guidance_scale: Enable video CFG when greater than one.
-            audio_guidance_scale: Enable audio CFG when greater than one.
-
-        Returns:
-            Positive kwargs and negative kwargs, or ``None`` for the latter
-            when neither modality uses CFG. Both share latent tensors and time.
-
-        Raises:
-            ValueError: CFG needs missing negative video embeddings or mask.
-            KeyError: Required audio connector embeddings are missing.
+        Both modalities use the supplied model-scale timesteps. The clean video
+        tensor supplies the split position for the dense actor micro-batch.
         """
+        video_seq_len = micro_batch["video_latents_clean"].shape[1]
+        video_latents = latents[:, :video_seq_len]
+        audio_latents = latents[:, video_seq_len:]
+        video_guidance_scale, audio_guidance_scale = cls._guidance_scales(model_config)
         common = {
             "hidden_states": video_latents,
             "audio_hidden_states": audio_latents,
-            "timestep": timestep,
-            "sigma": timestep,
+            "timestep": timesteps,
+            "sigma": timesteps,
             "num_frames": (model_config.pipeline.num_frames - 1) // 8 + 1,
             "height": model_config.pipeline.height // 32,
             "width": model_config.pipeline.width // 32,
@@ -136,8 +117,6 @@ class LTX23OmniNFT(DiffusionModelBase):
             return model_inputs, None
         if negative_prompt_embeds is None or negative_prompt_embeds_mask is None:
             raise ValueError("LTX-2.3 OmniNFT CFG requires negative prompt embeddings and attention masks.")
-        if "negative_audio_prompt_embeds" not in micro_batch:
-            raise KeyError("LTX-2.3 OmniNFT CFG requires `negative_audio_prompt_embeds` from rollout.")
         negative_model_inputs = {
             **common,
             "encoder_hidden_states": negative_prompt_embeds,
@@ -148,60 +127,6 @@ class LTX23OmniNFT(DiffusionModelBase):
         return model_inputs, negative_model_inputs
 
     @classmethod
-    def prepare_model_inputs(
-        cls,
-        module: ModelMixin,
-        model_config: DiffusionModelConfig,
-        latents: torch.Tensor,
-        timesteps: torch.Tensor,
-        prompt_embeds: torch.Tensor,
-        prompt_embeds_mask: torch.Tensor,
-        negative_prompt_embeds: Optional[torch.Tensor],
-        negative_prompt_embeds_mask: Optional[torch.Tensor],
-        micro_batch: TensorDict,
-        step: int,
-    ) -> tuple[dict, Optional[dict]]:
-        """Split packed noised tokens and prepare a joint LTX forward.
-
-        ``latents`` is ``[B, S_video + S_audio, D]``, with video first and
-        matching feature widths. ``micro_batch.video_seq_len`` must contain
-        one shared split position; ``audio_prompt_embeds`` supplies the audio
-        connector output. Positive and optional negative video embeddings
-        and masks are passed separately. ``timesteps`` contains model-scale
-        values shared by both modalities, not normalized times in [0, 1].
-
-        Returns positive/optional negative kwargs from
-        ``_build_joint_model_inputs`` without modifying the batch. ``module``
-        and ``step`` do not affect this conversion. Missing required fields
-        raise ``KeyError``; an empty or inconsistent video_seq_len field raises
-        ``ValueError``. Split bounds are not validated here.
-        """
-        del step
-        required = ["audio_prompt_embeds", "video_seq_len"]
-        missing = [key for key in required if key not in micro_batch]
-        if missing:
-            raise KeyError(f"LTX-2.3 OmniNFT rollout is missing required fields: {missing}.")
-
-        video_seq_len = shared_ltx_int(micro_batch["video_seq_len"], "video_seq_len")
-        video_latents = latents[:, :video_seq_len]
-        audio_latents = latents[:, video_seq_len:]
-
-        video_guidance_scale, audio_guidance_scale = cls._guidance_scales(model_config)
-        return cls._build_joint_model_inputs(
-            model_config=model_config,
-            video_latents=video_latents,
-            audio_latents=audio_latents,
-            timestep=timesteps,
-            prompt_embeds=prompt_embeds,
-            prompt_embeds_mask=prompt_embeds_mask,
-            negative_prompt_embeds=negative_prompt_embeds,
-            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
-            micro_batch=micro_batch,
-            video_guidance_scale=video_guidance_scale,
-            audio_guidance_scale=audio_guidance_scale,
-        )
-
-    @classmethod
     def forward(
         cls,
         module: ModelMixin,
@@ -209,18 +134,7 @@ class LTX23OmniNFT(DiffusionModelBase):
         model_inputs: dict[str, torch.Tensor],
         negative_model_inputs: Optional[dict[str, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Predict FP32 video/audio velocities, optionally with per-modality CFG.
-
-        Returns ``(video_prediction, audio_prediction)`` with the respective
-        latent shapes from ``model_inputs``. Either CFG scale above one
-        requires ``negative_model_inputs`` and a second joint forward; only
-        the enabled modalities receive x0-space guidance. For that conversion,
-        model-scale ``timestep`` is divided by 1000 to obtain normalized time.
-        Gradient tracking follows the caller's context; outputs are not detached.
-
-        Raises:
-            ValueError: CFG is enabled without negative model inputs.
-        """
+        """Predict paired FP32 velocities with optional modality CFG, preserving gradients."""
         video_prediction, audio_prediction = cls._predict(module, model_inputs)
 
         video_guidance_scale, audio_guidance_scale = cls._guidance_scales(model_config)
@@ -266,5 +180,4 @@ class LTX23OmniNFT(DiffusionModelBase):
         step: int,
     ):
         """Reject the reverse-transition API, which is not part of OmniNFT."""
-        del module, scheduler, model_config, model_inputs, negative_model_inputs, scheduler_inputs, step
         raise NotImplementedError("LTX-2.3 OmniNFT does not sample reverse transitions or compute their log-probs.")

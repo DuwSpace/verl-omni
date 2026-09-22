@@ -86,10 +86,6 @@ class TestDiffusionLossConfig:
         cfg = DiffusionLossConfig(loss_mode="dance_grpo")
         assert cfg.loss_mode == "dance_grpo"
 
-    def test_omni_nft_loss_mode(self):
-        cfg = DiffusionLossConfig(loss_mode="omni_nft")
-        assert cfg.loss_mode == "omni_nft"
-
 
 # ---------------------------------------------------------------------------
 # DiffusionAlgoConfig
@@ -296,6 +292,7 @@ def test_ltx2_omninft_example_config_composes_into_global_training_config():
     from pathlib import Path
 
     from hydra import compose, initialize_config_dir
+    from hydra.utils import instantiate
 
     import verl_omni
 
@@ -308,17 +305,15 @@ def test_ltx2_omninft_example_config_composes_into_global_training_config():
     assert cfg.algorithm.trainer_type == "direct_preference"
     assert cfg.actor_rollout_ref.model.algorithm == "omni_nft"
     assert cfg.actor_rollout_ref.actor.diffusion_loss.loss_mode == "omni_nft"
-    assert cfg.actor_rollout_ref.actor.optim.lr == pytest.approx(3.0e-5)
-    assert cfg.actor_rollout_ref.actor.ppo_mini_batch_size == 32
-    assert cfg.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu == 8
-    assert cfg.actor_rollout_ref.rollout.pipeline.video_cfg_scale == pytest.approx(1.5)
-    assert cfg.actor_rollout_ref.rollout.pipeline.height == 256
-    assert cfg.actor_rollout_ref.rollout.pipeline.width == 384
-    assert cfg.actor_rollout_ref.rollout.val_kwargs.pipeline.height == 256
-    assert cfg.actor_rollout_ref.rollout.val_kwargs.pipeline.width == 384
-    assert cfg.actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps == 40
     assert cfg.reward.aggregation == "preserve_components"
-    assert cfg.reward.reward_functions.hpsv3.routing_weights.video == pytest.approx(1.5)
+    assert cfg.actor_rollout_ref.model.model_type == "omni_nft_model"
+    assert cfg.actor_rollout_ref.rollout.max_num_seqs == 1
+    assert cfg.actor_rollout_ref.rollout.pipeline.output_type == "pt"
+    assert cfg.actor_rollout_ref.rollout.val_kwargs.pipeline.output_type == "pt"
+    loss_config = instantiate(cfg.actor_rollout_ref.actor.diffusion_loss)
+    assert loss_config.loss_mode == "omni_nft"
+    for reward in cfg.reward.reward_functions.values():
+        assert set(reward.routing_weights) == {"video", "audio"}
 
 
 # ---------------------------------------------------------------------------

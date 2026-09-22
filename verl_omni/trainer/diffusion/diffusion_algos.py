@@ -1045,31 +1045,10 @@ class OmniNFTLoss(DiffusionNFTLoss):
         reward_prob: torch.Tensor,
         config: DiffusionActorConfig,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute one modality's preference objective and reference velocity MSE.
+        """Compute NFT policy loss and reference velocity MSE for one modality.
 
-        Args:
-            forward_prediction: Current policy velocity, ``[B, ...]``.
-            old_prediction: Rollout-policy velocity with the same shape; detached here.
-            ref_forward_prediction: Base/reference velocity; detached here.
-            x0: Clean latent target, matching prediction shape.
-            xt: Noised latent at normalized time ``t_expanded``.
-            t_expanded: Time broadcastable to each sample's latent dimensions.
-            reward_prob: Per-sample optimality weight. Any trailing dimensions
-                are flattened and averaged, then cast to x0's device and dtype.
-            config: Supplies beta, adaptive-weight floor, and advantage clip scale.
-
-        Form velocities ``v+ = beta*v + (1-beta)*v_old`` and
-        ``v- = (1+beta)*v_old - beta*v``, then reconstruct ``x0+/- = xt - t*v+/-``.
-        Each branch's squared error is divided by a detached per-sample mean
-        absolute error, computed in FP64 and floored before casting back.
-        Average latent dimensions, mix branches by reward_prob, divide by beta,
-        multiply by adv_clip_max, and average the batch. The reference term is
-        mean squared velocity error over all elements, not KL divergence.
-
-        Returns:
-            Scalar policy loss, scalar reference MSE, and tensor diagnostics.
-            ``ref_kl_loss`` is the legacy metric name for that MSE. Gradients
-            through current predictions follow the caller's grad context.
+        Adaptive weights use detached FP64 mean absolute errors. Only current
+        predictions carry gradients; ``ref_kl_loss`` is the legacy MSE metric name.
         """
         loss_cfg = config.diffusion_loss
         beta = loss_cfg.mix_beta
@@ -1135,18 +1114,9 @@ class OmniNFTLoss(DiffusionNFTLoss):
         audio_reward_prob: torch.Tensor,
         config: DiffusionActorConfig,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Combine video/audio preference losses and reference velocity penalties.
+        """Combine modality policy losses and reference MSEs with separate coefficients.
 
-        Each modality supplies matching ``[B, ...]`` current/old/reference
-        velocities and clean/noised latents, broadcastable normalized times,
-        and per-sample reward probabilities. See ``_compute_modality_loss``
-        for branch construction and reductions. Each reference MSE is scaled
-        by its modality's ``*_ref_kl_coef``; the two resulting branch losses
-        are weighted by ``video_weight``/``audio_weight`` and divided by their
-        sum floored at 1e-8. These loss weights differ from reward routing weights.
-
-        Returns the differentiable scalar total and detached Python scalar
-        metrics, including ``ref_kl_loss`` names that denote velocity MSE.
+        Modality loss weights are independent of reward-routing weights.
         """
         video_policy, video_ref, video_details = cls._compute_modality_loss(
             forward_prediction=video_forward_prediction,
@@ -1244,12 +1214,7 @@ class OmniNFTLoss(DiffusionNFTLoss):
                 }
             )
         for name, value in summaries.items():
-            batch.batch[f"{cls._REWARD_METRIC_PREFIX}{name}"] = torch.full(
-                (scores.shape[0],),
-                value.detach().item(),
-                dtype=torch.float32,
-                device=scores.device,
-            )
+            batch.batch[f"{cls._REWARD_METRIC_PREFIX}{name}"] = value.detach().float().expand(scores.shape[0]).clone()
 
     @staticmethod
     def _compute_component_advantages(
@@ -1260,23 +1225,10 @@ class OmniNFTLoss(DiffusionNFTLoss):
         global_std: bool,
         epsilon: float = 1e-4,
     ) -> torch.Tensor:
-        """Center each reward column by prompt group and optionally scale its spread.
+        """Center each reward component by prompt group and optionally normalize it.
 
-        Args:
-            scores: Finite component scores, ``[B, K]`` with ``K > 0``.
-            uid: Prompt-group keys for B rows, not unique sample row identities.
-            norm_by_std: Divide centered scores by standard deviation plus epsilon.
-            global_std: Use each column's full-batch standard deviation when true;
-                otherwise use its prompt-group standard deviation. Both use
-                population variance (``correction=0``).
-            epsilon: Positive denominator offset.
-
-        Returns:
-            Detached FP32 ``[B, K]`` advantages on the score device, in the
-            original row/column order. Input scores are not modified.
-
-        Raises:
-            ValueError: Shape, UID count, or epsilon is invalid.
+        Use population standard deviation, either per group or across the full
+        batch. Normalize components before routing them to video/audio.
         """
         if scores.ndim != 2:
             raise ValueError(f"OmniNFT reward scores must have shape [B, K], got {tuple(scores.shape)}.")
@@ -1344,29 +1296,10 @@ class OmniNFTLoss(DiffusionNFTLoss):
 
     @classmethod
     def prepare_actor_batch(cls, batch: DataProto, reward_tensor: torch.Tensor, config: Any) -> DataProto:
-        """Populate the actor batch in place and return the same DataProto.
+        """Normalize reward components, route them to modalities, and select timesteps.
 
-        Args:
-            batch: Rollout batch with video/audio clean latents, model-scale
-                ``train_timesteps[B, T]``, finite ``rm_scores[B, K]``, prompt
-                grouping ``uid`` values, and column-ordered ``reward_names``.
-                An optional reward_valid_mask must match scores and be all true.
-            reward_tensor: Extracted reward matrix whose shape must match
-                rm_scores; values used for routing are read from rm_scores.
-            config: Normalization, routing, probability, and timestep settings.
-
-        Center each reward column by prompt uid, optionally standardize using
-        full-batch or group statistics, and apply the ``[K, 2]`` routing matrix.
-        Store reward_advantages ``[B, K]`` and modality_advantages and
-        modality_reward_probs ``[B, 2]`` in video/audio order. Repeat probabilities
-        over selected timesteps as reward_prob ``[B, T_selected, 2]``; the engine
-        selects one step for the loss. Store the modality mean as advantages and
-        returns ``[B, T_selected]`` and the component scores as sample_level_rewards.
-        Group uid is distinct from the sample_uid used for reward row alignment.
-
-        Raises:
-            ValueError: Required fields, reward validity/shape, routing, or
-                normalization/probability configuration are invalid.
+        Store per-step video/audio reward probabilities for the actor, plus
+        reward summaries, advantages, and returns for existing metric consumers.
         """
         if "uid" not in batch.non_tensor_batch:
             raise ValueError("OmniNFT actor batch requires `uid` in non_tensor_batch.")
@@ -1415,10 +1348,6 @@ class OmniNFTLoss(DiffusionNFTLoss):
                 f"got {tuple(routing_matrix.shape)}."
             )
         modality_advantages = reward_advantages @ routing_matrix
-        if actor_cfg.diffusion_loss.adv_clip_max <= 0:
-            raise ValueError(f"OmniNFT adv_clip_max must be positive, got {actor_cfg.diffusion_loss.adv_clip_max}.")
-        if algorithm_cfg.adv_mode not in {"continuous", "positive_only", "negative_only", "one_only", "binary"}:
-            raise ValueError(f"Unsupported OmniNFT adv_mode: {algorithm_cfg.adv_mode!r}.")
         modality_reward_probs = cls._advantage_to_reward_prob(
             modality_advantages,
             adv_clip_max=actor_cfg.diffusion_loss.adv_clip_max,
@@ -1434,9 +1363,6 @@ class OmniNFTLoss(DiffusionNFTLoss):
         summary_advantages = modality_advantages.mean(dim=1, keepdim=True).expand(-1, num_steps)
 
         batch.batch["train_timesteps"] = train_timesteps
-        batch.batch["reward_advantages"] = reward_advantages
-        batch.batch["modality_advantages"] = modality_advantages
-        batch.batch["modality_reward_probs"] = modality_reward_probs
         batch.batch["reward_prob"] = timestep_modality_reward_probs
         batch.batch["advantages"] = summary_advantages
         batch.batch["returns"] = summary_advantages
