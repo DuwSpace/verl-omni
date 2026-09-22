@@ -91,9 +91,9 @@ actor_rollout_ref:
       audio_ref_kl_coef: 1.0e-4
     fsdp_config:
       model_dtype: bfloat16
-      param_offload: false
-      optimizer_offload: false
-      offload_policy: true
+      param_offload: true
+      optimizer_offload: true
+      offload_policy: false
       ulysses_sequence_parallel_size: 1
       wrap_policy:
         transformer_layer_cls_to_wrap: [LTX2VideoTransformerBlock]
