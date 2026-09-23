@@ -158,23 +158,18 @@ In a wide shot with a desaturated, cinematic quality, six soldiers in dark World
 
 ### Reward curves
 
-The curves contain 196 training steps. Training and validation rewards each use
-a five-panel figure. Thin training curves are raw values and bold curves are
-30-step trailing means; validation points are joined by dashed lines. Total
-loss includes raw values and a 10-step trailing mean; gradient norm shows raw
-values. Each reward panel uses its own y-axis scale.
+Training and validation rewards are shown through step 150, with five panels
+per figure. Thin training curves show raw values and bold curves show smoothed
+trends; validation points are joined by dashed lines. Each reward panel uses
+its own y-axis scale.
 
 #### Training
 
-![OmniNFT batch-32 training rewards](assets/omninft_bs32_step196_rewards_train.jpg)
+![OmniNFT batch-32 training rewards](assets/omninft_bs32_rewards_train.jpeg)
 
 #### Validation
 
-![OmniNFT batch-32 validation rewards](assets/omninft_bs32_step196_rewards_validation.jpg)
-
-### Loss and gradient norm
-
-![OmniNFT batch-32 loss curves](assets/omninft_bs32_step196_loss.svg)
+![OmniNFT batch-32 validation rewards](assets/omninft_bs32_rewards_validation.jpeg)
 
 ## Routing
 
