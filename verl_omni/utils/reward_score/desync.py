@@ -20,12 +20,13 @@ import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+from types import MethodType
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
-from .clap import _get_audio
+from .reward_utils import audio_info_from_batch, get_audio, load_torch_state_dict, resample_audio
 
 _TARGET_VIDEO_FPS = 25.0
 _TARGET_AUDIO_RATE = 16_000
@@ -101,9 +102,8 @@ def _import_synchformer(root: Path, module_path: Path):
     """Import one Synchformer source tree under a process-local lock.
 
     Temporary path/symbol changes are restored after import. Imported modules
-    remain cached, and a missing AST ``get_head_mask`` is installed permanently
-    on that source class. Reject an already imported different source path;
-    the path check does not verify source contents.
+    remain cached. Reject an already imported different source path; the path
+    check does not verify source contents.
     """
     module_name = "flow_grpo.audio_video_align.synchformer.synchformer"
     ast_module_name = "flow_grpo.audio_video_align.synchformer.hf_src.modeling_ast"
@@ -113,11 +113,16 @@ def _import_synchformer(root: Path, module_path: Path):
             raise RuntimeError("A different Synchformer source_root is already imported in this process.")
         with _source_import_path(root), _temporary_transformers_ast_import_compat():
             module = existing or importlib.import_module(module_name)
-            ast_module = importlib.import_module(ast_module_name)
-        ast_base = ast_module.ASTPreTrainedModel
-        if not hasattr(ast_base, "get_head_mask"):
-            ast_base.get_head_mask = _legacy_get_head_mask
+            importlib.import_module(ast_module_name)
     return module
+
+
+def _install_ast_head_mask_compat(model) -> None:
+    """Add the removed Transformers method only to this Synchformer instance."""
+    ast_base = sys.modules["flow_grpo.audio_video_align.synchformer.hf_src.modeling_ast"].ASTPreTrainedModel
+    for component in model.modules():
+        if isinstance(component, ast_base) and not hasattr(component, "get_head_mask"):
+            component.get_head_mask = MethodType(_legacy_get_head_mask, component)
 
 
 def _load_components(model_path: str, source_root: str) -> tuple[Any, Any]:
@@ -136,7 +141,8 @@ def _load_components(model_path: str, source_root: str) -> tuple[Any, Any]:
         raise RuntimeError("Imported Synchformer does not belong to the configured source_root.")
 
     model = module.Synchformer()
-    state_dict = _load_torch_state_dict(model_path)
+    _install_ast_head_mask_compat(model)
+    state_dict = load_torch_state_dict(model_path)
     if not isinstance(state_dict, dict) or not all(isinstance(value, torch.Tensor) for value in state_dict.values()):
         raise ValueError("DeSync checkpoint must be a tensor state dict.")
     model.load_state_dict(state_dict, strict=True)
@@ -185,16 +191,8 @@ def _prepare_video(video: torch.Tensor, source_fps: float) -> torch.Tensor:
     return video
 
 
-def _resample_audio(waveform: torch.Tensor, source_rate: int) -> torch.Tensor:
-    if source_rate == _TARGET_AUDIO_RATE:
-        return waveform
-    import torchaudio.functional as audio_functional
-
-    return audio_functional.resample(waveform.unsqueeze(0), source_rate, _TARGET_AUDIO_RATE).squeeze(0)
-
-
 def _prepare_audio(audio: torch.Tensor, source_rate: int) -> torch.Tensor:
-    waveform = _resample_audio(audio.float().mean(dim=0), source_rate)[:_AUDIO_SAMPLES]
+    waveform = resample_audio(audio.float().mean(dim=0), source_rate, _TARGET_AUDIO_RATE)[:_AUDIO_SAMPLES]
     return F.pad(waveform, (0, _AUDIO_SAMPLES - waveform.shape[0]))
 
 
@@ -224,6 +222,8 @@ def _infer_micro_batch(state: "DeSyncModel", video: torch.Tensor, audio: torch.T
 
     audio_segments = audio_segments.to(state.device)
     mel = _pad_mel_time(torch.log(state.mel(audio_segments) + 1e-6))
+    # Match OmniNFT's Synchformer preprocessing:
+    # https://github.com/zghhui/OmniNFT/blob/master/flow_grpo/audio_video_align/av_desync.py
     mel = (mel - (-4.2677393)) / (2 * 4.5689974)
     auditory = state.model.extract_afeats(mel.unsqueeze(2))
 
@@ -257,24 +257,21 @@ async def compute_score(
     21 offset classes and fixed segment preprocessing define this model's score.
     """
     del data_source, ground_truth, kwargs
-    extra_info = dict(extra_info or {})
+    extra_info = audio_info_from_batch(extra_info, batch, scorer="DeSync")
     if batch is not None:
-        if len(batch) != 1:
-            raise ValueError("DeSync scoring requires exactly one sample.")
         item = batch[0]
         if solution_image is None:
             solution_image = item.batch["responses"]
-        for key in ("audio", "audio_sample_rate", "fps"):
-            if key in item.batch:
-                extra_info[key] = item.batch[key]
-            elif key in item.non_tensor_batch:
-                extra_info[key] = item.non_tensor_batch[key]
+        if "fps" in item.batch:
+            extra_info["fps"] = item.batch["fps"]
+        elif "fps" in item.non_tensor_batch:
+            extra_info["fps"] = item.non_tensor_batch["fps"]
     fps = float(extra_info["fps"] if fps is None else fps)
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("DeSync fps must be finite and positive.")
     if solution_image.ndim != 4 or solution_image.shape[1] != 3 or solution_image.dtype != torch.uint8:
         raise ValueError("DeSync requires uint8 RGB video with shape [T,3,H,W].")
-    waveform, source_rate = _get_audio(extra_info)
+    waveform, source_rate = get_audio(extra_info)
     video = _prepare_video(solution_image.detach().cpu(), fps)
     audio = _prepare_audio(waveform.unsqueeze(0), source_rate)
     logits = await reward_model.infer(video.unsqueeze(0), audio.unsqueeze(0))
@@ -307,11 +304,13 @@ class DeSyncModel:
         """Infer prepared video ``[B, 200, 3, 224, 224]`` and audio ``[B, 128000]``.
 
         Return detached CPU offset logits ``[2, B, 21]`` without gradients.
-        Disable the process-wide MHA fastpath for the forward because the
-        Synchformer attention path is unsupported on the target NPU. A module
+        On NPU, disable the process-wide MHA fastpath for the forward because the
+        Synchformer attention path is unsupported there. A module
         lock serializes these calls and ``finally`` restores the previous flag;
         unrelated callers that do not use this lock can observe the temporary flag.
         """
+        if self.device.type != "npu":
+            return _infer_micro_batch(self, video, audio)
         with _MHA_FASTPATH_LOCK:
             fastpath_enabled = torch.backends.mha.get_fastpath_enabled()
             torch.backends.mha.set_fastpath_enabled(False)
@@ -319,12 +318,3 @@ class DeSyncModel:
                 return _infer_micro_batch(self, video, audio)
             finally:
                 torch.backends.mha.set_fastpath_enabled(fastpath_enabled)
-
-
-def _load_torch_state_dict(path: str):
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-    except RuntimeError as exc:
-        if "mmap can only be used with files saved with" not in str(exc):
-            raise
-        return torch.load(path, map_location="cpu", weights_only=True)
