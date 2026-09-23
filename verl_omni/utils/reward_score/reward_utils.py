@@ -63,7 +63,9 @@ def resample_audio(waveform: torch.Tensor, source_rate: int, target_rate: int) -
         return waveform
     import torchaudio.functional as audio_functional
 
-    return audio_functional.resample(waveform.unsqueeze(0), source_rate, target_rate).squeeze(0)
+    return audio_functional.resample(
+        waveform.unsqueeze(0), orig_freq=source_rate, new_freq=target_rate
+    ).squeeze(0)
 
 
 def load_torch_state_dict(path: str):

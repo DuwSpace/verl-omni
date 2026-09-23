@@ -14,7 +14,7 @@
 """CPU tests for CLAP burst batching."""
 
 import asyncio
-import importlib.util
+import importlib
 import sys
 import threading
 from pathlib import Path
@@ -25,12 +25,12 @@ import torch
 
 
 def _load_scorer_module():
-    module_path = Path(__file__).parents[3] / "verl_omni/utils/reward_score/clap.py"
-    spec = importlib.util.spec_from_file_location("clap_reward_under_test", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    # Keep relative scorer imports working without importing the engine registry.
+    package_name = "clap_reward_under_test"
+    package = ModuleType(package_name)
+    package.__path__ = [str(Path(__file__).parents[3] / "verl_omni/utils/reward_score")]
+    sys.modules[package_name] = package
+    return importlib.import_module(f"{package_name}.clap")
 
 
 clap = _load_scorer_module()
