@@ -477,7 +477,7 @@ def _extract_frames(solution_image, frame_interval: int = 1) -> list[Image.Image
         solution_image = solution_image.permute(0, 2, 1, 3, 4)
         solution_image = solution_image.reshape(-1, *solution_image.shape[2:])
 
-    return [_to_pil_hwc(frame) for frame in solution_image]
+    return [_frame_to_pil(torch.as_tensor(frame)) for frame in solution_image]
 
 
 def _score_batch(requests: list[_ScoreRequest]) -> list[dict | Exception]:

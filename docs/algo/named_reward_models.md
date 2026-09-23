@@ -264,7 +264,9 @@ For native CLAP, AudioBox, and DeSync scorers, a single-sample `batch` supplies
 decoded `audio` and `audio_sample_rate` when present; these values override
 `extra_info`. Without `batch`, the scorers read `extra_info`. HPSv3 and
 VideoAlign accept uint8 video frames or finite floating-point frames in
-`[0, 1]`; values outside that range are rejected.
+`[0, 1]`; values outside that range are rejected. HPSv3 applies the same
+conversion and validation to both default interval sampling and explicit
+`num_frames` uniform sampling.
 
 ### Wrap a Transformers model for native mode
 
