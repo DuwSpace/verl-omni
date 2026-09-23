@@ -21,7 +21,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .hpsv3_reward import _Qwen2VLRewardModelBT, _smart_resize
+from .hpsv3_reward import Qwen2VLRewardModelBT, smart_resize
+from .reward_utils import load_torch_state_dict
 
 _SPECIAL_TOKENS = ("<|VQ_reward|>", "<|MQ_reward|>", "<|TA_reward|>")
 _TARGET_FPS = 24.0
@@ -31,6 +32,8 @@ _MAX_FRAMES = 768
 _IMAGE_FACTOR = 28
 _MIN_FRAME_PIXELS = 128 * 28 * 28
 _MAX_FRAME_PIXELS = 200_704
+# VideoReward checkpoint calibration constants:
+# https://huggingface.co/KlingTeam/VideoReward/blob/main/model_config.json
 _VQ_MEAN = 3.6757
 _VQ_STD = 2.2476
 _TA_MEAN = 2.8105
@@ -141,7 +144,7 @@ def _load_components(model_path: str, base_model_path: str) -> tuple[Any, Any]:
     special_token_ids = processor.tokenizer.convert_tokens_to_ids(list(_SPECIAL_TOKENS))
 
     with init_empty_weights():
-        model = _Qwen2VLRewardModelBT(
+        model = Qwen2VLRewardModelBT(
             config,
             output_dim=1,
             reward_token="special",
@@ -163,7 +166,7 @@ def _load_components(model_path: str, base_model_path: str) -> tuple[Any, Any]:
             ),
         )
 
-    state_dict = _load_torch_state_dict(model_path)
+    state_dict = load_torch_state_dict(model_path)
     if not isinstance(state_dict, dict) or not all(isinstance(value, torch.Tensor) for value in state_dict.values()):
         raise ValueError("VideoAlign checkpoint must be a tensor state dict.")
     state_dict = _remap_checkpoint_state_dict(state_dict)
@@ -203,7 +206,7 @@ def _sample_video(video: torch.Tensor, source_fps: float) -> tuple[torch.Tensor,
 
 def _resize_video(video: torch.Tensor) -> torch.Tensor:
     height, width = video.shape[-2:]
-    resized_height, resized_width = _smart_resize(
+    resized_height, resized_width = smart_resize(
         height,
         width,
         factor=_IMAGE_FACTOR,
@@ -334,14 +337,6 @@ class VideoAlignModel:
         with self._infer_lock:
             inputs = _prepare_batch(self, videos, prompts)
             output = self.model(return_dict=True, **inputs)
-            logits = output["logits"] if isinstance(output, dict) else output.logits
+            # Qwen2VLRewardModelBT.forward returns a plain dict, even with return_dict=True.
+            logits = output["logits"]
             return logits.detach().cpu()
-
-
-def _load_torch_state_dict(path: str):
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-    except RuntimeError as exc:
-        if "mmap can only be used with files saved with" not in str(exc):
-            raise
-        return torch.load(path, map_location="cpu", weights_only=True)

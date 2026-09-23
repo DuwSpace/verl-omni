@@ -24,6 +24,8 @@ import torch
 import torch.nn.functional as F
 from verl.utils.device import get_device_name
 
+from .reward_utils import audio_info_from_batch, get_audio, resample_audio
+
 _CLAP_SAMPLE_RATE = 48_000
 _DEFAULT_MODEL = "laion/larger_clap_general"
 _MAX_BATCH_SIZE = 16
@@ -52,24 +54,7 @@ def _get_batching_state() -> _BatchingState:
     return state
 
 
-def _get_audio(extra_info: dict) -> tuple[torch.Tensor, int]:
-    audio = extra_info.get("audio")
-    if audio is None:
-        raise KeyError("CLAP reward requires decoded audio in extra_info['audio'].")
-    audio = torch.as_tensor(audio).detach().float().cpu()
-    while audio.ndim > 2 and audio.shape[0] == 1:
-        audio = audio[0]
-    if audio.ndim == 2:
-        audio = audio.mean(dim=0)
-    elif audio.ndim != 1:
-        raise ValueError(f"Expected audio shape (T,) or (C,T), got {tuple(audio.shape)}.")
-
-    sample_rate = extra_info.get("audio_sample_rate", _CLAP_SAMPLE_RATE)
-    if isinstance(sample_rate, torch.Tensor):
-        sample_rate = sample_rate.item()
-    if sample_rate is None:
-        raise KeyError("CLAP reward requires extra_info['audio_sample_rate'].")
-    return audio, int(sample_rate)
+_get_audio = get_audio  # Keep the existing helper name for external scorer tests.
 
 
 def _load_clap(model_name_or_path: str, device: str):
@@ -90,7 +75,7 @@ def _score_batch(requests) -> list[tuple[float, int] | Exception]:
     for index, (prompt, extra_info, model_name_or_path, device, _) in enumerate(requests):
         try:
             waveform, source_rate = _get_audio(extra_info)
-            waveform = _resample_audio(waveform, source_rate)
+            waveform = resample_audio(waveform, source_rate, _CLAP_SAMPLE_RATE)
             key = (model_name_or_path, device)
             grouped_requests.setdefault(key, []).append(
                 (index, prompt, waveform.numpy().astype(np.float32), source_rate)
@@ -223,28 +208,19 @@ async def compute_score(
     """Score text/audio alignment through the local cache or a managed model.
 
     Defaults preserve the existing cached, batched cosine scorer. A supplied
-    reward_model owns inference and lifecycle. With a single-sample batch, that
-    path reads decoded audio and its sample rate directly; otherwise it uses
-    extra_info. prompt_key selects reward_inputs.text[prompt_key] from batch;
+    reward_model owns inference and lifecycle. A single-sample batch takes
+    precedence over extra_info for decoded audio and its sample rate.
+    prompt_key selects reward_inputs.text[prompt_key] from batch;
     without it, ground_truth supplies the text. Apply scale/offset to cosine,
     then optional lower/upper bounds. No recipe or checkpoint is hardcoded.
     """
     del data_source, solution_image, kwargs
     prompt = ground_truth or ""
-    if batch is not None and (reward_model is not None or prompt_key is not None):
-        if len(batch) != 1:
-            raise ValueError("CLAP scoring requires exactly one sample.")
-        item = batch[0]
-        extra_info = dict(extra_info or {})
-        for key in ("audio", "audio_sample_rate"):
-            if key in item.batch:
-                extra_info[key] = item.batch[key]
-            elif key in item.non_tensor_batch:
-                extra_info[key] = item.non_tensor_batch[key]
+    extra_info = audio_info_from_batch(extra_info, batch, scorer="CLAP")
     if prompt_key is not None:
         if batch is None:
             raise ValueError("CLAP prompt_key requires a single-sample batch.")
-        prompt = item.non_tensor_batch["reward_inputs"]["text"][prompt_key]
+        prompt = batch[0].non_tensor_batch["reward_inputs"]["text"][prompt_key]
 
     if reward_model is None:
         device = device or get_device_name()
@@ -257,7 +233,7 @@ async def compute_score(
         score, source_rate = await future
     else:
         waveform, source_rate = _get_audio(extra_info)
-        waveform = _resample_audio(waveform, source_rate)
+        waveform = resample_audio(waveform, source_rate, _CLAP_SAMPLE_RATE)
         output = await reward_model.infer([waveform.numpy().astype(np.float32, copy=False)], [prompt])
         audio_embeddings = F.normalize(output["audio_embeddings"].float(), p=2, dim=-1)
         text_embeddings = F.normalize(output["text_embeddings"].float(), p=2, dim=-1)
@@ -269,18 +245,6 @@ async def compute_score(
     if score_max is not None:
         score = min(score, score_max)
     return {"score": score, "source_sample_rate": source_rate}
-
-
-def _resample_audio(waveform: torch.Tensor, source_rate: int) -> torch.Tensor:
-    if source_rate == _CLAP_SAMPLE_RATE:
-        return waveform
-    import torchaudio.functional as audio_functional
-
-    return audio_functional.resample(
-        waveform.unsqueeze(0),
-        orig_freq=source_rate,
-        new_freq=_CLAP_SAMPLE_RATE,
-    ).squeeze(0)
 
 
 class CLAPModel:

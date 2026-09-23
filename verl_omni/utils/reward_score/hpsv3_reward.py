@@ -144,7 +144,7 @@ def _floor_by_factor(number, factor):
     return math.floor(number / factor) * factor
 
 
-def _smart_resize(height, width, factor=_IMAGE_FACTOR, min_pixels=_MIN_PIXELS, max_pixels=_MAX_PIXELS):
+def smart_resize(height, width, factor=_IMAGE_FACTOR, min_pixels=_MIN_PIXELS, max_pixels=_MAX_PIXELS):
     if max(height, width) / min(height, width) > _MAX_RATIO:
         raise ValueError(
             f"absolute aspect ratio must be smaller than {_MAX_RATIO}, got {max(height, width) / min(height, width)}"
@@ -190,12 +190,12 @@ def _fetch_image(ele):
     else:
         raise ValueError(f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}")
     if "resized_height" in ele and "resized_width" in ele:
-        resized_height, resized_width = _smart_resize(ele["resized_height"], ele["resized_width"])
+        resized_height, resized_width = smart_resize(ele["resized_height"], ele["resized_width"])
     else:
         width, height = image.size
         min_pixels = ele.get("min_pixels", _MIN_PIXELS)
         max_pixels = ele.get("max_pixels", _MAX_PIXELS)
-        resized_height, resized_width = _smart_resize(height, width, min_pixels=min_pixels, max_pixels=max_pixels)
+        resized_height, resized_width = smart_resize(height, width, min_pixels=min_pixels, max_pixels=max_pixels)
     image = image.resize((resized_width, resized_height), Image.BICUBIC)
     return image
 
@@ -219,7 +219,7 @@ def _process_vision_info(conversations):
     return image_inputs if image_inputs else None
 
 
-class _Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
+class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
     __module__ = Qwen2VLForConditionalGeneration.__module__
 
     def __init__(
@@ -289,7 +289,7 @@ class _Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
             use_cache=use_cache,
             **kwargs,
         )
-        hidden_states = outputs[0]
+        hidden_states = outputs.last_hidden_state
         head_dtype = next(self.rm_head.parameters()).dtype
         logits = self.rm_head(hidden_states.to(head_dtype))  # [B, L, N]
 
@@ -342,7 +342,7 @@ class _HPSv3Inferencer:
         processor.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
         special_token_ids = processor.tokenizer.convert_tokens_to_ids(special_tokens)
 
-        model = _Qwen2VLRewardModelBT(
+        model = Qwen2VLRewardModelBT(
             config,
             output_dim=2,
             reward_token="special",
@@ -719,7 +719,9 @@ def _frame_to_pil(frame: torch.Tensor) -> Image.Image:
     if frame.dtype.is_floating_point:
         if not torch.isfinite(frame).all():
             raise ValueError("HPSv3 video must contain only finite values.")
-        frame = frame.clamp(0, 1).mul(255).round().to(torch.uint8)
+        if frame.min() < 0 or frame.max() > 1:
+            raise ValueError("HPSv3 floating-point video values must be in [0, 1].")
+        frame = frame.mul(255).round().to(torch.uint8)
     elif frame.dtype != torch.uint8:
         raise ValueError("HPSv3 video must be floating-point or uint8.")
     if frame.shape[0] == 1:

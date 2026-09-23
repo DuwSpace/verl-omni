@@ -20,12 +20,14 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .clap import _get_audio
+from .reward_utils import audio_info_from_batch, get_audio, resample_audio
 
 _AUDIOBOX_SAMPLE_RATE = 16_000
 _AUDIOBOX_WINDOW_SAMPLES = 10 * _AUDIOBOX_SAMPLE_RATE
 _AUDIOBOX_HOP_SAMPLES = 10 * _AUDIOBOX_SAMPLE_RATE
 _AXES = ("CE", "CU", "PC", "PQ")
+# OmniNFT combines (CE + CU + PQ - PC) / 40:
+# https://github.com/zghhui/OmniNFT/blob/master/flow_grpo/rewards.py
 
 
 def _load_model(model_path: str) -> Any:
@@ -34,29 +36,16 @@ def _load_model(model_path: str) -> Any:
     return AesMultiOutput.from_pretrained(model_path).eval()
 
 
-def _resample_audio(waveform: torch.Tensor, source_rate: int) -> torch.Tensor:
-    if source_rate == _AUDIOBOX_SAMPLE_RATE:
-        return waveform
-    import torchaudio.functional as audio_functional
-
-    return audio_functional.resample(
-        waveform.unsqueeze(0),
-        orig_freq=source_rate,
-        new_freq=_AUDIOBOX_SAMPLE_RATE,
-    ).squeeze(0)
-
-
-def _make_windows(waveforms: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, list[int], list[float]]:
+def _make_windows(waveforms: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, list[float]]:
     """Expand waveforms into nonoverlapping 10 s windows, padding the last one.
 
-    Return CPU ``[W, 1, 160000]`` audio and bool validity masks, local sample
-    indices, and valid-duration fractions for per-sample weighted averaging.
+    Return CPU ``[W, 1, 160000]`` audio, bool validity masks, and valid-duration
+    fractions for duration-weighted averaging.
     """
     windows = []
     masks = []
-    sample_indices = []
     weights = []
-    for sample_index, waveform in enumerate(waveforms):
+    for waveform in waveforms:
         for start in range(0, waveform.numel(), _AUDIOBOX_HOP_SAMPLES):
             window = waveform[start : start + _AUDIOBOX_WINDOW_SAMPLES]
             valid_length = window.numel()
@@ -66,9 +55,8 @@ def _make_windows(waveforms: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Te
             mask[:valid_length] = True
             windows.append(window.unsqueeze(0))
             masks.append(mask.unsqueeze(0))
-            sample_indices.append(sample_index)
             weights.append(valid_length / _AUDIOBOX_WINDOW_SAMPLES)
-    return torch.stack(windows), torch.stack(masks), sample_indices, weights
+    return torch.stack(windows), torch.stack(masks), weights
 
 
 def _validate_predictions(predictions: Any, window_count: int) -> dict[str, torch.Tensor]:
@@ -119,18 +107,9 @@ async def compute_score(
     target transforms before combining CE/CU/PC/PQ; inference belongs to the executor.
     """
     del data_source, solution_image, ground_truth, kwargs
-    extra_info = dict(extra_info or {})
-    if batch is not None:
-        if len(batch) != 1:
-            raise ValueError("AudioBox scoring requires exactly one sample.")
-        item = batch[0]
-        for key in ("audio", "audio_sample_rate"):
-            if key in item.batch:
-                extra_info[key] = item.batch[key]
-            elif key in item.non_tensor_batch:
-                extra_info[key] = item.non_tensor_batch[key]
-    waveform, source_rate = _get_audio(extra_info)
-    windows, masks, _, weights = _make_windows([_resample_audio(waveform, source_rate)])
+    extra_info = audio_info_from_batch(extra_info, batch, scorer="AudioBox")
+    waveform, source_rate = get_audio(extra_info)
+    windows, masks, weights = _make_windows([resample_audio(waveform, source_rate, _AUDIOBOX_SAMPLE_RATE)])
     output = await reward_model.infer(windows, masks)
     if axis_weights is None:
         axis_weights = {"CE": 1.0, "CU": 1.0, "PC": -1.0, "PQ": 1.0}
