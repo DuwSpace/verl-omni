@@ -18,13 +18,24 @@ import asyncio
 import logging
 import os
 import threading
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from verl.utils.device import get_device_name
 
-from .reward_utils import audio_info_from_batch, get_audio, resample_audio
+if __package__:
+    from .reward_utils import audio_info_from_batch, get_audio, resample_audio
+else:
+    # File-path scorers have no parent package. Load the sibling without
+    # importing verl_omni's engine/pipeline registration side effects.
+    from verl.utils.import_utils import load_module
+
+    _reward_utils = load_module(str(Path(__file__).with_name("reward_utils.py")))
+    audio_info_from_batch = _reward_utils.audio_info_from_batch
+    get_audio = _reward_utils.get_audio
+    resample_audio = _reward_utils.resample_audio
 
 _CLAP_SAMPLE_RATE = 48_000
 _DEFAULT_MODEL = "laion/larger_clap_general"

@@ -14,7 +14,6 @@
 """CPU tests for CLAP burst batching."""
 
 import asyncio
-import importlib
 import sys
 import threading
 from pathlib import Path
@@ -22,18 +21,22 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from verl.utils.import_utils import load_extern_object, load_module
 
 
 def _load_scorer_module():
-    # Keep relative scorer imports working without importing the engine registry.
-    package_name = "clap_reward_under_test"
-    package = ModuleType(package_name)
-    package.__path__ = [str(Path(__file__).parents[3] / "verl_omni/utils/reward_score")]
-    sys.modules[package_name] = package
-    return importlib.import_module(f"{package_name}.clap")
+    module_path = Path(__file__).parents[3] / "verl_omni/utils/reward_score/clap.py"
+    return load_module(str(module_path))
 
 
 clap = _load_scorer_module()
+
+
+@pytest.mark.parametrize("prefix", ["", "file://"])
+def test_clap_loads_through_production_file_entrypoint(prefix):
+    module_path = Path(__file__).parents[3] / "verl_omni/utils/reward_score/clap.py"
+    scorer = load_extern_object(prefix + str(module_path), "compute_score")
+    assert asyncio.iscoroutinefunction(scorer)
 
 
 def test_get_audio_normalizes_batch_and_channels():
