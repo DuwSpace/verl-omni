@@ -110,21 +110,10 @@ class OmniRewardLoopManager(RewardLoopManager):
     def __init__(self, config, rm_resource_pool=None, accelerator_resource_pool=None):
         self._score_lock = asyncio.Lock()
         self._preserve_reward_components = config.reward.get("aggregation") == "preserve_components"
-        if self._preserve_reward_components and not has_reward_models(config):
-            raise ValueError("preserve_components requires named reward.models.")
         if self._preserve_reward_components:
-            loss_mode = config.actor_rollout_ref.actor.diffusion_loss.loss_mode
-            if config.algorithm.get("trainer_type") != "direct_preference" or loss_mode != "omni_nft":
-                raise ValueError(
-                    "reward.aggregation=preserve_components requires the OmniNFT direct-preference trainer; "
-                    "use reward.aggregation=weighted_sum for this trainer."
-                )
-            from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn
-
-            try:
-                get_diffusion_loss_fn(loss_mode)
-            except ValueError as exc:
-                raise ValueError("preserve_components requires the registered OmniNFT loss.") from exc
+            raise ValueError(
+                "reward.aggregation=preserve_components is not supported yet; use reward.aggregation=weighted_sum."
+            )
         self.accelerator_resource_pool = accelerator_resource_pool
         named_reward_manager_cls = None
         if has_reward_models(config):

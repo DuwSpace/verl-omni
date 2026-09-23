@@ -30,7 +30,6 @@ from .reward_utils import audio_info_from_batch, get_audio, load_torch_state_dic
 
 _TARGET_VIDEO_FPS = 25.0
 _TARGET_AUDIO_RATE = 16_000
-_MAX_SECONDS = 8
 _VIDEO_FRAMES = 200
 _AUDIO_SAMPLES = 128_000
 _VIDEO_SEGMENT = 16
