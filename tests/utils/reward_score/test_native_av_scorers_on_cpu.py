@@ -128,6 +128,30 @@ async def test_clap_native_audio_prompt_and_calibration():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("max_batch_size, batch_sizes", [(1, [1, 1, 1]), (2, [2, 1]), (4, [3])])
+async def test_hpsv3_frame_inference_preserves_order_and_batch_limit(max_batch_size, batch_sizes):
+    async def infer(images, prompts):
+        assert prompts == ["video prompt"] * len(images)
+        return torch.tensor([[float(image.getpixel((0, 0))[0]), -1.0] for image in images])
+
+    model = SimpleNamespace(infer=AsyncMock(side_effect=infer))
+    images = [hpsv3_reward._frame_to_pil(frame) for frame in _video([5, 1, 3])]
+
+    scores = await hpsv3_reward._infer_frame_scores(model, images, "video prompt", max_batch_size)
+
+    assert scores == pytest.approx([5.0, 1.0, 3.0])
+    assert [len(call.args[0]) for call in model.infer.await_args_list] == batch_sizes
+
+
+@pytest.mark.asyncio
+async def test_hpsv3_frame_inference_rejects_empty_input():
+    model = SimpleNamespace(infer=AsyncMock())
+    with pytest.raises(ValueError, match="at least one image frame"):
+        await hpsv3_reward._infer_frame_scores(model, [], "video prompt", 2)
+    model.infer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_hpsv3_native_frame_sampling_microbatches_and_top_scores():
     async def infer(images, prompts):
         assert prompts == ["video prompt"] * len(images)

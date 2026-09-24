@@ -143,7 +143,14 @@ def _floor_by_factor(number, factor):
     return math.floor(number / factor) * factor
 
 
-def smart_resize(height, width, factor=_IMAGE_FACTOR, min_pixels=_MIN_PIXELS, max_pixels=_MAX_PIXELS):
+def smart_resize(
+    height: int,
+    width: int,
+    factor: int = _IMAGE_FACTOR,
+    min_pixels: int = _MIN_PIXELS,
+    max_pixels: int = _MAX_PIXELS,
+) -> tuple[int, int]:
+    """Return factor-aligned (height, width) within the pixel budget."""
     if max(height, width) / min(height, width) > _MAX_RATIO:
         raise ValueError(
             f"absolute aspect ratio must be smaller than {_MAX_RATIO}, got {max(height, width) / min(height, width)}"
@@ -219,6 +226,8 @@ def _process_vision_info(conversations):
 
 
 class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
+    """Qwen2-VL with a reward head shared by HPSv3 and VideoAlign."""
+
     __module__ = Qwen2VLForConditionalGeneration.__module__
 
     def __init__(
@@ -602,6 +611,18 @@ async def _ensure_consumer(state: _BatchingState):
             state.consumer_task = asyncio.create_task(_consumer_loop(state))
 
 
+async def _infer_frame_scores(reward_model, images: list[Image.Image], prompt: str, max_batch_size: int) -> list[float]:
+    """Infer raw scores in frame order with at most max_batch_size frames per call."""
+    if not images:
+        raise ValueError("HPSv3 reward requires at least one image frame")
+    scores = []
+    for start in range(0, len(images), max_batch_size):
+        frames = images[start : start + max_batch_size]
+        logits = await reward_model.infer(frames, [prompt] * len(frames))
+        scores.extend(logits[:, 0].detach().float().cpu().tolist())
+    return scores
+
+
 async def compute_score_hpsv3(
     data_source: str,
     solution_image,
@@ -620,38 +641,33 @@ async def compute_score_hpsv3(
     score_cap: float | None = None,
     **kwargs,
 ) -> dict:
-    """Score frames using cached or executor-owned HPSv3 inference.
+    """Score frames with a managed model or the cached cross-request queue.
 
-    Defaults retain interval sampling (extra_info.frame_interval, default 4),
-    mean aggregation, reward_scale=0.1, and the cached cross-request queue.
-    num_frames selects that many uniformly spaced frames, allowing repeats.
-    Cap individual scores before averaging the largest ceil(N * top_fraction).
-    prompt_key selects batch.reward_inputs.text[prompt_key]; otherwise use
-    ground_truth. Managed inference batches frames within this sample only.
+    Sample every ``extra_info.frame_interval`` frames (default 4), or uniformly
+    select ``num_frames`` frames, allowing repeats. Cap scores before averaging
+    the top ``ceil(N * top_fraction)``; defaults average all scores without a cap.
+    ``prompt_key`` selects ``batch.reward_inputs.text[prompt_key]`` instead of
+    ``ground_truth``. Return scaled ``score`` and unscaled ``hpsv3_raw``.
     """
-    del data_source, kwargs
     if num_frames is not None and num_frames <= 0:
         raise ValueError("num_frames must be positive.")
     if not 0 < top_fraction <= 1:
         raise ValueError("top_fraction must be in (0, 1].")
     if isinstance(max_batch_size, bool) or not isinstance(max_batch_size, int) or max_batch_size <= 0:
         raise ValueError(f"max_batch_size must be a positive integer, got {max_batch_size!r}")
+
     prompt = ground_truth or ""
     if prompt_key is not None:
         if batch is None or len(batch) != 1:
             raise ValueError("HPSv3 prompt_key requires a single-sample batch.")
         prompt = batch[0].non_tensor_batch["reward_inputs"]["text"][prompt_key]
+
     if reward_model is not None:
         images = _select_reward_frames(solution_image, extra_info, num_frames)
-        if not images:
-            raise ValueError("HPSv3 reward requires at least one image frame")
-        raw_scores = []
-        for start in range(0, len(images), max_batch_size):
-            frames = images[start : start + max_batch_size]
-            logits = await reward_model.infer(frames, [prompt] * len(frames))
-            raw_scores.extend(logits[:, 0].detach().float().cpu().tolist())
+        raw_scores = await _infer_frame_scores(reward_model, images, prompt, max_batch_size)
         raw_score = _aggregate_frame_scores(raw_scores, top_fraction, score_cap)
         return {"score": raw_score * reward_scale, "hpsv3_raw": raw_score}
+
     checkpoint_path = os.getenv("custom_reward_model_path", model_name)
     assert checkpoint_path is not None, "HPSv3 checkpoint path must be provided via reward.reward_model.model_path"
     device = device or get_device_name()
@@ -722,7 +738,7 @@ class HPSv3Model:
 
     def __init__(
         self, model_path: str, device, base_model_path: str = _BASE_MODEL, use_sequential_position_ids: bool = False
-    ):
+    ) -> None:
         self._inferencer = _HPSv3Inferencer(
             checkpoint_path=model_path,
             base_config=base_model_path,
@@ -732,6 +748,7 @@ class HPSv3Model:
         self._infer_lock = threading.Lock()
 
     def close(self) -> None:
+        """Release the inferencer; reuse requires a new adapter."""
         self._inferencer = None
 
     @torch.inference_mode()
