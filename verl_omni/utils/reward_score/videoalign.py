@@ -223,36 +223,6 @@ def _resize_video(video: torch.Tensor) -> torch.Tensor:
     return resized.clamp(0, 255).round()
 
 
-def _prepare_batch(state: "VideoAlignModel", videos: list[torch.Tensor], prompts: list[str]) -> dict[str, Any]:
-    """Resize sampled RGB clips and tokenize video/prompt pairs on the active device.
-
-    Spatial sizes are multiples of 28 within the configured pixel budget; the
-    processor rescales pixel values and pads the formatted reward-token text.
-    """
-    resized_videos = [_resize_video(video) for video in videos]
-    messages = [
-        [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "video", "video": video, "max_pixels": _MAX_FRAME_PIXELS},
-                    {"type": "text", "text": _PROMPT_TEMPLATE.format(text_prompt=prompt)},
-                ],
-            }
-        ]
-        for video, prompt in zip(resized_videos, prompts, strict=True)
-    ]
-    inputs = state.processor(
-        text=state.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True),
-        images=None,
-        videos=resized_videos,
-        padding=True,
-        return_tensors="pt",
-        videos_kwargs={"do_rescale": True},
-    )
-    return {key: value.to(state.device) if isinstance(value, torch.Tensor) else value for key, value in inputs.items()}
-
-
 async def compute_score(
     data_source=None,
     solution_image=None,
@@ -326,6 +296,37 @@ class VideoAlignModel:
         self.processor = None
         self.device = None
 
+    def _prepare_batch(self, videos: list[torch.Tensor], prompts: list[str]) -> dict[str, Any]:
+        """Resize sampled RGB clips and tokenize video/prompt pairs on the active device.
+
+        Spatial sizes are multiples of 28 within the configured pixel budget; the
+        processor rescales pixel values and pads the formatted reward-token text.
+        """
+        resized_videos = [_resize_video(video) for video in videos]
+        messages = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": video, "max_pixels": _MAX_FRAME_PIXELS},
+                        {"type": "text", "text": _PROMPT_TEMPLATE.format(text_prompt=prompt)},
+                    ],
+                }
+            ]
+            for video, prompt in zip(resized_videos, prompts, strict=True)
+        ]
+        inputs = self.processor(
+            text=self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True),
+            images=None,
+            videos=resized_videos,
+            padding=True,
+            return_tensors="pt",
+            videos_kwargs={"do_rescale": True},
+        )
+        return {
+            key: value.to(self.device) if isinstance(value, torch.Tensor) else value for key, value in inputs.items()
+        }
+
     @torch.inference_mode()
     def infer(self, videos: list[torch.Tensor], prompts: list[str]) -> torch.Tensor:
         """Infer sampled uint8 RGB ``[T, 3, H, W]`` clips and aligned prompts.
@@ -335,7 +336,7 @@ class VideoAlignModel:
         the scorer owns temporal sampling, calibration, and scalar aggregation.
         """
         with self._infer_lock:
-            inputs = _prepare_batch(self, videos, prompts)
+            inputs = self._prepare_batch(videos, prompts)
             output = self.model(return_dict=True, **inputs)
             # Qwen2VLRewardModelBT.forward returns a plain dict, even with return_dict=True.
             logits = output["logits"]

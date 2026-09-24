@@ -201,44 +201,6 @@ def _pad_mel_time(mel: torch.Tensor) -> torch.Tensor:
     return mel[..., :_MEL_TIME]
 
 
-def _infer_micro_batch(state: "DeSyncModel", video: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
-    """Expand each prepared AV sample into 24 overlapping aligned segments.
-
-    Extract video and normalized log-mel features on the active device, then
-    compare the first and last 14 segments separately. Return detached CPU
-    logits ``[2, B, 21]`` in model-output dtype; the caller sets inference mode
-    and the MHA compatibility switch.
-    """
-    batch_size = video.shape[0]
-    video_segments = video.unfold(1, _VIDEO_SEGMENT, _VIDEO_STEP).movedim(-1, 2)
-    audio_segments = audio.unfold(1, _AUDIO_SEGMENT, _AUDIO_STEP)
-    if video_segments.shape[1] != _SEGMENTS or audio_segments.shape[1] != _SEGMENTS:
-        raise ValueError("DeSync preprocessing must produce exactly 24 AV segments.")
-
-    visual = video_segments.reshape(-1, _VIDEO_SEGMENT, *video.shape[2:]).unsqueeze(1).to(state.device)
-    visual = state.model.extract_vfeats(visual)
-    visual = visual.reshape(batch_size, _SEGMENTS, *visual.shape[2:])
-
-    audio_segments = audio_segments.to(state.device)
-    mel = _pad_mel_time(torch.log(state.mel(audio_segments) + 1e-6))
-    # Match OmniNFT's Synchformer preprocessing:
-    # https://github.com/zghhui/OmniNFT/blob/master/flow_grpo/audio_video_align/av_desync.py
-    mel = (mel - (-4.2677393)) / (2 * 4.5689974)
-    auditory = state.model.extract_afeats(mel.unsqueeze(2))
-
-    logits_batches = []
-    for start in (0, _SEGMENTS - _COMPARE_SEGMENTS):
-        logits = state.model.compare_v_a(
-            visual[:, start : start + _COMPARE_SEGMENTS], auditory[:, start : start + _COMPARE_SEGMENTS]
-        )
-        if not isinstance(logits, torch.Tensor) or logits.shape != (batch_size, 21):
-            raise ValueError(f"DeSync logits must have shape ({batch_size}, 21).")
-        if not torch.isfinite(logits).all():
-            raise ValueError("DeSync logits must contain only finite values.")
-        logits_batches.append(logits.detach().cpu())
-    return torch.stack(logits_batches)
-
-
 async def compute_score(
     data_source=None,
     solution_image=None,
@@ -298,6 +260,43 @@ class DeSyncModel:
         self.mel = None
         self.device = None
 
+    def _infer_micro_batch(self, video: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
+        """Expand each prepared AV sample into 24 overlapping aligned segments.
+
+        Extract video and normalized log-mel features on the active device, then
+        compare the first and last 14 segments separately. Return detached CPU
+        logits ``[2, B, 21]`` in model-output dtype; the caller sets inference mode
+        and the MHA compatibility switch.
+        """
+        batch_size = video.shape[0]
+        video_segments = video.unfold(1, _VIDEO_SEGMENT, _VIDEO_STEP).movedim(-1, 2)
+        audio_segments = audio.unfold(1, _AUDIO_SEGMENT, _AUDIO_STEP)
+        if video_segments.shape[1] != _SEGMENTS or audio_segments.shape[1] != _SEGMENTS:
+            raise ValueError("DeSync preprocessing must produce exactly 24 AV segments.")
+
+        visual = video_segments.reshape(-1, _VIDEO_SEGMENT, *video.shape[2:]).unsqueeze(1).to(self.device)
+        visual = self.model.extract_vfeats(visual)
+        visual = visual.reshape(batch_size, _SEGMENTS, *visual.shape[2:])
+
+        audio_segments = audio_segments.to(self.device)
+        mel = _pad_mel_time(torch.log(self.mel(audio_segments) + 1e-6))
+        # Match OmniNFT's Synchformer preprocessing:
+        # https://github.com/zghhui/OmniNFT/blob/master/flow_grpo/audio_video_align/av_desync.py
+        mel = (mel - (-4.2677393)) / (2 * 4.5689974)
+        auditory = self.model.extract_afeats(mel.unsqueeze(2))
+
+        logits_batches = []
+        for start in (0, _SEGMENTS - _COMPARE_SEGMENTS):
+            logits = self.model.compare_v_a(
+                visual[:, start : start + _COMPARE_SEGMENTS], auditory[:, start : start + _COMPARE_SEGMENTS]
+            )
+            if not isinstance(logits, torch.Tensor) or logits.shape != (batch_size, 21):
+                raise ValueError(f"DeSync logits must have shape ({batch_size}, 21).")
+            if not torch.isfinite(logits).all():
+                raise ValueError("DeSync logits must contain only finite values.")
+            logits_batches.append(logits.detach().cpu())
+        return torch.stack(logits_batches)
+
     @torch.inference_mode()
     def infer(self, video: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
         """Infer prepared video ``[B, 200, 3, 224, 224]`` and audio ``[B, 128000]``.
@@ -309,11 +308,11 @@ class DeSyncModel:
         unrelated callers that do not use this lock can observe the temporary flag.
         """
         if self.device.type != "npu":
-            return _infer_micro_batch(self, video, audio)
+            return self._infer_micro_batch(video, audio)
         with _MHA_FASTPATH_LOCK:
             fastpath_enabled = torch.backends.mha.get_fastpath_enabled()
             torch.backends.mha.set_fastpath_enabled(False)
             try:
-                return _infer_micro_batch(self, video, audio)
+                return self._infer_micro_batch(video, audio)
             finally:
                 torch.backends.mha.set_fastpath_enabled(fastpath_enabled)
