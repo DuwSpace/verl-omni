@@ -19,7 +19,6 @@ import os
 import threading
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -432,17 +431,6 @@ def _get_inferencer(checkpoint_path: str, device: str):
             _inferencers[key] = _HPSv3Inferencer(checkpoint_path=checkpoint_path, device=device)
 
     return _inferencers[key]
-
-
-def _to_pil_hwc(image) -> Image.Image:
-    if isinstance(image, torch.Tensor):
-        image = image.cpu().numpy()
-    if isinstance(image, np.ndarray):
-        if image.ndim == 3 and image.shape[0] in (1, 3):
-            image = image.transpose(1, 2, 0)
-        image = Image.fromarray(image)
-    assert isinstance(image, Image.Image)
-    return image
 
 
 def _extract_frames(solution_image, frame_interval: int = 1) -> list[Image.Image]:

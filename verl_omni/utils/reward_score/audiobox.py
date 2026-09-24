@@ -26,8 +26,6 @@ _AUDIOBOX_SAMPLE_RATE = 16_000
 _AUDIOBOX_WINDOW_SAMPLES = 10 * _AUDIOBOX_SAMPLE_RATE
 _AUDIOBOX_HOP_SAMPLES = 10 * _AUDIOBOX_SAMPLE_RATE
 _AXES = ("CE", "CU", "PC", "PQ")
-# OmniNFT combines (CE + CU + PQ - PC) / 40:
-# https://github.com/zghhui/OmniNFT/blob/master/flow_grpo/rewards.py
 
 
 def _load_model(model_path: str) -> Any:
@@ -98,13 +96,18 @@ async def compute_score(
     reward_model,
     batch=None,
     axis_weights=None,
-    score_scale: float = 0.025,
+    score_scale: float = 0.025,  # 1 / 40, matching OmniNFT's reward scaling.
     **kwargs,
 ) -> dict[str, float]:
     """Score audio aesthetics using duration-weighted windows and configurable axes.
 
     Read audio/rate from extra_info or a single-sample batch. Restore the model's
     target transforms before combining CE/CU/PC/PQ; inference belongs to the executor.
+
+    Default axis weights and score_scale=1/40 reproduce OmniNFT's
+    (CE + CU + PQ - PC) / 40 reward. The scale is applied after restoring the
+    model's target transforms; it does not guarantee a score in [0, 1]. Source:
+    https://github.com/zghhui/OmniNFT/blob/fb9237f6e74edf0d0f2a683f4d975b79fde588fe/flow_grpo/rewards.py#L316
     """
     del data_source, solution_image, ground_truth, kwargs
     extra_info = audio_info_from_batch(extra_info, batch, scorer="AudioBox")
