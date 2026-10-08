@@ -167,9 +167,13 @@ def _get_trainer_cls(config):
         from verl_omni.trainer.diffusion.native_ray_trainer import NativeRayDiffusionTrainer
 
         return NativeRayDiffusionTrainer
+    if trainer_type == "unigrpo_nft":
+        from verl_omni.trainer.diffusion.bagel_joint_ray_trainer import BagelJointRayTrainer
+
+        return BagelJointRayTrainer
     raise ValueError(
         f"Unsupported diffusion trainer_type {trainer_type!r}. "
-        "Expected one of: 'policy_gradient', 'direct_preference', 'unigrpo'."
+        "Expected one of: 'policy_gradient', 'direct_preference', 'unigrpo', 'unigrpo_nft'."
     )
 
 
@@ -196,7 +200,11 @@ class TaskRunner:
         from verl_omni.workers.engine_workers import ActorRolloutRefWorker
 
         actor_rollout_cls = ActorRolloutRefWorker
-        if OmegaConf.select(config, "actor_rollout_ref.rollout.name") == "native":
+        if config.algorithm.trainer_type == "unigrpo_nft":
+            from verl_omni.workers.native_workers import BagelJointRolloutWorker
+
+            actor_rollout_cls = BagelJointRolloutWorker
+        elif OmegaConf.select(config, "actor_rollout_ref.rollout.name") == "native":
             from verl_omni.workers.native_workers import NativeRolloutWorker
 
             actor_rollout_cls = NativeRolloutWorker

@@ -59,6 +59,18 @@ diffusion_loss:
   # UniGRPO image-side GRPO-Guard RatioNorm; false uses the plain Flow-GRPO ratio
   ratio_norm: true
 
+  # Hybrid UniGRPO/OmniNFT text loss weight
+  text_loss_weight: 1.0
+
+  # Hybrid UniGRPO/OmniNFT image loss weight
+  image_loss_weight: 1.0
+
+  # Hybrid AR token probability ratio clipping
+  ar_clip_ratio: 0.01
+
+  # Normalized forward-process sigma samples per generated image
+  nft_timesteps_per_sample: 1
+
 # Rollout Correction config.  Fields mirror RolloutCorrectionConfig.
 # rollout_is defaults to null (off); override for IS diagnostics.
 rollout_correction:

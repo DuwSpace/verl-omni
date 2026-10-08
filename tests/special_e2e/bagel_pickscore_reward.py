@@ -19,6 +19,7 @@ import os
 
 import torch
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPModel
+from verl.utils.device import get_device_id, get_device_name
 
 from verl_omni.utils.reward_score import pickscore_reward as _pickscore
 
@@ -28,7 +29,9 @@ _PICKSCORE_PATH = os.environ["PICKSCORE_PATH"]
 class _TinyPickScoreInferencer:
     """Tiny-checkpoint loader used only by the Bagel e2e smoke test."""
 
-    def __init__(self, device: str = "cuda", dtype=torch.float32):
+    def __init__(self, device: str | None = None, dtype=torch.float32):
+        if device is None:
+            device = torch.device(get_device_name(), get_device_id())
         self.device = device
         self.image_processor = CLIPImageProcessor.from_pretrained(_PICKSCORE_PATH)
         self.tokenizer = AutoTokenizer.from_pretrained(_PICKSCORE_PATH)

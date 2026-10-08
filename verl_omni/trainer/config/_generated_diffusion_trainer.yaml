@@ -91,6 +91,10 @@ actor_rollout_ref:
       add_kl_coefficient: true
       mse_weight: 1.5e-05
       ratio_norm: true
+      text_loss_weight: 1.0
+      image_loss_weight: 1.0
+      ar_clip_ratio: 0.01
+      nft_timesteps_per_sample: 1
     rollout_correction:
       _target_: verl.trainer.config.algorithm.RolloutCorrectionConfig
       bypass_mode: ${oc.select:algorithm.rollout_correction.bypass_mode,false}
@@ -272,6 +276,14 @@ actor_rollout_ref:
         sde_window_size: ${oc.select:actor_rollout_ref.rollout.algo.sde_window_size,null}
         sde_window_range: ${oc.select:actor_rollout_ref.rollout.algo.sde_window_range,null}
         sde_contiguous: ${oc.select:actor_rollout_ref.rollout.algo.sde_contiguous,true}
+    bagel_joint:
+      _target_: verl_omni.workers.config.diffusion.BagelJointRolloutConfig
+      max_think_tokens: 1024
+      text_temperature: 1.0
+      cfg_text_scale: 1.0
+      cfg_img_scale: 1.0
+      sync_bucket_size_mb: 256
+      sync_timeout_seconds: 600
     algo:
       _target_: verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig
       noise_level: 1.0
@@ -377,6 +389,14 @@ actor_rollout_ref:
       task: ${oc.select:actor_rollout_ref.rollout.pipeline.task,null}
       frame_indices: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_indices,null}
       video_flow_shift: ${oc.select:actor_rollout_ref.rollout.pipeline.video_flow_shift,12.0}
+    bagel_joint:
+      _target_: verl_omni.workers.config.diffusion.BagelJointRolloutConfig
+      max_think_tokens: ${oc.select:actor_rollout_ref.rollout.bagel_joint.max_think_tokens,1024}
+      text_temperature: ${oc.select:actor_rollout_ref.rollout.bagel_joint.text_temperature,1.0}
+      cfg_text_scale: ${oc.select:actor_rollout_ref.rollout.bagel_joint.cfg_text_scale,1.0}
+      cfg_img_scale: ${oc.select:actor_rollout_ref.rollout.bagel_joint.cfg_img_scale,1.0}
+      sync_bucket_size_mb: ${oc.select:actor_rollout_ref.rollout.bagel_joint.sync_bucket_size_mb,256}
+      sync_timeout_seconds: ${oc.select:actor_rollout_ref.rollout.bagel_joint.sync_timeout_seconds,600}
     algo:
       _target_: verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig
       noise_level: ${oc.select:actor_rollout_ref.rollout.algo.noise_level,1.0}

@@ -96,6 +96,18 @@ class NativeRayDiffusionTrainer(PolicyGradientRayTrainer):
         gen_output = self.actor_rollout_wg.generate(gen_td)
         return DataProto.from_tensordict(gen_output)
 
+    def _prepare_actor_batch(self, batch, reward_tensor):
+        """Keep the standalone UniGRPO advantage contract unchanged."""
+        scores = batch.batch["sample_level_scores"]
+        batch.batch["sample_level_rewards"] = scores if scores.ndim > 1 else scores.unsqueeze(-1)
+        return compute_advantage(
+            batch,
+            adv_estimator=self.config.algorithm.adv_estimator,
+            norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+            global_std=self.config.algorithm.global_std,
+            config=self.config.algorithm,
+        )
+
     def fit(self):
         """Native training loop: worker generate -> reward -> flow_grpo advantage -> joint update."""
         from omegaconf import OmegaConf
@@ -122,9 +134,6 @@ class NativeRayDiffusionTrainer(PolicyGradientRayTrainer):
         self.global_steps += 1
         last_val_metrics = None
         self.max_steps_duration = 0
-
-        adv_estimator = self.config.algorithm.adv_estimator
-        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -167,17 +176,7 @@ class NativeRayDiffusionTrainer(PolicyGradientRayTrainer):
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
                         # One advantage per sample (num_timesteps == 1): the joint update reads a
                         # per-sample scalar, not a per-denoise-step vector like image-only flow_grpo.
-                        sample_level_scores = batch.batch["sample_level_scores"]
-                        batch.batch["sample_level_rewards"] = (
-                            sample_level_scores if sample_level_scores.ndim > 1 else sample_level_scores.unsqueeze(-1)
-                        )
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=adv_estimator,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            global_std=self.config.algorithm.global_std,
-                            config=self.config.algorithm,
-                        )
+                        batch = self._prepare_actor_batch(batch, reward_tensor)
 
                     # Joint AR + image update on the FSDP module (record_old_logp already anchored
                     # old_logp inside generate). num_updates_per_batch == number of framework

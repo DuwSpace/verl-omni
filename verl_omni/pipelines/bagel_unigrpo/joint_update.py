@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
-from verl.utils.device import get_device_id, get_device_name, is_cuda_available
+from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 
 
 def ar_grpo_loss(
@@ -149,6 +149,13 @@ class UniGRPOJointUpdater:
     @contextmanager
     def _reference_weights(self):
         """Swap the one-time frozen (initial-policy) trainable params in for a v_ref forward."""
+        from torch.distributed.fsdp import FSDPModule
+
+        units = [module for module in self.module.modules() if isinstance(module, FSDPModule)]
+        # Functional replay can leave leaves unsharded. Keep snapshots in the persistent
+        # shard layout rather than retaining temporary full-parameter views.
+        for unit in units:
+            unit.reshard()
         live = [p for p in self.module.parameters() if p.requires_grad]
         if self._ref_snapshot is None:
             # Snapshot in the params' own (compute) dtype: a bf16 v_ref target halves the
@@ -160,6 +167,8 @@ class UniGRPOJointUpdater:
         try:
             yield
         finally:
+            for unit in units:
+                unit.reshard()
             for p, saved in zip(live, stash, strict=False):
                 p.data.copy_(saved)
 
@@ -180,9 +189,11 @@ class UniGRPOJointUpdater:
 
         module = self.module
         cfg = module.config
-        # Compute is on CUDA even when FSDP offloads the (sharded) params to CPU.
+        # FSDP CPU offload changes parameter placement, not the compute device.
         device = (
-            torch.device(get_device_name(), get_device_id()) if is_cuda_available else next(module.parameters()).device
+            torch.device(get_device_name(), get_device_id())
+            if is_cuda_available or is_npu_available
+            else next(module.parameters()).device
         )
         gh, gw = sample.latent_grid
         pos_ids = _latent_pos_ids(cfg, gh, gw, device)[None]

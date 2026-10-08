@@ -218,6 +218,30 @@ val_kwargs:
     # Whether selected SDE steps must form one consecutive window
     sde_contiguous: ${oc.select:actor_rollout_ref.rollout.algo.sde_contiguous,true}
 
+# Native BAGEL joint-policy MP-worker settings.
+bagel_joint:
+
+  # Required when using verl.utils.omega_conf_to_dataclass.
+  _target_: verl_omni.workers.config.diffusion.BagelJointRolloutConfig
+
+  # Maximum AR reasoning tokens, including the initial cached BOS.
+  max_think_tokens: 1024
+
+  # AR reasoning sampling temperature.
+  text_temperature: 1.0
+
+  # Image classifier-free guidance for the text condition.
+  cfg_text_scale: 1.0
+
+  # Image classifier-free guidance for the image condition.
+  cfg_img_scale: 1.0
+
+  # Upper bucket size, except for an individual larger tensor.
+  sync_bucket_size_mb: 256
+
+  # Worker initialization and weight transport timeout.
+  sync_timeout_seconds: 600
+
 # Rollout Algorithm configuration
 algo:
 

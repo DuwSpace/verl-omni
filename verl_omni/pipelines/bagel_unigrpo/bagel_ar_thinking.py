@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from verl.utils.device import get_device_id, get_device_name, is_cuda_available
+from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 
 from ..bagel_flow_grpo.bagel_model import _apply_rotary_emb
 
@@ -254,9 +254,12 @@ def replay_thinking_logprobs(
     scored from the hidden state at the token preceding it (standard next-token TF),
     matching :func:`generate_thinking` when temperature=1 and weights are unchanged.
     """
-    # Compute happens on the CUDA device even when FSDP has the (sharded) params offloaded to CPU,
-    # so build inputs on the live CUDA device rather than the parameter device.
-    device = torch.device(get_device_name(), get_device_id()) if is_cuda_available else next(model.parameters()).device
+    # FSDP CPU offload changes parameter placement, not the compute device.
+    device = (
+        torch.device(get_device_name(), get_device_id())
+        if is_cuda_available or is_npu_available
+        else next(model.parameters()).device
+    )
     if not response_token_ids:
         return torch.zeros(0, device=device)
     prompt_len = len(prompt_token_ids)

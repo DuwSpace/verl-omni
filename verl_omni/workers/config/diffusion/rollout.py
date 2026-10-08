@@ -27,11 +27,39 @@ from verl.workers.config.rollout import (
 )
 
 __all__ = [
+    "BagelJointRolloutConfig",
     "DiffusionRolloutAlgoConfig",
     "DiffusionPipelineConfig",
     "DiffusionSamplingConfig",
     "DiffusionRolloutConfig",
 ]
+
+
+@dataclass
+class BagelJointRolloutConfig(BaseConfig):
+    """Native BAGEL MP-worker knobs; one independent engine per actor rank."""
+
+    # Preserve the reference recipe's maximum reasoning length.
+    max_think_tokens: int = 1024
+    # Sampling temperature for the AR reasoning policy.
+    text_temperature: float = 1.0
+    # Native image classifier-free guidance scales.
+    cfg_text_scale: float = 1.0
+    cfg_img_scale: float = 1.0
+    # Bounded shared-file transport; a single larger tensor is its own bucket.
+    sync_bucket_size_mb: int = 256
+    # Timeout covers cold full-model worker initialization and synchronization.
+    sync_timeout_seconds: int = 600
+
+    def __post_init__(self):
+        import math
+
+        if self.max_think_tokens < 2 or self.sync_bucket_size_mb <= 0 or self.sync_timeout_seconds <= 0:
+            raise ValueError("Joint BAGEL token limit and sync limits must be positive")
+        if not math.isfinite(self.text_temperature) or self.text_temperature <= 0:
+            raise ValueError("Joint BAGEL text temperature must be finite and positive")
+        if any(not math.isfinite(v) or v < 0 for v in (self.cfg_text_scale, self.cfg_img_scale)):
+            raise ValueError("Joint BAGEL guidance scales must be finite and nonnegative")
 
 
 @dataclass
@@ -104,6 +132,8 @@ class DiffusionSamplingConfig(BaseConfig):
 
 @dataclass
 class DiffusionRolloutConfig(BaseConfig):
+    # Exact native-worker settings mirrored into the actor's model config.
+    bagel_joint: BagelJointRolloutConfig = field(default_factory=BagelJointRolloutConfig)
     _mutable_fields = {
         "max_model_len",
         "load_format",

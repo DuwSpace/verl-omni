@@ -47,8 +47,24 @@ def optimizer_parameters(module, config):
     return groups
 
 
+class _FSDPInitializationRoot(torch.nn.Module):
+    """Initialize shared FSDP state for functional forwards through model leaves."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, initialization_token):
+        """Run root hooks without executing model computation."""
+        return None
+
+
 def shard_fsdp2_units(module, units, fsdp_kwargs):
-    """Apply engine-owned FSDP2 policies to adapter-selected units in their given order."""
+    """Shard explicit leaves and return their parameter-free initialization root.
+
+    Keep the returned root outside the model to preserve checkpoint keys. A shared
+    communication context bounds retained full reduction inputs across leaf backwards.
+    """
     from torch.distributed.fsdp import fully_shard
 
     if not units or len({id(unit) for unit in units}) != len(units):
@@ -66,6 +82,11 @@ def shard_fsdp2_units(module, units, fsdp_kwargs):
     ]
     if unsharded:
         raise ValueError(f"Explicit FSDP2 units leave trainable parameters unsharded: {unsharded}")
+    root = _FSDPInitializationRoot(module)
+    ignored = {param for param in module.parameters() if not param.requires_grad}
+    fully_shard(root, **{**fsdp_kwargs, "ignored_params": ignored})
+    root(torch.empty(0))
+    return root
 
 
 def clip_grad_norm_sharded_(parameters, max_norm, mesh):
@@ -77,6 +98,9 @@ def clip_grad_norm_sharded_(parameters, max_norm, mesh):
     """
     parameters = list(parameters)
     device = next((p.device for p in parameters if p.requires_grad), torch.device("cpu"))
+    if device.type == "cpu" and mesh.device_type != "cpu":
+        # Offloaded gradients are on CPU, but NCCL/HCCL collectives require accelerator tensors.
+        device = torch.device(mesh.device_type, get_device_id())
     local_sq = torch.zeros((), dtype=torch.float32, device=device)
     grads = [p.grad for p in parameters if p.requires_grad and p.grad is not None]
     for grad in grads:
@@ -92,7 +116,7 @@ def clip_grad_norm_sharded_(parameters, max_norm, mesh):
                 if placement.is_replicate():
                     replication *= mesh.size(dim)
             local = grad.to_local()
-        local_sq += local.detach().float().square().sum() / replication
+        local_sq += (local.detach().float().square().sum() / replication).to(device)
     # Reduce one mesh dimension at a time (supports both FSDP and hybrid sharding).
     for dim in range(mesh.ndim):
         group = mesh.get_group(dim)

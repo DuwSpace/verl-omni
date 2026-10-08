@@ -15,7 +15,7 @@
 """Worker entry points for actor-side (native) sampling."""
 
 from tensordict import TensorDict
-from verl.single_controller.base.decorator import make_nd_compute_dataproto_dispatch_fn, register
+from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils.profiler import DistProfiler
 
 from verl_omni.workers.engine_workers import ActorRolloutRefWorker, _with_routing_replay_flag
@@ -50,3 +50,15 @@ class NativeRolloutWorker(ActorRolloutRefWorker):
             raise NotImplementedError(f"{type(self.actor.engine).__name__} does not support actor-side generation")
         output = generate(data)
         return output.cpu() if output is not None else None
+
+
+class BagelJointRolloutWorker(NativeRolloutWorker):
+    """Actor transport plus a separate real MP vllm-omni worker owned by its hooks.
+
+    Inheriting dispatch here does not select native actor-side sampling: the
+    unigrpo_nft adapter's generate hook exports weights and calls vllm-omni.
+    """
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def close_joint_rollout(self):
+        self.actor.engine._engine_hooks.close_rollout()

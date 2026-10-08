@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -52,6 +53,13 @@ class DiffusionLossConfig(BaseConfig):
     mse_weight: float = 1.5e-5
     # UniGRPO image-side GRPO-Guard RatioNorm; False falls back to the plain Flow-GRPO ratio
     ratio_norm: bool = True
+    # Hybrid UniGRPO/OmniNFT text and image loss weights (normalized by their sum).
+    text_loss_weight: float = 1.0
+    image_loss_weight: float = 1.0
+    # Hybrid AR-GRPO token ratio clipping; distinct from diffusion trajectory clipping.
+    ar_clip_ratio: float = 0.01
+    # Independent normalized forward-process sigma samples per generated image.
+    nft_timesteps_per_sample: int = 1
 
     def __post_init__(self):
         """Validate diffusion loss configuration."""
@@ -60,6 +68,7 @@ class DiffusionLossConfig(BaseConfig):
             "flow_dppo",
             "grpo_guard",
             "unigrpo",
+            "unigrpo_nft",
             "diffusion_nft",
             "dpo",
             "dmd2",
@@ -77,6 +86,14 @@ class DiffusionLossConfig(BaseConfig):
             raise ValueError(f"adaptive_weight_min must be positive, got {self.adaptive_weight_min}.")
         if self.kl_mask_threshold <= 0:
             raise ValueError(f"kl_mask_threshold must be positive, got {self.kl_mask_threshold}.")
+        if any(not math.isfinite(value) or value < 0 for value in (self.text_loss_weight, self.image_loss_weight)):
+            raise ValueError("Hybrid text/image loss weights must be finite and nonnegative")
+        if self.text_loss_weight + self.image_loss_weight <= 0:
+            raise ValueError("At least one hybrid loss branch must have positive weight")
+        if not math.isfinite(self.ar_clip_ratio) or not 0 < self.ar_clip_ratio < 1:
+            raise ValueError("Hybrid AR clip ratio must be finite and in (0, 1)")
+        if not isinstance(self.nft_timesteps_per_sample, int) or self.nft_timesteps_per_sample <= 0:
+            raise ValueError("NFT timesteps per sample must be a positive integer")
 
 
 @dataclass

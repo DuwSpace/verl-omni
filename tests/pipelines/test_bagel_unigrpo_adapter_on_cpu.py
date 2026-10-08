@@ -168,3 +168,23 @@ def test_build_unigrpo_pipeline_kwargs_reads_model_config() -> None:
     assert kwargs["eta"] == pytest.approx(0.8)
     assert kwargs["num_sde_steps"] == 3
     assert "stop_token_ids" not in kwargs  # no module -> no EOS derived
+
+
+def test_offloaded_ar_replay_selects_compute_device(monkeypatch) -> None:
+    from verl_omni.pipelines.bagel_unigrpo import bagel_ar_thinking as ar
+
+    # Stub the accelerator as CPU so this boundary test needs no accelerator allocation.
+    # Meta parameters stand in for storage located away from the compute device.
+    model = SimpleNamespace(parameters=lambda: iter([torch.nn.Parameter(torch.empty(1, device="meta"))]))
+    monkeypatch.setattr(ar, "is_cuda_available", False)
+    monkeypatch.setattr(ar, "is_npu_available", True)
+    monkeypatch.setattr(ar, "get_device_name", lambda: "cpu")
+    monkeypatch.setattr(ar, "get_device_id", lambda: 0)
+
+    def text_logits(module, input_ids, position_ids):
+        assert input_ids.device.type == position_ids.device.type == "cpu"
+        return torch.zeros(1, input_ids.shape[1], 5)
+
+    monkeypatch.setattr(ar, "_text_logits", text_logits)
+    result = ar.replay_thinking_logprobs(model, [1], [2])
+    torch.testing.assert_close(result, torch.tensor([-1.6094379]))

@@ -434,7 +434,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             else:
                 from .training_utils import shard_fsdp2_units
 
-                shard_fsdp2_units(module, sharding_units, fsdp_kwargs)
+                self._fsdp2_initialization_root = shard_fsdp2_units(module, sharding_units, fsdp_kwargs)
                 self._explicit_fsdp2_units = True
         else:
             raise NotImplementedError(f"Unknown strategy {self.engine_config.strategy}")
@@ -795,6 +795,10 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         """
         Save FSDP checkpoint, handling parameter offload as needed.
         """
+        hooks = getattr(self, "_engine_hooks", None)
+        save_hook_state = hooks is not None and getattr(hooks, "requires_checkpoint_state", False)
+        if save_hook_state and hdfs_path is not None:
+            raise NotImplementedError("Full-weight joint policy checkpoints currently require a local checkpoint path")
         origin_module_device = next(self.module.parameters()).device.type
         if (self._is_offload_param or origin_module_device == "cpu") and not getattr(
             self, "_uses_fsdp2_cpu_offload_policy", False
@@ -804,6 +808,11 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         self.checkpoint_manager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
+        if save_hook_state:
+            rank = torch.distributed.get_rank()
+            state_path = os.path.join(local_path, f"algorithm_state_rank_{rank}.pt")
+            torch.save(hooks.state_dict(), state_path + ".tmp")
+            os.replace(state_path + ".tmp", state_path)
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.module)
@@ -818,7 +827,16 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         """
         import torch
 
-        if self._is_offload_param:
+        hooks = getattr(self, "_engine_hooks", None)
+        if hooks is not None and getattr(hooks, "requires_checkpoint_state", False):
+            if hdfs_path is not None:
+                raise NotImplementedError("Full-weight joint policy checkpoints currently require a local path")
+            rank = torch.distributed.get_rank()
+            state_path = os.path.join(local_path, f"algorithm_state_rank_{rank}.pt")
+            if not os.path.isfile(state_path):
+                raise FileNotFoundError(f"Missing frozen old/reference policy checkpoint: {state_path}")
+            hooks.load_state_dict(torch.load(state_path, map_location="cpu", weights_only=True))
+        if self._is_offload_param and not getattr(self, "_uses_fsdp2_cpu_offload_policy", False):
             load_fsdp_model_to_gpu(self.module)
 
         self.checkpoint_manager.load_checkpoint(
