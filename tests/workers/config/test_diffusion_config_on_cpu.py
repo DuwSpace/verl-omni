@@ -288,7 +288,8 @@ class TestDiffusionModelConfigPolicyAdapters:
                 omega_conf_to_dataclass(cfg)
 
 
-def test_ltx2_omninft_example_config_composes_into_global_training_config():
+@pytest.mark.parametrize("frame_rate", [24.0, 23.976])
+def test_ltx2_omninft_example_config_composes_into_global_training_config(frame_rate):
     from pathlib import Path
 
     from hydra import compose, initialize_config_dir
@@ -299,8 +300,15 @@ def test_ltx2_omninft_example_config_composes_into_global_training_config():
     repo_root = Path(verl_omni.__file__).resolve().parent.parent
     config_dir = repo_root / "examples/omninft_trainer/ltx2"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
-        cfg = compose(config_name="ltx2_omninft")
+        cfg = compose(
+            config_name="ltx2_omninft", overrides=[f"actor_rollout_ref.rollout.pipeline.frame_rate={frame_rate}"]
+        )
 
+    assert cfg.reward.reward_functions.desync.fps == frame_rate
+    assert cfg.reward.reward_functions.video_align.fps == frame_rate
+    assert cfg.actor_rollout_ref.rollout.val_kwargs.pipeline.frame_rate == frame_rate
+    assert cfg.reward.reward_functions.desync.audio_layout == "CT"
+    assert cfg.reward.reward_functions.audiobox.audio_layout == "CT"
     assert "recipe" not in cfg
     assert cfg.algorithm.trainer_type == "direct_preference"
     assert cfg.actor_rollout_ref.model.algorithm == "omni_nft"

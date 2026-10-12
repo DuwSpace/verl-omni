@@ -295,3 +295,19 @@ async def test_consumer_isolates_invalid_audio_and_resamples_valid_requests(monk
     assert resample_calls == [(24_000, 48_000)]
     assert len(processor.batches) == 1
     assert len(processor.batches[0][0]) == 2
+
+
+@pytest.mark.parametrize("shape", [(16,), (1, 16), (2, 16), (1, 2, 16)])
+def test_legacy_clap_keeps_rate_and_channel_defaults(shape):
+    info = {"audio": torch.ones(shape)}
+    audio, rate = clap._get_audio(info)
+    assert audio.shape == (16,)
+    assert rate == 48000
+    assert set(info) == {"audio"}
+
+
+@pytest.mark.parametrize("rate", [24000, 32000, torch.tensor([24000])])
+def test_legacy_clap_preserves_explicit_source_rate(rate):
+    audio, actual_rate = clap._get_audio({"audio": torch.ones(2, 16), "audio_sample_rate": rate})
+    assert audio.shape == (16,)
+    assert actual_rate == int(rate)

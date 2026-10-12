@@ -182,6 +182,13 @@ class MultiRewardManager(RewardManagerBase, ABC):
                     raise RuntimeError(f"Reward model {model_name!r} cannot be used with a reward function")
                 filtered_kwargs = _filter_kwargs({**sub_kwargs, **reward_kwargs()}, sig)
 
+            native_model_arg = sig.parameters.get("reward_model") if sig is not None else None
+            if native_model_arg is not None and native_model_arg.default is inspect.Parameter.empty:
+                try:
+                    sig.bind(**filtered_kwargs)
+                except TypeError as exc:
+                    raise ValueError(f"Invalid arguments for sub-reward {key!r}: {exc}") from exc
+
             try:
                 if is_async:
                     result = await fn(**filtered_kwargs)

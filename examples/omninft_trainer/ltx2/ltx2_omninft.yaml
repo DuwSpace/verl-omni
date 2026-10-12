@@ -131,7 +131,7 @@ actor_rollout_ref:
         height: 256
         width: 384
         num_frames: 121
-        frame_rate: 24.0
+        frame_rate: ${actor_rollout_ref.rollout.pipeline.frame_rate}
         num_inference_steps: 40
         video_cfg_scale: 3.0
         audio_cfg_scale: 7.0
@@ -185,6 +185,7 @@ reward:
       path: pkg://verl_omni.utils.reward_score.videoalign
       name: compute_score
       model: video_align
+      fps: ${actor_rollout_ref.rollout.pipeline.frame_rate}
       prompt_key: video
       score_weights: [0.5, 0.0, 0.5]
       score_means: [3.6757, 0.0, 2.8105]
@@ -209,6 +210,7 @@ reward:
       path: pkg://verl_omni.utils.reward_score.audiobox
       name: compute_score
       model: audiobox
+      audio_layout: CT
       axis_weights: {CE: 1.0, CU: 1.0, PC: -1.0, PQ: 1.0}
       score_scale: 0.025
       weight: 1.0
@@ -230,6 +232,8 @@ reward:
       path: pkg://verl_omni.utils.reward_score.desync
       name: compute_score
       model: desync
+      fps: ${actor_rollout_ref.rollout.pipeline.frame_rate}
+      audio_layout: CT
       weight: 1.0
       required: true
       routing_weights: {video: 1.0, audio: 1.0}

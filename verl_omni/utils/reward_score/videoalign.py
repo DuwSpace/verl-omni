@@ -232,7 +232,7 @@ async def compute_score(
     reward_model,
     batch=None,
     prompt_key: str | None = None,
-    fps: float | None = None,
+    fps: float,
     score_weights=None,
     score_means=None,
     score_stds=None,
@@ -241,7 +241,7 @@ async def compute_score(
     """Score video preference with configurable VQ/MQ/TA calibration and weights.
 
     Text defaults to ground_truth; prompt_key selects batch.reward_inputs.text.
-    Read the source frame rate from batch, extra_info, or an explicit fps option.
+    Configure fps explicitly with the generated video frame rate.
     """
     del data_source, kwargs
     prompt = ground_truth or ""
@@ -252,19 +252,25 @@ async def compute_score(
         item = batch[0]
         if solution_image is None:
             solution_image = item.batch["responses"]
-        if fps is None:
-            fps = item.batch.get("fps", item.non_tensor_batch.get("fps"))
         if prompt_key is not None:
-            prompt = item.non_tensor_batch["reward_inputs"]["text"][prompt_key]
+            try:
+                prompt = item.non_tensor_batch["reward_inputs"]["text"][prompt_key]
+            except (KeyError, TypeError) as exc:
+                raise ValueError(f"VideoAlign requires reward_inputs.text[{prompt_key!r}] in the batch.") from exc
     elif prompt_key is not None:
         raise ValueError("VideoAlign prompt_key requires a single-sample batch.")
-    if fps is None:
-        fps = extra_info["fps"]
     fps = float(fps)
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("VideoAlign fps must be finite and positive.")
-    if solution_image.ndim != 4 or solution_image.shape[0] < 2 or solution_image.shape[1] not in (1, 3):
+    if (
+        not isinstance(solution_image, torch.Tensor)
+        or solution_image.ndim != 4
+        or solution_image.shape[0] < 2
+        or solution_image.shape[1] not in (1, 3)
+    ):
         raise ValueError("VideoAlign requires video with shape [T,C,H,W], at least two frames, and 1 or 3 channels.")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("VideoAlign requires a non-empty text prompt via ground_truth or prompt_key.")
     video, _ = _sample_video(solution_image, fps)
     logits = await reward_model.infer([video], [prompt])
     if not isinstance(logits, torch.Tensor) or logits.shape != (1, 3):

@@ -15,6 +15,8 @@
 
 import importlib
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
@@ -44,6 +46,7 @@ def _batch(*, audio=None, sample_rate=48000, video=None, fps=24.0):
             batch=tensors,
             non_tensor_batch={
                 "audio_sample_rate": sample_rate,
+                "audio_layout": "CT",
                 "fps": fps,
                 "reward_inputs": {"text": {"audio": "audio prompt", "video": "video prompt"}},
             },
@@ -219,6 +222,7 @@ async def test_videoalign_native_sampling_prompt_and_calibration():
     result = await videoalign.compute_score(
         reward_model=model,
         batch=_batch(video=_video(range(8)), fps=48),
+        fps=48,
         prompt_key="video",
         score_weights=[0.5, 0.0, 0.5],
         score_means=[1.0, 0.0, 3.0],
@@ -258,6 +262,7 @@ async def test_desync_native_preparation_and_offset_score():
     result = await desync.compute_score(
         reward_model=SimpleNamespace(infer=AsyncMock(side_effect=infer)),
         batch=_batch(video=_video([0, 255]), audio=torch.ones(1, 1600), sample_rate=16000, fps=25),
+        fps=25,
     )
     assert result["score"] == pytest.approx(2 / 3)
 
@@ -276,7 +281,9 @@ async def test_av_scorers_reject_invalid_fps_before_inference(scorer, fps):
 async def test_videoalign_rejects_nonfinite_model_scores():
     model = SimpleNamespace(infer=AsyncMock(return_value=torch.tensor([[float("nan"), 0.0, 0.0]])))
     with pytest.raises(ValueError, match="score must be finite"):
-        await videoalign.compute_score(reward_model=model, solution_image=_video([0, 1]), fps=24)
+        await videoalign.compute_score(
+            reward_model=model, solution_image=_video([0, 1]), fps=24, ground_truth="video prompt"
+        )
 
 
 @pytest.mark.asyncio
@@ -310,3 +317,97 @@ async def test_clap_native_resamples_to_model_rate_and_preserves_source_rate():
     waveforms, prompts = model.infer.call_args.args
     assert waveforms[0].shape == (480,)
     assert prompts == ["prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", [None, "", "  "])
+async def test_videoalign_rejects_empty_text_before_inference(prompt):
+    model = SimpleNamespace(infer=AsyncMock())
+    with pytest.raises(ValueError, match="non-empty text prompt"):
+        await videoalign.compute_score(reward_model=model, solution_image=_video([0, 1]), fps=24, ground_truth=prompt)
+    model.infer.assert_not_awaited()
+
+
+def test_desync_serializes_inference_on_cpu(monkeypatch):
+    monkeypatch.setattr(desync, "_load_components", lambda *args: (torch.nn.Identity(), torch.nn.Identity()))
+    model = desync.DeSyncModel("unused", "cpu", "unused")
+    first_entered, second_attempted, second_entered, release = (threading.Event() for _ in range(4))
+
+    def infer(video, audio):
+        assert model._infer_lock.locked()
+        if video == 1:
+            first_entered.set()
+            assert release.wait(5)
+        else:
+            second_entered.set()
+        return video
+
+    monkeypatch.setattr(model, "_infer_micro_batch", infer)
+
+    def second_call():
+        second_attempted.set()
+        return model.infer(2, None)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(model.infer, 1, None)
+        try:
+            assert first_entered.wait(5)
+            second = pool.submit(second_call)
+            assert second_attempted.wait(5)
+            assert not second_entered.wait(0.1)
+        finally:
+            release.set()
+        assert first.result(timeout=5) == 1
+        assert second.result(timeout=5) == 2
+    assert second_entered.is_set()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_desync_npu_fastpath_changes_are_locked_and_restored(monkeypatch, fail):
+    monkeypatch.setattr(desync, "_load_components", lambda *args: (torch.nn.Identity(), torch.nn.Identity()))
+    model = desync.DeSyncModel("unused", "cpu", "unused")
+    model.device = SimpleNamespace(type="npu")
+    flags = [True]
+    monkeypatch.setattr(torch.backends.mha, "get_fastpath_enabled", lambda: flags[-1])
+
+    def set_flag(enabled):
+        assert model._infer_lock.locked()
+        assert desync._MHA_FASTPATH_LOCK.locked()
+        flags.append(enabled)
+
+    def infer(*args):
+        assert flags[-1] is False
+        if fail:
+            raise RuntimeError("inference failed")
+        return "logits"
+
+    monkeypatch.setattr(torch.backends.mha, "set_fastpath_enabled", set_flag)
+    monkeypatch.setattr(model, "_infer_micro_batch", infer)
+    if fail:
+        with pytest.raises(RuntimeError, match="inference failed"):
+            model.infer(None, None)
+    else:
+        assert model.infer(None, None) == "logits"
+    assert flags == [True, False, True]
+    assert not model._infer_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_videoalign_reports_missing_named_prompt():
+    model = SimpleNamespace(infer=AsyncMock())
+    with pytest.raises(ValueError, match="VideoAlign requires reward_inputs.text"):
+        await videoalign.compute_score(
+            reward_model=model, batch=_batch(video=_video([0, 1])), fps=24, prompt_key="missing"
+        )
+    model.infer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scorer", [audiobox, desync])
+async def test_new_audio_scorers_do_not_inherit_clap_rate_default(scorer):
+    model = SimpleNamespace(infer=AsyncMock())
+    with pytest.raises(KeyError, match="audio_sample_rate"):
+        await scorer.compute_score(
+            reward_model=model, solution_image=_video([0, 1]), fps=24, extra_info={"audio": torch.ones(16)}
+        )
+    model.infer.assert_not_awaited()

@@ -94,6 +94,8 @@ Don't assume more than that:
 
 ## Failure and heavy state
 
+- Scorers requiring a native `reward_model` validate required call arguments
+  before optional error handling. DeSync and VideoAlign require an explicit `fps` kwarg.
 - **Raising is allowed.** `MultiVisualRewardManager` catches per-sub-reward and
   substitutes `0.0` unless that entry sets `required: true`. `VisualRewardManager`
   has no try/except, so a raise there propagates — raise only when the run genuinely

@@ -15,6 +15,9 @@
 
 import inspect
 import os
+import re
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -539,3 +542,120 @@ async def test_batch_injection_is_signature_gated():
     assert result["reward_score"] == pytest.approx(0.75)
     assert result["reward_extra_info"]["reward/explicit"] == pytest.approx(0.5)
     assert result["reward_extra_info"]["reward/legacy"] == pytest.approx(0.25)
+
+
+def _native_av_manager(scorer, *, fps=24.0, include_fps=True, bind_model=True):
+    from unittest.mock import AsyncMock
+
+    entry = {
+        "path": f"pkg://verl_omni.utils.reward_score.{scorer}",
+        "name": "compute_score",
+        "required": False,
+        "audio_layout": "CT",
+    }
+    if include_fps:
+        entry["fps"] = fps
+    if bind_model:
+        entry["model"] = "av_model"
+    config = _make_config({"av": entry})
+    config.reward.models = OmegaConf.create({"av_model": {"backend": "native"}} if bind_model else {})
+    manager = MultiVisualRewardManager(config, MagicMock(), compute_score=None)
+    logits = torch.zeros((2, 1, 21) if scorer == "desync" else (1, 3))
+    if scorer == "desync":
+        logits[:, :, 10] = 1
+    model = SimpleNamespace(infer=AsyncMock(return_value=logits))
+    manager.set_reward_executors(None, {"av_model": SimpleNamespace(reward_kwargs=lambda: {"reward_model": model})})
+    data = DataProto.from_dict(
+        tensors={
+            "responses": torch.zeros(1, 4, 3, 4, 4, dtype=torch.uint8),
+            "audio": torch.ones(1, 1, 480),
+            "audio_sample_rate": torch.tensor([24000]),
+        },
+        non_tensors={"data_source": ["test"], "reward_model": [{"ground_truth": "a video"}], "extra_info": [{}]},
+    )
+    return manager, model, data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scorer", ["desync", "videoalign"])
+async def test_av_fps_config_reaches_real_manager_without_rollout_fps(scorer):
+    manager, model, data = _native_av_manager(scorer, fps=23.976)
+    assert "fps" not in data.batch and "fps" not in data.non_tensor_batch
+    result = await manager.run_single(data)
+    assert model.infer.await_count == 1
+    assert "reward/av/errors" not in result["reward_extra_info"]
+    assert isinstance(result["reward_score"], float)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scorer", ["desync", "videoalign"])
+async def test_missing_fps_config_is_fatal_even_for_optional_av_reward(scorer):
+    manager, model, data = _native_av_manager(scorer, include_fps=False)
+    with pytest.raises(ValueError, match="Invalid arguments.*fps"):
+        await manager.run_single(data)
+    model.infer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scorer", ["desync", "videoalign", "audiobox"])
+async def test_missing_native_model_binding_reports_configuration_error(scorer):
+    manager, model, data = _native_av_manager(scorer, bind_model=False)
+    with pytest.raises(ValueError, match="Invalid arguments.*reward_model"):
+        await manager.run_single(data)
+    model.infer.assert_not_awaited()
+
+
+async def reward_missing_legacy_argument(custom_option):
+    return float(custom_option)
+
+
+@pytest.mark.asyncio
+async def test_legacy_optional_scorer_missing_argument_still_contributes_zero():
+    manager = _build_manager({"legacy": {"path": DUMMY_REWARDS_PATH, "name": "reward_missing_legacy_argument"}})
+    result = await manager.run_single(_make_single_data())
+    assert result["reward_score"] == 0.0
+    assert result["reward_extra_info"]["reward/legacy/errors"] == 1
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CLAP_RECIPES = [
+    path for path in sorted((_REPO_ROOT / "examples").rglob("*.sh")) if "reward_score/clap.py" in path.read_text()
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recipe", _CLAP_RECIPES, ids=lambda path: str(path.relative_to(_REPO_ROOT)))
+async def test_existing_clap_recipe_config_accepts_stereo_without_layout(recipe, monkeypatch):
+    entry = dict(re.findall(r"reward\.reward_functions\.clap\.(\w+)=([^'\"\s]+)", recipe.read_text()))
+    assert "audio_layout" not in entry
+    entry["path"] = entry["path"].replace("$repo_root", str(_REPO_ROOT))
+    entry["device"] = "cpu"
+    manager = _build_manager({"clap": entry})
+    scorer_globals = manager._sub_rewards[0]["fn"].__globals__
+    captured_audio = []
+
+    def processor(*, audio, sampling_rate, **kwargs):
+        assert sampling_rate == 48000
+        captured_audio.extend(audio)
+        return {"features": torch.ones(len(audio), 2)}
+
+    def model(*, features):
+        return SimpleNamespace(audio_embeds=features, text_embeds=features)
+
+    monkeypatch.setitem(scorer_globals, "_load_clap", lambda *args: (model, processor))
+    source_rate = 24000 if "ltx2" in str(recipe) else 32000
+    data = _make_single_data()
+    data.batch["audio"] = torch.ones(1, 2, 480)
+    data.batch["audio_sample_rate"] = torch.tensor([source_rate])
+    try:
+        result = await manager.run_single(data)
+        assert result["reward_score"] == pytest.approx(1.0)
+        assert "reward/clap/errors" not in result["reward_extra_info"]
+        assert len(captured_audio) == 1
+        assert captured_audio[0].shape == (480 * 48000 // source_rate,)
+        assert result["reward_extra_info"]["reward/clap/source_sample_rate"] == source_rate
+    finally:
+        state = scorer_globals["_get_batching_state"]()
+        if state.consumer_task is not None:
+            state.queue.put_nowait((None, None, None, None, None))
+            await state.consumer_task
