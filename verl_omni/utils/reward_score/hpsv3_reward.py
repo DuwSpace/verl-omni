@@ -442,8 +442,11 @@ def _get_inferencer(checkpoint_path: str, device: str):
     return _inferencers[key]
 
 
-def _extract_frames(solution_image, frame_interval: int = 1) -> list[Image.Image]:
-    """Extract image frames, preferring the canonical CHW/TCHW layout."""
+def _normalize_video_layout(solution_image: torch.Tensor) -> torch.Tensor:
+    """Convert CHW/HWC, TCHW/THWC/CTHW, or BCTHW/BTHWC input to BTCHW.
+
+    Prefer CHW/TCHW for ambiguous unbatched shapes, preserving legacy layout detection.
+    """
     is_channels_last = solution_image.shape[-1] in (1, 3) if solution_image.ndim >= 3 else False
 
     if solution_image.ndim == 3:
@@ -452,29 +455,34 @@ def _extract_frames(solution_image, frame_interval: int = 1) -> list[Image.Image
                 solution_image = solution_image.permute(2, 0, 1)
             else:
                 raise ValueError(f"Expected CHW or HWC image input, got shape {tuple(solution_image.shape)}")
-        solution_image = solution_image.unsqueeze(0)
+        return solution_image.unsqueeze(0).unsqueeze(0)
 
     elif solution_image.ndim == 4:
         if solution_image.shape[1] in (1, 3):
-            # The reward-manager contract is TCHW; sample its leading time axis.
-            solution_image = solution_image[::frame_interval]
+            return solution_image.unsqueeze(0)
         elif is_channels_last:
             # Keep the existing channels-last extension for THWC direct callers.
-            solution_image = solution_image[::frame_interval].permute(0, 3, 1, 2)
+            solution_image = solution_image.permute(0, 3, 1, 2)
         elif solution_image.shape[0] in (1, 3):
             # Preserve compatibility with the legacy CTHW interpretation.
-            solution_image = solution_image[:, ::frame_interval].permute(1, 0, 2, 3)
+            solution_image = solution_image.permute(1, 0, 2, 3)
         else:
             raise ValueError(f"Expected TCHW or THWC video input, got shape {tuple(solution_image.shape)}")
+        return solution_image.unsqueeze(0)
 
     elif solution_image.ndim == 5:
         if is_channels_last:
             solution_image = solution_image.permute(0, 4, 1, 2, 3)
-        solution_image = solution_image[:, :, ::frame_interval]
-        solution_image = solution_image.permute(0, 2, 1, 3, 4)
-        solution_image = solution_image.reshape(-1, *solution_image.shape[2:])
+        return solution_image.permute(0, 2, 1, 3, 4)
 
-    return [_frame_to_pil(torch.as_tensor(frame)) for frame in solution_image]
+    raise ValueError(f"Expected a 3-D image or 4-D/5-D video, got shape {tuple(solution_image.shape)}")
+
+
+def _extract_frames(solution_image, frame_interval: int = 1) -> list[Image.Image]:
+    """Extract frames at the given interval within each video, then flatten the batch."""
+    video = _normalize_video_layout(solution_image)
+    frames = video[:, ::frame_interval].flatten(0, 1)
+    return [_frame_to_pil(frame) for frame in frames]
 
 
 def _score_batch(requests: list[_ScoreRequest]) -> list[dict | Exception]:
@@ -698,8 +706,7 @@ async def compute_score_hpsv3(
 def _select_reward_frames(solution_image, extra_info, num_frames):
     if num_frames is None:
         return _extract_frames(solution_image, frame_interval=extra_info.get("frame_interval", 4))
-    # Uniform sampling uses the standard single-sample CHW/TCHW contract.
-    video = solution_image.unsqueeze(0) if solution_image.ndim == 3 else solution_image
+    video = _normalize_video_layout(solution_image).flatten(0, 1)
     indices = torch.linspace(0, video.shape[0] - 1, num_frames).round().long().tolist()
     return [_frame_to_pil(video[index]) for index in indices]
 
