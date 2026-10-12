@@ -95,6 +95,7 @@ async def compute_score(
     *,
     reward_model,
     batch=None,
+    audio_layout: str | None = None,
     axis_weights=None,
     score_scale: float = 0.025,  # 1 / 40, matching OmniNFT's reward scaling.
     **kwargs,
@@ -111,7 +112,7 @@ async def compute_score(
     """
     del data_source, solution_image, ground_truth, kwargs
     extra_info = audio_info_from_batch(extra_info, batch, scorer="AudioBox")
-    waveform, source_rate = get_audio(extra_info)
+    waveform, source_rate = get_audio(extra_info, audio_layout=audio_layout)
     windows, masks, weights = _make_windows([resample_audio(waveform, source_rate, _AUDIOBOX_SAMPLE_RATE)])
     output = await reward_model.infer(windows, masks)
     if axis_weights is None:

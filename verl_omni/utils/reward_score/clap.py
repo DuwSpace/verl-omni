@@ -65,7 +65,12 @@ def _get_batching_state() -> _BatchingState:
     return state
 
 
-_get_audio = get_audio  # Keep the existing helper name for external scorer tests.
+def _get_audio(extra_info: dict) -> tuple[torch.Tensor, int]:
+    """Preserve legacy CLAP rate/layout defaults while sharing audio validation."""
+    info = dict(extra_info)
+    info.setdefault("audio_sample_rate", _CLAP_SAMPLE_RATE)
+    info.setdefault("audio_layout", "CT")
+    return get_audio(info)
 
 
 def _load_clap(model_name_or_path: str, device: str):
@@ -209,6 +214,7 @@ async def compute_score(
     *,
     reward_model=None,
     batch=None,
+    audio_layout: str | None = None,
     prompt_key: str | None = None,
     score_scale: float = 1.0,
     score_offset: float = 0.0,
@@ -228,6 +234,10 @@ async def compute_score(
     del data_source, solution_image, kwargs
     prompt = ground_truth or ""
     extra_info = audio_info_from_batch(extra_info, batch, scorer="CLAP")
+    if audio_layout is not None:
+        if extra_info.get("audio_layout") not in (None, audio_layout):
+            raise ValueError("Conflicting audio_layout in scorer config and extra_info.")
+        extra_info["audio_layout"] = audio_layout
     if prompt_key is not None:
         if batch is None:
             raise ValueError("CLAP prompt_key requires a single-sample batch.")

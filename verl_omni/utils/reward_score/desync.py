@@ -209,13 +209,15 @@ async def compute_score(
     *,
     reward_model,
     batch=None,
-    fps: float | None = None,
+    audio_layout: str | None = None,
+    fps: float,
     **kwargs,
 ) -> dict[str, float]:
     """Score AV synchrony as 1 / (1 + mean absolute predicted offset).
 
-    Read audio/rates from extra_info or a single-sample batch. The checkpoint's
-    21 offset classes and fixed segment preprocessing define this model's score.
+    Configure the generated video fps explicitly; read audio/rates from extra_info
+    or a single-sample batch. The checkpoint's 21 offset classes and fixed segment
+    preprocessing define this model's score.
     """
     del data_source, ground_truth, kwargs
     extra_info = audio_info_from_batch(extra_info, batch, scorer="DeSync")
@@ -223,16 +225,17 @@ async def compute_score(
         item = batch[0]
         if solution_image is None:
             solution_image = item.batch["responses"]
-        if "fps" in item.batch:
-            extra_info["fps"] = item.batch["fps"]
-        elif "fps" in item.non_tensor_batch:
-            extra_info["fps"] = item.non_tensor_batch["fps"]
-    fps = float(extra_info["fps"] if fps is None else fps)
+    fps = float(fps)
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("DeSync fps must be finite and positive.")
-    if solution_image.ndim != 4 or solution_image.shape[1] != 3 or solution_image.dtype != torch.uint8:
+    if (
+        not isinstance(solution_image, torch.Tensor)
+        or solution_image.ndim != 4
+        or solution_image.shape[1] != 3
+        or solution_image.dtype != torch.uint8
+    ):
         raise ValueError("DeSync requires uint8 RGB video with shape [T,3,H,W].")
-    waveform, source_rate = get_audio(extra_info)
+    waveform, source_rate = get_audio(extra_info, audio_layout=audio_layout)
     video = _prepare_video(solution_image.detach().cpu(), fps)
     audio = _prepare_audio(waveform.unsqueeze(0), source_rate)
     logits = await reward_model.infer(video.unsqueeze(0), audio.unsqueeze(0))
@@ -253,6 +256,7 @@ class DeSyncModel:
         self.device = torch.device(device)
         self.model.to(self.device).eval()
         self.mel.to(self.device)
+        self._infer_lock = threading.Lock()
 
     def close(self) -> None:
         """Drop model/mel references; reuse requires constructing a new adapter."""
@@ -281,7 +285,7 @@ class DeSyncModel:
         audio_segments = audio_segments.to(self.device)
         mel = _pad_mel_time(torch.log(self.mel(audio_segments) + 1e-6))
         # Match OmniNFT's Synchformer preprocessing:
-        # https://github.com/zghhui/OmniNFT/blob/master/flow_grpo/audio_video_align/av_desync.py
+        # https://github.com/zghhui/OmniNFT/blob/fb9237f6e74edf0d0f2a683f4d975b79fde588fe/flow_grpo/audio_video_align/av_desync.py
         mel = (mel - (-4.2677393)) / (2 * 4.5689974)
         auditory = self.model.extract_afeats(mel.unsqueeze(2))
 
@@ -302,17 +306,18 @@ class DeSyncModel:
         """Infer prepared video ``[B, 200, 3, 224, 224]`` and audio ``[B, 128000]``.
 
         Return detached CPU offset logits ``[2, B, 21]`` without gradients.
-        On NPU, disable the process-wide MHA fastpath for the forward because the
-        Synchformer attention path is unsupported there. A module
+        Serialize calls on each model instance. On NPU, disable the process-wide
+        MHA fastpath because the Synchformer attention path is unsupported there. A module
         lock serializes these calls and ``finally`` restores the previous flag;
         unrelated callers that do not use this lock can observe the temporary flag.
         """
-        if self.device.type != "npu":
-            return self._infer_micro_batch(video, audio)
-        with _MHA_FASTPATH_LOCK:
-            fastpath_enabled = torch.backends.mha.get_fastpath_enabled()
-            torch.backends.mha.set_fastpath_enabled(False)
-            try:
+        with self._infer_lock:
+            if self.device.type != "npu":
                 return self._infer_micro_batch(video, audio)
-            finally:
-                torch.backends.mha.set_fastpath_enabled(fastpath_enabled)
+            with _MHA_FASTPATH_LOCK:
+                fastpath_enabled = torch.backends.mha.get_fastpath_enabled()
+                torch.backends.mha.set_fastpath_enabled(False)
+                try:
+                    return self._infer_micro_batch(video, audio)
+                finally:
+                    torch.backends.mha.set_fastpath_enabled(fastpath_enabled)
