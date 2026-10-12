@@ -148,7 +148,7 @@ class MultiRewardManager(RewardManagerBase, ABC):
     async def _build_reward_kwargs(self, data_item: DataProto) -> dict:
         """Build scorer kwargs for one sample in a modality-specific subclass."""
 
-    async def _run_multi_reward(self, all_kwargs: dict) -> dict:
+    async def _run_multi_reward(self, all_kwargs: dict, data: DataProto) -> dict:
         """Execute configured reward terms and preserve their weighted outputs."""
         combined_score = 0.0
         reward_extra_info = {}
@@ -217,7 +217,7 @@ class MultiRewardManager(RewardManagerBase, ABC):
         """Prepare one sample through the subclass input contract, then aggregate."""
         if len(data) != 1:
             raise ValueError(f"{type(self).__name__} scores one sample at a time, got batch size {len(data)}.")
-        return await self._run_multi_reward(await self._build_reward_kwargs(data[0]))
+        return await self._run_multi_reward(await self._build_reward_kwargs(data[0]), data)
 
 
 class MultiVisualRewardManager(MultiRewardManager):
