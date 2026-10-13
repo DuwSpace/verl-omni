@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 10/12/2026
+Last updated: 10/13/2026
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -299,8 +299,12 @@ requires `source_root` in `executor.kwargs`; VideoAlign requires `base_model_pat
 DeSync and VideoAlign require `fps` in each reward-function config. Set it to the
 actual generated frame rate, including fractional rates; there is no inferred
 or checkpoint-default FPS. For scorers that require a native `reward_model`,
-missing required arguments are configuration errors and fail before optional reward-error handling, even
-with `required: false`. Existing scorers retain their optional failure behavior.
+missing required arguments are configuration errors and fail before optional
+reward-error handling, even with `required: false`. If such a scorer also requires
+`fps`, the manager rejects null, boolean, non-numeric, non-finite, zero, and negative
+values before calling it. Positive fractional rates and numeric strings remain
+supported. Optional model inference failures still contribute zero and record an
+error; existing scorers retain their optional failure behavior.
 For example, with a configured native `desync` model:
 
 ```yaml

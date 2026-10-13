@@ -578,8 +578,9 @@ def _native_av_manager(scorer, *, fps=24.0, include_fps=True, bind_model=True):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scorer", ["desync", "videoalign"])
-async def test_av_fps_config_reaches_real_manager_without_rollout_fps(scorer):
-    manager, model, data = _native_av_manager(scorer, fps=23.976)
+@pytest.mark.parametrize("fps", [24, 23.976, "23.976"])
+async def test_av_fps_config_reaches_real_manager_without_rollout_fps(scorer, fps):
+    manager, model, data = _native_av_manager(scorer, fps=fps)
     assert "fps" not in data.batch and "fps" not in data.non_tensor_batch
     result = await manager.run_single(data)
     assert model.infer.await_count == 1
@@ -597,6 +598,31 @@ async def test_missing_fps_config_is_fatal_even_for_optional_av_reward(scorer):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scorer", ["desync", "videoalign"])
+@pytest.mark.parametrize(
+    "fps", [None, 0, -1, float("nan"), float("inf"), -float("inf"), "invalid", True, False, [], {}]
+)
+async def test_invalid_fps_config_is_fatal_even_for_optional_av_reward(scorer, fps):
+    manager, model, data = _native_av_manager(scorer, fps=fps)
+    with pytest.raises(ValueError, match="Invalid arguments.*av.*fps.*finite and positive"):
+        await manager.run_single(data)
+    model.infer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scorer", ["desync", "videoalign"])
+async def test_optional_av_inference_failure_still_contributes_zero(scorer):
+    manager, model, data = _native_av_manager(scorer)
+    model.infer.side_effect = RuntimeError("model inference failed")
+
+    result = await manager.run_single(data)
+
+    model.infer.assert_awaited_once()
+    assert result["reward_score"] == 0.0
+    assert result["reward_extra_info"]["reward/av/errors"] == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("scorer", ["desync", "videoalign", "audiobox"])
 async def test_missing_native_model_binding_reports_configuration_error(scorer):
     manager, model, data = _native_av_manager(scorer, bind_model=False)
@@ -607,6 +633,18 @@ async def test_missing_native_model_binding_reports_configuration_error(scorer):
 
 async def reward_missing_legacy_argument(custom_option):
     return float(custom_option)
+
+
+async def reward_legacy_fps(fps):
+    return float(fps)
+
+
+@pytest.mark.asyncio
+async def test_legacy_scorer_fps_argument_keeps_existing_semantics():
+    manager = _build_manager({"legacy": {"path": DUMMY_REWARDS_PATH, "name": "reward_legacy_fps", "fps": -1}})
+    result = await manager.run_single(_make_single_data())
+    assert result["reward_score"] == -1.0
+    assert "reward/legacy/errors" not in result["reward_extra_info"]
 
 
 @pytest.mark.asyncio
