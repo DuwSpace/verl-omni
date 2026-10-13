@@ -15,6 +15,7 @@
 
 import inspect
 import logging
+import math
 from abc import ABC, abstractmethod
 from collections import ChainMap
 
@@ -212,6 +213,16 @@ class MultiRewardManager(RewardManagerBase, ABC):
                     sig.bind(**filtered_kwargs)
                 except TypeError as exc:
                     raise ValueError(f"Invalid arguments for sub-reward {key!r}: {exc}") from exc
+                fps_arg = sig.parameters.get("fps")
+                if fps_arg is not None and fps_arg.default is inspect.Parameter.empty:
+                    fps = filtered_kwargs["fps"]
+                    message = f"Invalid arguments for sub-reward {key!r}: fps must be finite and positive, got {fps!r}"
+                    try:
+                        numeric_fps = float(fps)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise ValueError(message) from exc
+                    if isinstance(fps, bool) or not math.isfinite(numeric_fps) or numeric_fps <= 0:
+                        raise ValueError(message)
 
             try:
                 if is_async:
