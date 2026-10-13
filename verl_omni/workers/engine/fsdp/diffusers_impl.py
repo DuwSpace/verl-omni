@@ -1630,12 +1630,14 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
     def _build_module(self):
-        from verl_omni.pipelines.ltx2_omni_nft.compat import apply_ltx_npu_rms_norm_workaround
-
         module = super()._build_module()
         if self.model_config.enable_gradient_checkpointing:
             self._enable_omni_gradient_checkpointing(module)
-        return apply_ltx_npu_rms_norm_workaround(module)
+        if self.model_config.architecture == "LTX2Pipeline" and self.model_config.algorithm == "omni_nft":
+            from verl_omni.pipelines.ltx2_omni_nft.compat import apply_ltx_npu_rms_norm_workaround
+
+            apply_ltx_npu_rms_norm_workaround(module)
+        return module
 
     def _enable_omni_gradient_checkpointing(self, module: torch.nn.Module) -> None:
         from verl.utils.torch_dtypes import PrecisionType
