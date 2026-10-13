@@ -15,6 +15,7 @@
 
 import inspect
 import logging
+from time import perf_counter
 
 from verl import DataProto
 from verl.utils.import_utils import load_extern_object
@@ -73,7 +74,7 @@ class MultiVisualRewardManager(VisualRewardManager):
 
         self._sub_rewards = []
         total_weight = 0.0
-        _reserved_keys = {"path", "name", "weight", "required", "model"}
+        _reserved_keys = {"path", "name", "weight", "required", "model", "routing_weights"}
         for key, entry in reward_functions_cfg.items():
             model_name = resolve_reward_model_name(key, entry, reward_models_cfg)
             path = entry.get("path")
@@ -95,6 +96,8 @@ class MultiVisualRewardManager(VisualRewardManager):
                 required = required_value
             else:
                 raise TypeError(f"required must be a boolean, got {type(required_value).__name__}")
+            if config.reward.get("aggregation") == "preserve_components" and (not required or weight != 1.0):
+                raise ValueError("Component rewards require required=true and weight=1.0; use routing_weights instead.")
             total_weight += weight
 
             # Collect non-manager fields to pass to compute_score.
@@ -184,6 +187,8 @@ class MultiVisualRewardManager(VisualRewardManager):
 
             # Merge per-reward extra config fields into kwargs
             sub_kwargs = {**all_kwargs, **extra_args}
+            if sig is not None and "batch" in sig.parameters:
+                sub_kwargs["batch"] = data
             filtered_kwargs = _filter_kwargs(sub_kwargs, sig) if sig is not None else {}
 
             if model_name is not None:
@@ -197,6 +202,14 @@ class MultiVisualRewardManager(VisualRewardManager):
                     raise RuntimeError(f"Reward model {model_name!r} cannot be used with a reward function")
                 filtered_kwargs = _filter_kwargs({**sub_kwargs, **reward_kwargs()}, sig)
 
+            native_model_arg = sig.parameters.get("reward_model") if sig is not None else None
+            if native_model_arg is not None and native_model_arg.default is inspect.Parameter.empty:
+                try:
+                    sig.bind(**filtered_kwargs)
+                except TypeError as exc:
+                    raise ValueError(f"Invalid arguments for sub-reward {key!r}: {exc}") from exc
+
+            score_started = perf_counter()
             try:
                 if is_async:
                     result = await fn(**filtered_kwargs)
@@ -222,6 +235,10 @@ class MultiVisualRewardManager(VisualRewardManager):
                 reward_extra_info[f"reward/{key}/errors"] = 1
                 score = 0.0
 
+            # Awaited wall time per sample, including executor queueing but not
+            # model wake-up. Concurrent scorer times must not be added to obtain
+            # the reward phase's independently measured elapsed time.
+            reward_extra_info[f"reward/{key}/score_seconds"] = perf_counter() - score_started
             reward_extra_info[f"reward/{key}"] = score
             combined_score += weight * score
 

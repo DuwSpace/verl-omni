@@ -20,7 +20,15 @@ from verl_omni.trainer.diffusion.native_ray_trainer import NativeRayDiffusionTra
 class BagelJointRayTrainer(NativeRayDiffusionTrainer):
     """Reuse Ray transport/reward/checkpoints; replace generation and loss preparation."""
 
+    policy_version_key = "_bagel_policy_version"
+    sample_seed_key = "_bagel_sample_seed"
+
     def __init__(self, config, *args, **kwargs):
+        self.validate_joint_config(config)
+        super().__init__(config, *args, **kwargs)
+
+    @staticmethod
+    def validate_joint_config(config):
         model, actor, rollout = (
             config.actor_rollout_ref.model,
             config.actor_rollout_ref.actor,
@@ -36,7 +44,6 @@ class BagelJointRayTrainer(NativeRayDiffusionTrainer):
             raise ValueError("Joint BAGEL currently supports full-weight training only")
         if rollout.seed is None:
             raise ValueError("Joint BAGEL requires an explicit seed")
-        super().__init__(config, *args, **kwargs)
 
     def _generate_native(self, gen_batch_output):
         """Mix prompts across replicas, then restore exact group/seed output order."""
@@ -47,16 +54,20 @@ class BagelJointRayTrainer(NativeRayDiffusionTrainer):
         uids = gen_batch_output.non_tensor_batch.get("uid")
         if uids is None or not (uids.reshape(-1, group_size) == uids.reshape(-1, group_size)[:, :1]).all():
             raise ValueError("Joint rollout requires contiguous repeated prompt UID groups")
-        version = self.global_steps - 1
-        gen_batch_output.non_tensor_batch["_bagel_policy_version"] = np.full(count, version)
-        gen_batch_output.non_tensor_batch["_bagel_sample_seed"] = (
-            self.config.actor_rollout_ref.rollout.seed + version * count + np.arange(count)
-        )
+        version = self._rollout_version()
+        gen_batch_output.non_tensor_batch[self.policy_version_key] = np.full(count, version)
+        gen_batch_output.non_tensor_batch[self.sample_seed_key] = self._rollout_seeds(count, version)
         # A contiguous prompt group otherwise monopolizes one replica; long
         # thinking on that prompt leaves replicas with short prompts idle.
         permutation = np.arange(count).reshape(-1, group_size).T.reshape(-1)
         output = super()._generate_native(gen_batch_output.select_idxs(permutation))
         return output.select_idxs(np.argsort(permutation))
+
+    def _rollout_version(self):
+        return self.global_steps - 1
+
+    def _rollout_seeds(self, count, version):
+        return self.config.actor_rollout_ref.rollout.seed + version * count + np.arange(count)
 
     def _prepare_actor_batch(self, batch, reward_tensor):
         return BagelUniGRPONFTLoss.prepare_actor_batch(batch, reward_tensor, self.config)

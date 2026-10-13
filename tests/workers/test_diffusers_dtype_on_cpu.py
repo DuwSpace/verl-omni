@@ -13,10 +13,17 @@
 # limitations under the License.
 """CPU tests for diffusers model dtype finalization."""
 
+from types import SimpleNamespace
+
 import torch
 
 from verl_omni.pipelines.wan22_dance_grpo.diffusers_training_adapter import Wan22DanceGRPO
-from verl_omni.workers.engine.fsdp.diffusers_impl import _cast_loaded_diffusers_module, _fsdp_param_dtype
+from verl_omni.workers.engine.fsdp.diffusers_impl import (
+    DiffusersFSDPEngine,
+    DiffusionModelBase,
+    _cast_loaded_diffusers_module,
+    _fsdp_param_dtype,
+)
 
 
 class _MixedPrecisionModel(torch.nn.Module):
@@ -71,3 +78,15 @@ def test_ordinary_diffusers_model_is_cast_to_engine_dtype():
 
     assert model[0].weight.dtype == torch.bfloat16
     assert _fsdp_param_dtype(model, torch.bfloat16) == torch.bfloat16
+
+
+def test_custom_registry_loader_preserves_declared_fp32_islands(monkeypatch):
+    model = _MixedPrecisionModel()
+    before = model.sensitive.weight.detach().clone()
+    adapter = SimpleNamespace(build_module=lambda config, dtype: model, preserve_fp32_modules=lambda: True)
+    monkeypatch.setattr(DiffusionModelBase, "get_class", lambda config: adapter)
+    engine = SimpleNamespace(model_config=SimpleNamespace(enable_gradient_checkpointing=False))
+    actual = DiffusersFSDPEngine._build_module_from_registry(engine, torch.bfloat16)
+    assert actual is model and model.regular.weight.dtype == torch.bfloat16
+    assert model.sensitive.weight.dtype == torch.float32
+    torch.testing.assert_close(model.sensitive.weight, before, rtol=0, atol=0)

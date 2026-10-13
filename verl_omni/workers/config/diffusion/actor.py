@@ -14,7 +14,7 @@
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import ClassVar, Optional
 
 from omegaconf import MISSING
 from verl.base_config import BaseConfig
@@ -29,6 +29,8 @@ from .model import DiffusionModelConfig
 
 __all__ = [
     "DiffusionLossConfig",
+    "OmniNFTLossConfig",
+    "LTXJointLossConfig",
     "VeOmniDiffusionEngineConfig",
     "VeOmniDiffusionOptimizerConfig",
     "FSDPDiffusionOptimizerConfig",
@@ -70,6 +72,8 @@ class DiffusionLossConfig(BaseConfig):
             "unigrpo",
             "unigrpo_nft",
             "diffusion_nft",
+            "omni_nft",
+            "ltx2_unigrpo_nft",
             "dpo",
             "dmd2",
             "dance_grpo",
@@ -94,6 +98,59 @@ class DiffusionLossConfig(BaseConfig):
             raise ValueError("Hybrid AR clip ratio must be finite and in (0, 1)")
         if not isinstance(self.nft_timesteps_per_sample, int) or self.nft_timesteps_per_sample <= 0:
             raise ValueError("NFT timesteps per sample must be a positive integer")
+
+
+@dataclass
+class OmniNFTLossConfig(DiffusionLossConfig):
+    """Preserve the LTX OmniNFT modality objective and reference coefficients."""
+
+    expected_loss_mode: ClassVar[str] = "omni_nft"
+
+    # Forward-process joint audio/video objective.
+    loss_mode: str = "omni_nft"
+    # Modality loss weights, independent of reward routing weights.
+    video_weight: float = 1.0
+    audio_weight: float = 1.0
+    # Frozen-reference velocity MSE coefficients for each modality.
+    video_ref_kl_coef: float = 0.0
+    audio_ref_kl_coef: float = 0.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.loss_mode != self.expected_loss_mode:
+            raise ValueError(f"Expected loss_mode={self.expected_loss_mode!r}, got {self.loss_mode!r}.")
+        for name in ("video_weight", "audio_weight", "video_ref_kl_coef", "audio_ref_kl_coef"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative, got {value}.")
+        if self.video_weight + self.audio_weight <= 0:
+            raise ValueError("At least one OmniNFT modality loss weight must be positive.")
+
+
+@dataclass
+class LTXJointLossConfig(OmniNFTLossConfig):
+    """Unnormalized text/AV coefficients for the joint Gemma/DiT objective."""
+
+    expected_loss_mode: ClassVar[str] = "ltx2_unigrpo_nft"
+    # Joint text GRPO and audio/video OmniNFT objective.
+    loss_mode: str = "ltx2_unigrpo_nft"
+    # AV coefficient; text_loss_weight is inherited. No normalization by their sum.
+    av_loss_weight: float = 1.0
+    # Scalar text reward uses the mean of the source video/audio probabilities.
+    text_probability_reduction: str = "mean"
+    # Within-prompt population-standard-deviation stabilization for text GRPO.
+    text_advantage_epsilon: float = 1e-6
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not math.isfinite(self.av_loss_weight) or self.av_loss_weight < 0:
+            raise ValueError("av_loss_weight must be finite and nonnegative")
+        if self.text_loss_weight + self.av_loss_weight <= 0:
+            raise ValueError("At least one joint loss coefficient must be positive")
+        if self.text_probability_reduction != "mean":
+            raise ValueError("Supported text_probability_reduction: mean")
+        if not math.isfinite(self.text_advantage_epsilon) or self.text_advantage_epsilon <= 0:
+            raise ValueError("text_advantage_epsilon must be finite and positive")
 
 
 @dataclass

@@ -1,0 +1,146 @@
+# @package _global_
+# LTX-2.3 Gemma/DiT LoRA: synchronous native rollout and joint updates.
+defaults:
+  - diffusion_trainer
+  - rewards
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://verl_omni.trainer.config
+
+
+data:
+  train_files: ${oc.env:LTX_TRAIN_FILE}
+  val_files: ${oc.env:LTX_VAL_FILE}
+  train_batch_size: 2
+  max_prompt_length: 256
+  dataloader_num_workers: 0
+  validation_shuffle: false
+
+algorithm:
+  trainer_type: direct_preference
+  sample_source: online
+  global_std: true
+  adv_mode: continuous
+  timestep_fraction: 0.1
+
+actor_rollout_ref:
+  model:
+    path: ${oc.env:LTX_MODEL_PATH}
+    tokenizer_path: ${oc.env:LTX_MODEL_PATH}/tokenizer
+    architecture: LTX2Pipeline
+    algorithm: ltx2_unigrpo_nft
+    model_type: diffusion_model
+    attn_backend: native
+    enable_gradient_checkpointing: true
+    lora_rank: 8
+    lora_alpha: 8
+    lora_dtype: fp32
+    policy_state_adapters: [default]
+    target_modules: '^(gemma\.model\.language_model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)|transformer\.transformer_blocks\.\d+\..*\.(to_q|to_k|to_v|to_out\.0))$'
+  actor:
+    strategy: fsdp2
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_epochs: 1
+    shuffle: false
+    optim:
+      _target_: verl_omni.workers.config.diffusion.FSDPDiffusionOptimizerConfig
+      lr: 1.0e-5
+      param_group_lrs: {gemma: 1.0e-6}
+      override_optimizer_config: {foreach: false}
+    fsdp_config:
+      model_dtype: bfloat16
+      param_offload: false
+      optimizer_offload: false
+      offload_policy: true
+    diffusion_loss:
+      _target_: verl_omni.workers.config.diffusion.LTXJointLossConfig
+      loss_mode: ltx2_unigrpo_nft
+      text_loss_weight: 1.0
+      av_loss_weight: 1.0
+      text_probability_reduction: mean
+      text_advantage_epsilon: 1.0e-6
+      ar_clip_ratio: 0.01
+      mix_beta: 1.0
+      adv_clip_max: 5.0
+      video_weight: 1.0
+      audio_weight: 1.0
+      video_ref_kl_coef: 0.0001
+      audio_ref_kl_coef: 0.0001
+  rollout:
+    name: vllm_omni
+    tensor_model_parallel_size: 1
+    max_num_seqs: 1
+    n: 8
+    seed: 42
+    enforce_eager: true
+    rollout_attn_backend: TORCH_SDPA
+    log_prob_micro_batch_size_per_gpu: 1
+    pipeline:
+      output_type: video
+      height: 256
+      width: 256
+      num_frames: 33
+      frame_rate: 24.0
+      num_inference_steps: 30
+      max_sequence_length: 1024
+
+reward:
+  num_workers: 8
+  accelerator_workers:
+    enabled: true
+  models:
+    video_align:
+      placement:
+        devices: [0]
+      model_path: ${oc.env:LTX_REWARD_ROOT}/VideoReward/checkpoint-11352/model.pth
+      executor:
+        kwargs:
+          base_model_path: ${oc.env:LTX_REWARD_ROOT}/Qwen2-VL-2B-Instruct
+    hpsv3:
+      placement:
+        devices: [1]
+      model_path: ${oc.env:LTX_REWARD_ROOT}/HPSv3/HPSv3.safetensors
+      executor:
+        kwargs:
+          base_model_path: ${oc.env:LTX_REWARD_ROOT}/Qwen2-VL-7B-Instruct
+    audiobox:
+      placement:
+        devices: [2]
+      model_path: ${oc.env:LTX_REWARD_ROOT}/audiobox-aesthetics
+    clap:
+      placement:
+        devices: [3]
+      model_path: ${oc.env:LTX_REWARD_ROOT}/checkpoints/clap-htsat-unfused
+    desync:
+      placement:
+        devices: [4]
+      model_path: ${oc.env:LTX_REWARD_ROOT}/synchformer/synchformer_state_dict.pth
+      executor:
+        kwargs:
+          source_root: ${oc.env:LTX_REWARD_ROOT}/OmniNFT-reference
+
+trainer:
+  device: npu
+  logger: console
+  project_name: ltx2-unigrpo-nft
+  experiment_name: gemma-dit-joint
+  val_before_train: false
+  n_gpus_per_node: 8
+  nnodes: 1
+  save_freq: 1
+  max_actor_ckpt_to_keep: 2
+  test_freq: 1
+  total_epochs: 100
+  total_training_steps: 3
+  resume_mode: disable
+  default_local_dir: ${oc.env:LTX_OUTPUT_DIR}/checkpoints
+  rollout_data_dir: ${oc.env:LTX_OUTPUT_DIR}/samples
+
+ray_kwargs:
+  ray_init:
+    address: local
+    num_cpus: 64
+    object_store_memory: 8589934592

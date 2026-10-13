@@ -128,7 +128,7 @@ async def test_score_queue_is_bounded(monkeypatch):
 
 
 def test_to_pil_preserves_uint8_pixel_values():
-    image = hpsv3_reward._to_pil_hwc(_image(173))
+    image = hpsv3_reward._frame_to_pil(_image(173))
 
     assert image.mode == "RGB"
     assert image.getpixel((0, 0)) == (173, 173, 173)

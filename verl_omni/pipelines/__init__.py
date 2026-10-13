@@ -19,6 +19,7 @@ from . import (
     boogu_image_flow_grpo,
     flux_dance_grpo,
     ltx2_flow_grpo,
+    ltx2_unigrpo_nft,
     minimax_h3_diffusion_nft,
     minimax_h3_flow_grpo,
     qwen3_omni,
@@ -39,6 +40,7 @@ from .bagel_unigrpo_nft import *  # noqa: F401, F403
 from .boogu_image_flow_grpo import *  # noqa: F401, F403
 from .flux_dance_grpo import *  # noqa: F401, F403
 from .ltx2_flow_grpo import *  # noqa: F401, F403
+from .ltx2_unigrpo_nft import *  # noqa: F401, F403
 from .minimax_h3_diffusion_nft import *  # noqa: F401, F403
 from .minimax_h3_flow_grpo import *  # noqa: F401, F403
 from .qwen3_omni import *  # noqa: F401, F403
@@ -62,6 +64,7 @@ __all__ += list(bagel_flow_grpo.__all__)
 __all__ += list(bagel_unigrpo.__all__)
 __all__ += list(bagel_unigrpo_nft.__all__)
 __all__ += list(ltx2_flow_grpo.__all__)
+__all__ += list(ltx2_unigrpo_nft.__all__)
 __all__ += list(minimax_h3_diffusion_nft.__all__)
 __all__ += list(minimax_h3_flow_grpo.__all__)
 __all__ += list(sd3_dpo.__all__)

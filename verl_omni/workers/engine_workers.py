@@ -242,6 +242,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024 ** 3)
 
         metrics: dict = output.pop("metrics")
+        if getattr(self.model_config, "algorithm", None) == "ltx2_unigrpo_nft" and not forward_only:
+            device_api = torch.get_device_module(self.device_name)
+            metrics["train/max_memory_allocated_gib"] = [device_api.max_memory_allocated() / 1024**3]
+            metrics["train/max_memory_reserved_gib"] = [device_api.max_memory_reserved() / 1024**3]
         dp_group = self.engine.get_data_parallel_group()
 
         # perform all gather in dp group to ensure that it's correct.

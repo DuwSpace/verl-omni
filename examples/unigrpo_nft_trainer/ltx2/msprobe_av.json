@@ -1,0 +1,21 @@
+{
+  "task": "tensor",
+  "level": "L0",
+  "rank": [],
+  "step": [
+    0
+  ],
+  "async_dump": false,
+  "tensor": {
+    "scope": [],
+    "list": [
+      "connectors",
+      "transformer",
+      "language_model.norm"
+    ],
+    "data_mode": [
+      "input",
+      "output"
+    ]
+  }
+}

@@ -27,7 +27,7 @@ from verl.workers.config.model import MtpConfig
 
 from verl_omni.utils.fs import resolve_model_local_dir
 
-from .rollout import BagelJointRolloutConfig, DiffusionPipelineConfig, DiffusionRolloutAlgoConfig
+from .rollout import BagelJointRolloutConfig, DiffusionPipelineConfig, DiffusionRolloutAlgoConfig, LTXJointRolloutConfig
 
 __all__ = ["DiffusionModelConfig"]
 
@@ -125,6 +125,7 @@ class DiffusionModelConfig(BaseConfig):
 
     # Exact rollout settings consumed by the joint engine hooks.
     bagel_joint: BagelJointRolloutConfig = field(default_factory=BagelJointRolloutConfig)
+    ltx_joint: LTXJointRolloutConfig = field(default_factory=LTXJointRolloutConfig)
 
     algo: Optional[DiffusionRolloutAlgoConfig] = field(default_factory=DiffusionRolloutAlgoConfig)
 

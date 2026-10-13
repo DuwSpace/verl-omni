@@ -162,6 +162,10 @@ def _get_trainer_cls(config):
     if trainer_type == "policy_gradient":
         return PolicyGradientRayTrainer
     if trainer_type == "direct_preference":
+        if OmegaConf.select(config, "actor_rollout_ref.model.algorithm") == "ltx2_unigrpo_nft":
+            from verl_omni.trainer.diffusion.ltx_joint_ray_trainer import LTXJointRayTrainer
+
+            return LTXJointRayTrainer
         return DirectPreferenceRayTrainer
     if trainer_type == "unigrpo":
         from verl_omni.trainer.diffusion.native_ray_trainer import NativeRayDiffusionTrainer
@@ -200,7 +204,10 @@ class TaskRunner:
         from verl_omni.workers.engine_workers import ActorRolloutRefWorker
 
         actor_rollout_cls = ActorRolloutRefWorker
-        if config.algorithm.trainer_type == "unigrpo_nft":
+        if (
+            config.algorithm.trainer_type == "unigrpo_nft"
+            or OmegaConf.select(config, "actor_rollout_ref.model.algorithm") == "ltx2_unigrpo_nft"
+        ):
             from verl_omni.workers.native_workers import BagelJointRolloutWorker
 
             actor_rollout_cls = BagelJointRolloutWorker

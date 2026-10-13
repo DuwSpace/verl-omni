@@ -1,0 +1,391 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Joint GRPO/OmniNFT accumulation under the shared engine-owned optimizer."""
+
+import os
+from contextlib import nullcontext
+from dataclasses import asdict
+from time import perf_counter
+
+import torch
+from verl.utils import tensordict_utils as tu
+
+from verl_omni.pipelines.model_base import DiffusionEngineHooks
+from verl_omni.trainer.diffusion.recaption_grpo import old_policy_logprob_metrics
+
+from .loss import LTXJointLoss
+from .policy_state import LTXJointPolicyState
+
+
+class LTXJointHooks(DiffusionEngineHooks):
+    """One local PPO mini-batch per call; exact one-sample micro-batches initially.
+
+    The engine clears gradients and steps after this call. All reference outputs
+    precede each sample's differentiable forwards, and every current graph is
+    consumed before switching state for another sample. Both branches share the
+    same trainable Gemma and the same optimizer accumulation window.
+    """
+
+    requires_checkpoint_state = True
+
+    def __init__(self, module, model_config, optimizer_config):
+        self.module = module
+        self.model_config = model_config
+        self.optimizer_config = optimizer_config
+        self.policies = LTXJointPolicyState(module)
+        self._rollout_backend = None
+        self._probe_versions = set()
+        device = self._device()
+        if device.type == "npu" and "LTX_ACTOR_NPU_MEMORY_FRACTION" in os.environ:
+            # CANN kernels also allocate outside PyTorch's caching allocator.
+            # Keep headroom for those allocations and colocated worker contexts.
+            fraction = float(os.environ["LTX_ACTOR_NPU_MEMORY_FRACTION"])
+            if not 0 < fraction <= 1:
+                raise ValueError("LTX_ACTOR_NPU_MEMORY_FRACTION must be in (0, 1]")
+            torch.get_device_module(device).set_per_process_memory_fraction(fraction, device)
+
+    def generate(self, data):
+        from verl import DataProto
+
+        from verl_omni.workers.rollout.bagel_joint_backend import original_prompt_text
+        from verl_omni.workers.rollout.ltx_joint_backend import LTXJointVllmBackend
+
+        from .rewards import reward_sample
+
+        prompts = tu.get(data, "raw_prompt")
+        versions = tu.get(data, "_ltx_policy_version")
+        seeds = tu.get(data, "_ltx_sample_seed")
+        if prompts is None or versions is None or seeds is None or not len(prompts):
+            raise ValueError("Joint LTX generation needs original prompts, versions and seeds")
+        if len(versions) != len(prompts) or len(seeds) != len(prompts) or len(set(int(v) for v in versions)) != 1:
+            raise ValueError("Joint LTX generation requires one version and a seed per prompt")
+        version = int(versions[0])
+        texts = [original_prompt_text(prompt) for prompt in prompts]
+        self.begin_rollout(version=version)
+        device = self._device()
+        if device.type != "cpu":
+            from verl.utils.memory_utils import aggressive_empty_cache
+
+            aggressive_empty_cache(force_sync=True)
+        settings, geometry = self.model_config.ltx_joint, self.model_config.pipeline
+        loading = 0.0
+        if self._rollout_backend is None:
+            started = perf_counter()
+            self._rollout_backend = LTXJointVllmBackend(
+                model_path=self.model_config.local_path,
+                geometry={
+                    key: getattr(geometry, key)
+                    for key in (
+                        "height",
+                        "width",
+                        "num_frames",
+                        "frame_rate",
+                        "num_inference_steps",
+                        "max_sequence_length",
+                    )
+                }
+                | {
+                    "extra_args": {
+                        "video_cfg_scale": 1.0,
+                        "audio_cfg_scale": 1.0,
+                        "video_modality_scale": 1.0,
+                        "audio_modality_scale": 1.0,
+                        "video_rescale_scale": 0.0,
+                        "audio_rescale_scale": 0.0,
+                    }
+                },
+                recaption_temperature=settings.temperature,
+                recaption_max_new_tokens=settings.max_new_tokens,
+                sync_timeout_seconds=settings.sync_timeout_seconds,
+                enable_cpu_offload=settings.cpu_offload,
+            )
+            loading = perf_counter() - started
+        if device.type != "cpu":
+            torch.get_device_module(device).reset_peak_memory_stats()
+        started = perf_counter()
+        self._rollout_backend.load_actor_policy(self.module, version=version)
+        sync = perf_counter() - started
+        results = self._rollout_backend.generate(texts, seeds, version=version)
+        media = DataProto.concat([reward_sample(sample) for sample in results])
+        values = dict(media.batch.items())
+        # Original data_source/reward_model remain on the trainer's source batch.
+        values.update({key: list(media.non_tensor_batch[key]) for key in ("reward_inputs", "fps", "audio_layout")})
+        values["ltx_joint_replay"] = [sample["replay"] for sample in results]
+        for key in ("video_latents_clean", "audio_latents_clean", "train_timesteps"):
+            values[key] = torch.cat([sample[key] for sample in results], dim=0)
+        values["ltx_rollout_metrics"] = [
+            {
+                "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+                "sync_started_at": started,
+                "rollout/model_load_time": loading,
+                "rollout/sync_time": sync,
+                "rollout/recaption_time": sample["recaption_time"],
+                "rollout/generation_time": sample["generation_time"],
+                **sample.get("memory_metrics", {}),
+            }
+            for sample in results
+        ]
+        return tu.get_tensordict(values)
+
+    def close_rollout(self):
+        if self._rollout_backend is not None:
+            self._rollout_backend.close()
+            self._rollout_backend = None
+
+    def begin_rollout(self, *, version):
+        self.policies.begin_rollout(version=version)
+
+    def state_dict(self):
+        return self.policies.state_dict()
+
+    def load_state_dict(self, state):
+        self.policies.load_state_dict(state)
+
+    def _device(self):
+        # Use the accelerator even when FSDP keeps local parameter shards on CPU.
+        from verl.utils.device import get_device_id, get_device_name
+
+        name = get_device_name()
+        return torch.device(name, get_device_id()) if name != "cpu" else torch.device("cpu")
+
+    def _synchronize(self):
+        device = self._device()
+        if device.type != "cpu":
+            torch.get_device_module(device).synchronize()
+
+    def _ar(self, record):
+        return self.module(task="recaption", **record.ar_inputs(self._device()))
+
+    def _av_inputs(self, record, video_clean, audio_clean, video_noise, audio_noise, timestep):
+        device = self._device()
+        t = timestep.to(device=device, dtype=torch.float32).reshape(1)
+        sigma = t.reshape(1, 1, 1) / 1000.0
+        clean = (video_clean.to(device).unsqueeze(0), audio_clean.to(device).unsqueeze(0))
+        noise = (video_noise.to(device).unsqueeze(0), audio_noise.to(device).unsqueeze(0))
+        noisy = tuple((1 - sigma) * x.float() + sigma * n.float() for x, n in zip(clean, noise, strict=True))
+        params = record.generation_params
+        dtype = next(self.module.transformer.parameters()).dtype
+        inputs = dict(
+            input_ids=record.condition_token_ids.to(device).unsqueeze(0),
+            attention_mask=record.condition_attention_mask.to(device).unsqueeze(0),
+            hidden_states=noisy[0].to(dtype),
+            audio_hidden_states=noisy[1].to(dtype),
+            timestep=t,
+            sigma=t,
+            audio_timestep=t,
+            audio_sigma=t,
+            num_frames=(params["num_frames"] - 1) // 8 + 1,
+            height=params["height"] // 32,
+            width=params["width"] // 32,
+            fps=params["frame_rate"],
+            audio_num_frames=clean[1].shape[1],
+        )
+        return inputs, clean, noisy, sigma
+
+    def _av(self, record, video_clean, audio_clean, video_noise, audio_noise, timestep):
+        inputs, clean, noisy, sigma = self._av_inputs(
+            record, video_clean, audio_clean, video_noise, audio_noise, timestep
+        )
+        predictions = self.module(task="av", **inputs)
+        return tuple(value.float() for value in predictions), clean, noisy, sigma
+
+    def forward_backward_batch(self, data, loss_function, forward_only=False):
+        from .diagnostics import gradient_delta_metrics, gradient_snapshot
+
+        if forward_only:
+            raise NotImplementedError("Use vLLM-Omni for joint rollout")
+        self.policies.assert_frozen()
+        config = getattr(loss_function, "keywords", {}).get("config")
+        if config is None or config.diffusion_loss.loss_mode != "ltx2_unigrpo_nft":
+            raise ValueError("LTX joint hooks require the joint loss configuration")
+        if config.ppo_micro_batch_size_per_gpu != 1:
+            raise ValueError("Initial LTX joint replay requires ppo_micro_batch_size_per_gpu=1")
+        records = tu.get(data, "ltx_joint_replay")
+        if records is None or len(records) == 0:
+            raise ValueError("Missing exact LTX joint rollout records")
+        for record in records:
+            record.validate()
+            if not self.policies.rollout_started or record.policy_version != self.policies.version:
+                raise ValueError("Rollout policy version differs from frozen old")
+        times = data["train_timesteps"]
+        if times.ndim != 2 or times.shape[0] != len(records) or times.shape[1] == 0:
+            raise ValueError("Joint train timesteps must be [batch, nonempty steps]")
+        if not bool(torch.isfinite(times).all() and ((times > 0) & (times <= 1000)).all()):
+            raise ValueError("LTX train timesteps must be finite model-scale times in (0, 1000]")
+        for modality in ("video", "audio"):
+            clean, noise = data[f"{modality}_latents_clean"], data[f"{modality}_forward_noise"]
+            if (
+                clean.ndim != 3
+                or clean.shape[0] != len(records)
+                or noise.shape != (len(records), times.shape[1], *clean.shape[1:])
+            ):
+                raise ValueError(f"Invalid joint {modality} clean latent/noise shapes")
+            if not bool(torch.isfinite(clean).all() and torch.isfinite(noise).all()):
+                raise ValueError(f"Nonfinite joint {modality} latents/noise")
+        if data["reward_prob"].shape != (len(records), times.shape[1], 2):
+            raise ValueError("Joint reward probabilities must preserve [batch, steps, video/audio]")
+        probabilities = data["reward_prob"]
+        if not bool(torch.isfinite(probabilities).all() and ((probabilities >= 0) & (probabilities <= 1)).all()):
+            raise ValueError("Joint reward probabilities must be finite and in [0, 1]")
+        if data["text_advantages"].shape != (len(records),) or not bool(torch.isfinite(data["text_advantages"]).all()):
+            raise ValueError("Joint text advantages must be finite with one value per sample")
+        for record in records:
+            params = record.generation_params
+            rows = ((params["num_frames"] - 1) // 8 + 1) * (params["height"] // 32) * (params["width"] // 32)
+            if rows != data["video_latents_clean"].shape[1]:
+                raise ValueError("Clean video latents do not match the recorded generation geometry")
+        total, metrics = 0.0, {}
+        replay_train, replay_rollout = [], []
+        started = perf_counter()
+
+        def collect(values, scale=1.0):
+            for key, value in values.items():
+                metrics[key] = metrics.get(key, 0.0) + float(value) * scale
+
+        for index, record in enumerate(records):
+            from .consistency_probe import capture_forward, probe_identity, probe_selected, to_cpu
+
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            probe = (
+                rank == 0
+                and record.policy_version not in self._probe_versions
+                and probe_selected(record.policy_version)
+            )
+            identity = None
+            if probe:
+                if self._rollout_backend is None:
+                    raise RuntimeError("Paired collection requires the live native rollout worker")
+                identity = probe_identity(record, times[index, 0])
+                inputs = self._av_inputs(
+                    record,
+                    data["video_latents_clean"][index],
+                    data["audio_latents_clean"][index],
+                    data["video_forward_noise"][index, 0],
+                    data["audio_forward_noise"][index, 0],
+                    times[index, 0],
+                )[0]
+                self._rollout_backend.engine.collective_rpc(
+                    "collect_joint_av_probe",
+                    args=(asdict(record), to_cpu(inputs), identity),
+                    timeout=self._rollout_backend.timeout,
+                )
+                self._probe_versions.add(record.policy_version)
+
+            def av(step, record=record, index=index):
+                return self._av(
+                    record,
+                    data["video_latents_clean"][index],
+                    data["audio_latents_clean"][index],
+                    data["video_forward_noise"][index, step],
+                    data["audio_forward_noise"][index, step],
+                    times[index, step],
+                )
+
+            self._synchronize()
+            reference_start = perf_counter()
+            with self.policies.use("old"):
+                old_logprobs = self._ar(record).detach().cpu()
+                old_predictions = []
+                for step in range(times.shape[1]):
+                    capture = (
+                        capture_forward(self.module, side="actor", identity=identity)
+                        if probe and step == 0
+                        else nullcontext()
+                    )
+                    with capture as directory:
+                        if directory is not None:
+                            ar_inputs = record.ar_inputs("cpu")
+                            torch.save(
+                                {
+                                    "inputs": ar_inputs,
+                                    "train_old_logprobs": old_logprobs[ar_inputs["response_mask"][:, 1:]],
+                                    "rollout_logprobs": record.rollout_logprobs,
+                                    "clip_ratio": config.diffusion_loss.ar_clip_ratio,
+                                    "policy_version": record.policy_version,
+                                },
+                                directory / "old_text_replay.pt",
+                            )
+                        old_predictions.append(tuple(p.cpu() for p in av(step)[0]))
+            with self.policies.use("ref"):
+                ref_predictions = [tuple(p.cpu() for p in av(step)[0]) for step in range(times.shape[1])]
+            self._synchronize()
+            collect({"train/reference_time": perf_counter() - reference_start})
+            text_start = perf_counter()
+            before_text = gradient_snapshot(self.module)
+            current = self._ar(record)
+            old = old_logprobs.to(current.device)
+            mask = record.ar_inputs(current.device)["response_mask"][:, 1:]
+            loss, values = LTXJointLoss.text_loss(
+                current=current,
+                old=old,
+                advantages=data["text_advantages"][index : index + 1].to(current.device),
+                mask=mask,
+                config=config,
+            )
+            (loss / len(records)).backward()
+            after_text = gradient_snapshot(self.module)
+            collect(gradient_delta_metrics(before_text, after_text, "text"), 1 / len(records))
+            del before_text
+            total += loss.detach().item() / len(records)
+            collect(values, 1 / len(records))
+            replay_train.append(old[mask].detach().cpu())
+            replay_rollout.append(record.rollout_logprobs)
+            self._synchronize()
+            collect({"train/text_time": perf_counter() - text_start})
+            av_start = perf_counter()
+            for step in range(times.shape[1]):
+                predictions, clean, noisy, sigma = av(step)
+                output = {}
+                for column, modality in enumerate(("video", "audio")):
+                    prediction = predictions[column]
+                    output.update(
+                        {
+                            f"{modality}_forward_prediction": prediction,
+                            f"{modality}_old_prediction": old_predictions[step][column].to(prediction.device),
+                            f"{modality}_ref_forward_prediction": ref_predictions[step][column].to(prediction.device),
+                            f"{modality}_x0": clean[column],
+                            f"{modality}_xt": noisy[column],
+                            f"{modality}_t_expanded": sigma,
+                        }
+                    )
+                loss, values = LTXJointLoss.av_loss(
+                    model_output=output,
+                    probabilities=data["reward_prob"][index : index + 1, step].to(predictions[0].device),
+                    config=config,
+                )
+                scale = 1 / (len(records) * times.shape[1])
+                (loss * scale).backward()
+                total += loss.detach().item() * scale
+                collect(values, scale)
+            self._synchronize()
+            after_av = gradient_snapshot(self.module)
+            collect(gradient_delta_metrics(after_text, after_av, "av"), 1 / len(records))
+            del after_text, after_av
+            collect({"train/av_time": perf_counter() - av_start})
+        replay_train = torch.cat(replay_train).unsqueeze(0)
+        replay_rollout = torch.cat(replay_rollout).unsqueeze(0)
+        metrics.update(
+            old_policy_logprob_metrics(
+                replay_train,
+                replay_rollout,
+                torch.ones_like(replay_train, dtype=torch.bool),
+                clip_ratio=config.diffusion_loss.ar_clip_ratio,
+            )
+        )
+        metrics["train/forward_backward_time"] = perf_counter() - started
+        metrics["joint/total_loss"] = total
+        self.policies.assert_frozen()
+        metrics["joint/frozen_snapshots_verified"] = 1.0
+        return {"loss": [total], "metrics": {key: [value] for key, value in metrics.items()}, "model_output": {}}

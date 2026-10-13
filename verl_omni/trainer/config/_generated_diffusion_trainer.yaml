@@ -284,6 +284,12 @@ actor_rollout_ref:
       cfg_img_scale: 1.0
       sync_bucket_size_mb: 256
       sync_timeout_seconds: 600
+    ltx_joint:
+      _target_: verl_omni.workers.config.diffusion.LTXJointRolloutConfig
+      max_new_tokens: 256
+      temperature: 1.0
+      sync_timeout_seconds: 600
+      cpu_offload: true
     algo:
       _target_: verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig
       noise_level: 1.0
@@ -397,6 +403,12 @@ actor_rollout_ref:
       cfg_img_scale: ${oc.select:actor_rollout_ref.rollout.bagel_joint.cfg_img_scale,1.0}
       sync_bucket_size_mb: ${oc.select:actor_rollout_ref.rollout.bagel_joint.sync_bucket_size_mb,256}
       sync_timeout_seconds: ${oc.select:actor_rollout_ref.rollout.bagel_joint.sync_timeout_seconds,600}
+    ltx_joint:
+      _target_: verl_omni.workers.config.diffusion.LTXJointRolloutConfig
+      max_new_tokens: ${oc.select:actor_rollout_ref.rollout.ltx_joint.max_new_tokens,256}
+      temperature: ${oc.select:actor_rollout_ref.rollout.ltx_joint.temperature,1.0}
+      sync_timeout_seconds: ${oc.select:actor_rollout_ref.rollout.ltx_joint.sync_timeout_seconds,600}
+      cpu_offload: ${oc.select:actor_rollout_ref.rollout.ltx_joint.cpu_offload,true}
     algo:
       _target_: verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig
       noise_level: ${oc.select:actor_rollout_ref.rollout.algo.noise_level,1.0}

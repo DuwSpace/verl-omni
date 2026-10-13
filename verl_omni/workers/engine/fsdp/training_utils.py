@@ -72,10 +72,19 @@ def shard_fsdp2_units(module, units, fsdp_kwargs):
     owned = {id(submodule) for submodule in module.modules()}
     if any(id(unit) not in owned for unit in units):
         raise ValueError("Explicit FSDP2 units must belong to the model")
-    # Frozen buffers/leaves may be used directly and are not moved by fully_shard.
-    module.to(get_device_id())
+
+    # Materialize one unit at a time. Moving the complete model first defeats
+    # CPU offload and can OOM before FSDP has created even its first shard.
+    # A parent unit must leave already-sharded descendants on their FSDP-owned
+    # device; recursively calling parent.to(device) would move them back too.
+    def move_unsharded(tensor):
+        return tensor if isinstance(tensor, DTensor) else tensor.to(get_device_id())
+
     for unit in units:
+        unit._apply(move_unsharded)
         fully_shard(unit, **fsdp_kwargs)
+    # Frozen buffers/leaves outside the declared units may be used directly.
+    module._apply(move_unsharded)
     # A missed leaf would silently leave trainable replicated weights unsynchronized.
     unsharded = [
         name for name, param in module.named_parameters() if param.requires_grad and not isinstance(param, DTensor)

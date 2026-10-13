@@ -27,12 +27,31 @@ from verl.workers.config.rollout import (
 )
 
 __all__ = [
+    "LTXJointRolloutConfig",
     "BagelJointRolloutConfig",
     "DiffusionRolloutAlgoConfig",
     "DiffusionPipelineConfig",
     "DiffusionSamplingConfig",
     "DiffusionRolloutConfig",
 ]
+
+
+@dataclass
+class LTXJointRolloutConfig(BaseConfig):
+    """Synchronous two-stage native LTX worker settings."""
+
+    max_new_tokens: int = 256
+    temperature: float = 1.0
+    sync_timeout_seconds: int = 600
+    cpu_offload: bool = True
+
+    def __post_init__(self):
+        import math
+
+        if self.max_new_tokens <= 0 or self.sync_timeout_seconds <= 0:
+            raise ValueError("LTX recaption token limit and sync timeout must be positive")
+        if not math.isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError("LTX recaption temperature must be finite and positive")
 
 
 @dataclass
@@ -132,6 +151,7 @@ class DiffusionSamplingConfig(BaseConfig):
 
 @dataclass
 class DiffusionRolloutConfig(BaseConfig):
+    ltx_joint: LTXJointRolloutConfig = field(default_factory=LTXJointRolloutConfig)
     # Exact native-worker settings mirrored into the actor's model config.
     bagel_joint: BagelJointRolloutConfig = field(default_factory=BagelJointRolloutConfig)
     _mutable_fields = {

@@ -242,6 +242,24 @@ bagel_joint:
   # Worker initialization and weight transport timeout.
   sync_timeout_seconds: 600
 
+# Native two-stage LTX settings.
+ltx_joint:
+
+  # Typed rollout settings.
+  _target_: verl_omni.workers.config.diffusion.LTXJointRolloutConfig
+
+  # Maximum generated recaption length, including EOS.
+  max_new_tokens: 256
+
+  # Temperature-only recaption sampling.
+  temperature: 1.0
+
+  # Paired worker synchronization timeout.
+  sync_timeout_seconds: 600
+
+  # Sequential native model offload.
+  cpu_offload: true
+
 # Rollout Algorithm configuration
 algo:
 

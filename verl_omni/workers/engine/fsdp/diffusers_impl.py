@@ -247,7 +247,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         )
 
         try:
-            module.to(torch_dtype)
+            _cast_loaded_diffusers_module(module, torch_dtype, preserve_fp32_modules=model_cls.preserve_fp32_modules())
         except AttributeError:
             raise TypeError(
                 f"{type(module).__name__} returned by build_module() has no to() method. "
