@@ -15,7 +15,6 @@ from .diffusers_impl import (  # noqa: F401
     DiffusersFSDPEngine,
     DPODiffusersFSDPEngine,
     NFTDiffusersFSDPEngine,
-    OmniNFTDiffusersFSDPEngine,
     PPODiffusersFSDPEngine,
 )
 from .omni_impl import OmniFSDPEngine  # noqa: F401
@@ -25,7 +24,6 @@ __all__ = [
     "PPODiffusersFSDPEngine",
     "DPODiffusersFSDPEngine",
     "NFTDiffusersFSDPEngine",
-    "OmniNFTDiffusersFSDPEngine",
     "DiffusersFSDPEngine",
     "OmniFSDPEngine",
 ]
