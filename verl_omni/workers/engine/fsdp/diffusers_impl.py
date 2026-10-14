@@ -1583,7 +1583,7 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
 
 @EngineRegistry.register(model_type="omni_nft_model", backend=["fsdp2"], device=[device_name])
 class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
-    """FSDP2 actor engine for joint LTX video/audio DiffusionNFT updates."""
+    """FSDP2 actor engine for joint video/audio DiffusionNFT updates."""
 
     @staticmethod
     def _fsdp2_gradient_checkpointing_with_cast_func(param_dtype: Optional[torch.dtype]) -> Callable:
@@ -1633,6 +1633,9 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         module = super()._build_module()
         if self.model_config.enable_gradient_checkpointing:
             self._enable_omni_gradient_checkpointing(module)
+        # Diffusers 0.40.0 passes weight=None to fused NPU RMSNorm for affine-free layers.
+        # Fixed in 0.41.0: https://github.com/huggingface/diffusers/pull/14288
+        # Remove this workaround once the supported dependency stack requires diffusers>=0.41.0.
         if self.model_config.architecture == "LTX2Pipeline" and self.model_config.algorithm == "omni_nft":
             from verl_omni.pipelines.ltx2_omni_nft.compat import apply_ltx_npu_rms_norm_workaround
 
