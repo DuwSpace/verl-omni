@@ -48,7 +48,7 @@ bash examples/omninft_trainer/ltx2/run_ltx2_3_omninft_lora_npu_bs32.sh
 ```
 
 The example uses a batch size of 32, eight rollouts per prompt, 256 generated
-samples per step, eight TP=2 rollout replicas with one sample per
+samples per step, four TP=4 rollout replicas with one sample per
 replica, LoRA rank/alpha 32/64, and a learning rate of `3e-5`. Rollout CPU
 offload is disabled. Actor mini/micro batch sizes are 32/8. Validation runs
 every 10 steps with 16 prompts, and checkpoints are saved every 50 steps.
