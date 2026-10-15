@@ -1,6 +1,6 @@
 # DiffusionNFT
 
-Last updated: 10/14/2026.
+Last updated: 10/15/2026.
 
 DiffusionNFT ([paper](https://arxiv.org/abs/2509.16117),
 [code](https://github.com/NVlabs/DiffusionNFT),
@@ -132,7 +132,11 @@ the rollout and model adapter must use the same scale. Reward routing and
 loss weighting remain in actor-batch preparation and `OmniNFTLoss`.
 
 Algorithm hooks validate engine requirements before distributed initialization.
-OmniNFT currently requires FSDP2 without Ulysses. When gradient checkpointing
+OmniNFT currently requires FSDP2 without Ulysses. It also requires
+`actor_rollout_ref.actor.enable_timestep_staging=False` (the default):
+the existing single-latent staging path cannot stage joint video/audio inputs.
+The trainer rejects this option when enabled, before starting workers.
+When gradient checkpointing
 is enabled, the NFT engine calls `configure_gradient_checkpointing` after
 loading the model and before LoRA, compilation and FSDP wrapping. Default NFT
 hooks retain the loader's checkpointing; only OmniNFT hooks install the

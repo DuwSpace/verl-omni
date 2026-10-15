@@ -1062,6 +1062,16 @@ class DiffusionNFTLoss(DiffusionLossFn):
 class OmniNFTLoss(DiffusionNFTLoss):
     """Two-branch DiffusionNFT objective for joint audio-video generation."""
 
+    @classmethod
+    def validate_trainer_config(cls, config: Any) -> None:
+        """Reject single-latent timestep staging before starting OmniNFT workers."""
+        super().validate_trainer_config(config)
+        if config.actor_rollout_ref.actor.get("enable_timestep_staging", False):
+            raise ValueError(
+                "OmniNFT does not support timestep staging for joint video/audio inputs; "
+                "set actor_rollout_ref.actor.enable_timestep_staging=False."
+            )
+
     _REWARD_METRIC_PREFIX = "_omnift_reward_metric::"
 
     required_model_output_keys = (

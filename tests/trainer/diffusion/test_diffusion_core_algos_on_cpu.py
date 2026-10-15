@@ -18,9 +18,67 @@ import os
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from verl_omni.trainer.diffusion import diffusion_algos
+from verl_omni.workers.config.diffusion.actor import DiffusionActorConfig, DiffusionLossConfig
+
+
+@pytest.mark.parametrize("overrides", [{}, {"video_ref_kl_coef": 1e-4, "audio_ref_kl_coef": 1e-4}])
+def test_omni_nft_loss_with_declared_config(overrides):
+    config = DiffusionActorConfig(
+        strategy="fsdp2", rollout_n=1, diffusion_loss=DiffusionLossConfig(loss_mode="omni_nft", **overrides)
+    )
+    inputs = {}
+    predictions = []
+    for modality, length in (("video", 3), ("audio", 2)):
+        prediction = torch.full((2, length, 4), 0.2, requires_grad=True)
+        predictions.append(prediction)
+        inputs.update(
+            {
+                f"{modality}_forward_prediction": prediction,
+                f"{modality}_old_prediction": torch.zeros_like(prediction),
+                f"{modality}_ref_forward_prediction": torch.zeros_like(prediction),
+                f"{modality}_x0": torch.zeros_like(prediction),
+                f"{modality}_xt": torch.ones_like(prediction),
+                f"{modality}_t_expanded": torch.full((2, 1, 1), 0.5),
+                f"{modality}_reward_prob": torch.tensor([0.7, 0.8]),
+            }
+        )
+    loss, metrics = diffusion_algos.OmniNFTLoss.compute_loss(config=config, **inputs)
+    expected = (
+        sum(
+            metrics[f"actor/{modality}/policy_loss"]
+            + overrides.get(f"{modality}_ref_kl_coef", 0.0) * metrics[f"actor/{modality}/ref_kl_loss"]
+            for modality in ("video", "audio")
+        )
+        / 2
+    )
+    assert loss.item() == pytest.approx(expected)
+    loss.backward()
+    for prediction in predictions:
+        assert prediction.grad is not None
+        assert torch.isfinite(prediction.grad).all()
+        assert prediction.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("actor_config", [{}, {"enable_timestep_staging": False}, {"enable_timestep_staging": True}])
+def test_omni_nft_trainer_rejects_timestep_staging(actor_config):
+    config = OmegaConf.create({"algorithm": {}, "actor_rollout_ref": {"actor": actor_config}})
+    loss = diffusion_algos.get_diffusion_loss_fn("omni_nft")
+    if actor_config.get("enable_timestep_staging", False):
+        with pytest.raises(ValueError, match="actor_rollout_ref.actor.enable_timestep_staging=False"):
+            loss.validate_trainer_config(config)
+    else:
+        loss.validate_trainer_config(config)
+
+
+@pytest.mark.parametrize("key,value", [("train_timestep_range", [0, 2]), ("train_timestep_count", 2)])
+def test_omni_nft_retains_base_trainer_validation(key, value):
+    config = OmegaConf.create({"algorithm": {key: value}, "actor_rollout_ref": {"actor": {}}})
+    with pytest.raises(ValueError, match=f"algorithm.{key} is only used by the dgpo loss"):
+        diffusion_algos.get_diffusion_loss_fn("omni_nft").validate_trainer_config(config)
 
 
 @pytest.mark.parametrize("norm_adv_by_std_in_grpo", [True, False])
