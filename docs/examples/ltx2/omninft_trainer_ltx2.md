@@ -1,6 +1,6 @@
 # LTX-2.3 audio-video OmniNFT
 
-Last updated: 09/17/2026
+Last updated: 10/14/2026
 
 This recipe trains LoRA adapters for
 `diffusers/LTX-2.3-Diffusers@8eee8edcf067e838b843f926ec4d4cc9b2be1aaf`
@@ -12,6 +12,13 @@ routes independent reward components to its video and audio branches.
 The configuration uses FSDP2, sequence-parallel size one, and four TP=4
 rollout replicas. Each replica serves one sample at a time, with rollout CPU
 offload disabled. The recipe sets `actor_rollout_ref.rollout.max_num_seqs=1`.
+
+The actor uses `model_type=diffusion_nft_model` with `algorithm=omni_nft`.
+The shared NFT engine delegates modality-specific training inputs and loss
+assembly to the OmniNFT hooks. LTX's adapter prepares transformer inputs and
+applies its instance-scoped NPU RMSNorm workaround before forward execution.
+Rollout returns named video/audio artifacts with explicit FPS and sample rate,
+alongside the clean latent tokens needed for training.
 
 ## Paper feature coverage
 

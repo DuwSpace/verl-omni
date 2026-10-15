@@ -43,6 +43,9 @@ def apply_ltx_npu_rms_norm_workaround(module: torch.nn.Module) -> torch.nn.Modul
         Diffusers issue #14380 describes the fused NPU path receiving an
         unsupported null gamma for affine-free layers.
     """
+    # Diffusers PR #14288 fixes affine-free NPU RMSNorm in 0.41.0:
+    # https://github.com/huggingface/diffusers/pull/14288
+    # Remove this workaround once the supported runtime requires that release.
     if get_device_name() != "npu":
         return module
 

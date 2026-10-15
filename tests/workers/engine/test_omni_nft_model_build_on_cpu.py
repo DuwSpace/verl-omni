@@ -11,74 +11,56 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU regression tests for LTX-scoped OmniNFT module initialization."""
+"""The LTX adapter applies its NPU workaround before preparing forward inputs."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 from diffusers.models.normalization import RMSNorm
+from tensordict import TensorDict
 
 from verl_omni.pipelines.ltx2_omni_nft import compat
-from verl_omni.pipelines.model_base import DiffusionModelBase
-from verl_omni.workers.engine.fsdp import diffusers_impl
+from verl_omni.pipelines.ltx2_omni_nft.diffusers_training_adapter import LTX23OmniNFT
 
 
-@pytest.mark.parametrize("use_lora", [False, True])
-@pytest.mark.parametrize(
-    "architecture,algorithm,engine_cls,expect_patch",
-    [
-        ("LTX2Pipeline", "omni_nft", diffusers_impl.OmniNFTDiffusersFSDPEngine, True),
-        ("QwenImagePipeline", "diffusion_nft", diffusers_impl.NFTDiffusersFSDPEngine, False),
-        ("LTX2Pipeline", "flow_grpo", diffusers_impl.PPODiffusersFSDPEngine, False),
-        ("LTX2Pipeline", "flow_grpo", diffusers_impl.OmniNFTDiffusersFSDPEngine, False),
-        ("_OtherOmniNFTTest", "omni_nft", diffusers_impl.OmniNFTDiffusersFSDPEngine, False),
-    ],
-)
-def test_ltx_workaround_is_scoped_before_model_wrapping(
-    monkeypatch, use_lora, architecture, algorithm, engine_cls, expect_patch
-):
-    """Exercise real engine dispatch without loading weights or initializing FSDP."""
-
-    class OtherOmniNFTAdapter(DiffusionModelBase):
-        pass
-
-    monkeypatch.setitem(DiffusionModelBase._registry, ("_OtherOmniNFTTest", "omni_nft"), OtherOmniNFTAdapter)
-    monkeypatch.setattr(compat, "get_device_name", lambda: "npu")
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+def test_ltx_adapter_scopes_workaround_to_model_instances(monkeypatch, device):
+    monkeypatch.setattr(compat, "get_device_name", lambda: device)
     module = torch.nn.Sequential(RMSNorm(4, eps=1e-6, elementwise_affine=False), RMSNorm(4, eps=1e-6))
+    untouched = RMSNorm(4, eps=1e-6, elementwise_affine=False)
     original_forward = RMSNorm.forward
-    stages = []
-    engine = object.__new__(engine_cls)
-    engine.model_config = SimpleNamespace(
-        architecture=architecture, algorithm=algorithm, external_lib=None, enable_gradient_checkpointing=False
+    latents = torch.randn(1, 5, 4)
+    embeds = torch.randn(1, 2, 4)
+    config = SimpleNamespace(
+        pipeline=SimpleNamespace(
+            guidance_scale=1.0,
+            num_frames=9,
+            height=64,
+            width=64,
+            frame_rate=24,
+        )
     )
-    engine.engine_config = SimpleNamespace(forward_only=True)
-    engine._is_lora = use_lora
-    engine.use_ulysses_sp = False
-    engine.rank = 1
+    batch = TensorDict({"video_latents_clean": latents[:, :3], "audio_prompt_embeds": embeds}, batch_size=[1])
 
-    def loaded_module(self):
-        stages.append("load")
-        return module
+    inputs, negative = LTX23OmniNFT.prepare_model_inputs(
+        module,
+        config,
+        latents,
+        torch.tensor([500.0]),
+        embeds,
+        torch.ones(1, 2, dtype=torch.bool),
+        None,
+        None,
+        batch,
+        0,
+    )
 
-    def check_module(actual, stage):
-        assert actual is module
-        expected = compat.ltx_affine_free_rms_norm_forward if expect_patch else original_forward
-        assert module[0].forward.__func__ is expected
-        assert module[1].forward.__func__ is original_forward
-        assert RMSNorm.forward is original_forward
-        stages.append(stage)
-        return actual
-
-    monkeypatch.setattr(diffusers_impl.DiffusersFSDPEngine, "_build_module", loaded_module)
-    monkeypatch.setattr(engine, "_build_lora_module", lambda m: check_module(m, "lora"))
-    monkeypatch.setattr(diffusers_impl, "_maybe_compile_repeated_blocks", lambda m, *args: check_module(m, "compile"))
-    monkeypatch.setattr(engine, "_build_scheduler", lambda: None)
-    monkeypatch.setattr(engine, "_build_fsdp_module", lambda m: check_module(m, "fsdp"))
-    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
-    monkeypatch.setattr(diffusers_impl, "log_gpu_memory_usage", lambda *args, **kwargs: None)
-
-    engine._build_model_optimizer()
-
-    assert engine.module is module
-    assert stages == (["load", "lora", "compile", "fsdp"] if use_lora else ["load", "compile", "fsdp"])
+    expected = compat.ltx_affine_free_rms_norm_forward if device == "npu" else original_forward
+    assert module[0].forward.__func__ is expected
+    assert module[1].forward.__func__ is original_forward
+    assert untouched.forward.__func__ is original_forward
+    assert RMSNorm.forward is original_forward
+    assert negative is None
+    torch.testing.assert_close(inputs["hidden_states"], latents[:, :3])
+    torch.testing.assert_close(inputs["audio_hidden_states"], latents[:, 3:])

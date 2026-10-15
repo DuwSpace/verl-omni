@@ -28,7 +28,11 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
+from verl_omni.pipelines.diffusion_rollout_output import (
+    quantize_pixels,
+    with_batched_media_artifacts,
+    with_rollout_data,
+)
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 
@@ -42,8 +46,12 @@ class LTX23OmniNFTPipeline(LTX2Pipeline):
     supports_request_batch = False
     support_image_input = False
     diffusion_io_spec = DiffusionIOSpec(
-        primary=MediaSpec("video"),
-        auxiliary=(MediaSpec("audio", sample_rate=24000),),
+        artifacts={
+            "video_preview": MediaSpec("video", "decoded", "TCHW"),
+            "audio": MediaSpec("audio", "decoded", "CT"),
+            "video_latent": MediaSpec("video", "latent", "CTHW"),
+            "audio_latent": MediaSpec("audio", "latent", "CTF"),
+        },
     )
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
@@ -115,23 +123,47 @@ class LTX23OmniNFTPipeline(LTX2Pipeline):
         self._omni_nft_forward_context = forward_ctx
         return super()._unpack_and_denormalize_stage(forward_ctx, latents, audio_latents)
 
+    def _decode_output(self, *, latents, audio_latents, output_type, **kwargs):
+        """Retain native VAE latents alongside the packed tokens used for training."""
+        self._omni_nft_native_latents = (latents, audio_latents)
+        return super()._decode_output(latents=latents, audio_latents=audio_latents, output_type=output_type, **kwargs)
+
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Generate one request and attach replay data, releasing captured state on exit."""
+        if req.num_reqs != 1:
+            raise ValueError(f"LTX-2.3 OmniNFT expects one request, got {req.num_reqs}.")
+        self._omni_nft_native_latents = None
         try:
             request = self._prepare_request(req.requests[0])
             output = super().forward(DiffusionRequestBatch(requests=[request]))
+            if isinstance(output, list):
+                if len(output) != 1:
+                    raise RuntimeError(f"Single-request LTX rollout returned {len(output)} outputs.")
+                output = output[0]
+            if OmniDiffusionRequest.is_dummy_run_request_id(request.request_id):
+                return replace(output, output=None, to_cpu=True)
+            if (
+                self.distributed_video_decode
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() != 0
+            ):
+                return output
             state = self._omni_nft_clean_state
             context = self._omni_nft_forward_context
+            if state is None or context is None:
+                raise RuntimeError("LTX-2.3 OmniNFT rollout did not capture clean latents and replay context.")
             prompt = context.prompt_context
             device = state.video.device
             # Sequence-parallel padding must not enter the training audio tokens.
             audio_latents = state.audio[:, : context.original_audio_num_frames]
             video, audio = output.output
-            if video.ndim == 5:
-                video = video[0]
-            return with_rollout_data(
-                replace(output, output=(video, audio)),
+            if video.ndim == 4:
+                video = video.unsqueeze(0)
+            if audio.ndim == 2:
+                audio = audio.unsqueeze(0)
+            result = with_rollout_data(
+                output,
                 media_key="video",
                 prompt_embeddings={
                     "prompt_embeds": prompt.positive_connector_prompt_embeds,
@@ -142,16 +174,38 @@ class LTX23OmniNFTPipeline(LTX2Pipeline):
                     "negative_prompt_embeds_mask": prompt.negative_connector_attention_mask,
                 },
                 rl={
-                    "audio": audio,
                     "video_latents_clean": state.video.float(),
                     "audio_latents_clean": audio_latents.float(),
                     "train_timesteps": context.timesteps.to(device=device, dtype=torch.float32).unsqueeze(0),
                     "video_seq_len": torch.tensor([state.video.shape[1]], device=device),
-                    "fps": torch.tensor([context.request_inputs.frame_rate], device=device, dtype=torch.float32),
-                    "audio_sample_rate": torch.tensor([self.vocoder.config.output_sampling_rate], device=device),
                 },
                 to_cpu=True,
             )
+            if self._omni_nft_native_latents is None:
+                raise RuntimeError("LTX-2.3 OmniNFT rollout did not capture native VAE latents.")
+            video_latent, audio_latent = self._omni_nft_native_latents
+            artifact_context = f"pipeline={type(self).__name__}, request_id={request.request_id}"
+            return with_batched_media_artifacts(
+                result,
+                data={
+                    "video_preview": quantize_pixels(video, "zero_one", context=artifact_context),
+                    "audio": audio,
+                    "video_latent": video_latent,
+                    "audio_latent": audio_latent,
+                },
+                specs={
+                    "video_latent": MediaSpec("video", "latent", "CTHW"),
+                    "audio_latent": MediaSpec("audio", "latent", "CTF"),
+                    "video_preview": MediaSpec("video", "decoded", "TCHW", fps=context.request_inputs.frame_rate),
+                    "audio": MediaSpec("audio", "decoded", "CT", sample_rate=self.vocoder.config.output_sampling_rate),
+                },
+                primary="video_preview",
+                preview="video_preview",
+                audio="audio",
+                context=artifact_context,
+                requested=(request.sampling_params.extra_args or {}).get("requested_outputs"),
+            )
         finally:
+            self._omni_nft_native_latents = None
             self._omni_nft_clean_state = None
             self._omni_nft_forward_context = None

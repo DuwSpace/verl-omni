@@ -34,7 +34,7 @@ algorithm:
 actor_rollout_ref:
   model:
     algorithm: omni_nft
-    model_type: omni_nft_model
+    model_type: diffusion_nft_model
     attn_backend: native
     enable_gradient_checkpointing: true
     lora_rank: 32
