@@ -64,3 +64,30 @@ def test_ltx_adapter_scopes_workaround_to_model_instances(monkeypatch, device):
     assert negative is None
     torch.testing.assert_close(inputs["hidden_states"], latents[:, :3])
     torch.testing.assert_close(inputs["audio_hidden_states"], latents[:, 3:])
+
+
+def test_ltx_adapter_dispatches_joint_training_inputs():
+    from verl_omni.pipelines.model_base import DiffusionModelBase
+
+    config = SimpleNamespace(architecture="LTX2Pipeline", algorithm="omni_nft", external_lib=None)
+    adapter = DiffusionModelBase.get_class(config)
+    batch = TensorDict(
+        {
+            "video_latents_clean": torch.ones(1, 3, 4),
+            "audio_latents_clean": torch.full((1, 2, 4), 2.0),
+            "video_forward_noise": torch.zeros(1, 3, 4),
+            "audio_forward_noise": torch.zeros(1, 2, 4),
+            "train_timesteps": torch.tensor([[500.0]]),
+        },
+        batch_size=[1],
+    )
+    latents, timesteps, context = adapter.prepare_training_inputs(
+        batch, step=0, scheduler=SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000))
+    )
+    assert adapter is LTX23OmniNFT
+    torch.testing.assert_close(latents[:, :3], torch.full((1, 3, 4), 0.5))
+    torch.testing.assert_close(latents[:, 3:], torch.ones(1, 2, 4))
+    torch.testing.assert_close(timesteps, torch.tensor([500.0]))
+    outputs = adapter.prepare_model_outputs({"forward_prediction": (latents[:, :3], latents[:, 3:])}, context)
+    assert outputs["video_x0"] is batch["video_latents_clean"]
+    assert outputs["audio_x0"] is batch["audio_latents_clean"]

@@ -15,11 +15,13 @@
 """LTX-2.3 joint audio-video training adapter for OmniNFT."""
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler, ModelMixin
 from tensordict import TensorDict
+from torch.utils._pytree import tree_map
+from torch.utils.checkpoint import checkpoint
 from verl.utils.device import get_device_name
 
 from verl_omni.pipelines.ltx2_flow_grpo.common import apply_x0_cfg, set_ltx23_timesteps
@@ -33,6 +35,56 @@ __all__ = ["LTX23OmniNFT"]
 @DiffusionModelBase.register("LTX2Pipeline", algorithm="omni_nft")
 class LTX23OmniNFT(DiffusionModelBase):
     """Return separate video/audio velocities from one joint LTX forward."""
+
+    @staticmethod
+    def validate_engine_config(engine_config) -> None:
+        """Reject unsupported sharding and sequence parallelism before initialization."""
+        if engine_config.strategy != "fsdp2":
+            raise NotImplementedError(
+                f"OmniNFT currently supports only actor.strategy=fsdp2, got {engine_config.strategy!r}."
+            )
+        if engine_config.ulysses_sequence_parallel_size != 1:
+            raise NotImplementedError(
+                "OmniNFT FSDP2 does not implement Ulysses/context parallelism yet; "
+                "set actor.fsdp_config.ulysses_sequence_parallel_size=1."
+            )
+
+    @classmethod
+    def configure_gradient_checkpointing(cls, module, engine_config) -> None:
+        """Configure the FSDP2 checkpoint wrapper only for OmniNFT training."""
+        from verl.utils.torch_dtypes import PrecisionType
+
+        precision = engine_config.mixed_precision
+        param_dtype = PrecisionType.to_dtype(precision.get("param_dtype", "bf16") if precision is not None else "bf16")
+        if getattr(module, "_keep_in_fp32_modules", None) and cls.preserve_fp32_modules():
+            param_dtype = None
+        module.enable_gradient_checkpointing(gradient_checkpointing_func=_gradient_checkpointing_with_cast(param_dtype))
+
+    @classmethod
+    def prepare_training_inputs(
+        cls, micro_batch: TensorDict, step: int, scheduler
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Noise modalities independently and retain their context separately."""
+        timestep, time = cls._flow_time(micro_batch, step, scheduler)
+        context = {
+            modality: cls._noise_latents(
+                micro_batch, f"{modality}_latents_clean", f"{modality}_forward_noise", step, time
+            )
+            for modality in ("video", "audio")
+        }
+        latents = torch.cat((context["video"]["xt"], context["audio"]["xt"]), dim=1)
+        return latents, timestep, context
+
+    @staticmethod
+    def prepare_model_outputs(predictions: dict, loss_context: dict) -> dict:
+        """Map joint model predictions and modality context to OmniNFT loss fields."""
+        outputs = {
+            f"{modality}_{name}": value for modality, context in loss_context.items() for name, value in context.items()
+        }
+        for name, values in predictions.items():
+            for modality, value in zip(("video", "audio"), values, strict=True):
+                outputs[f"{modality}_{name}"] = value
+        return outputs
 
     @classmethod
     def prepare_processor_files(cls, model_path: str) -> str:
@@ -183,3 +235,25 @@ class LTX23OmniNFT(DiffusionModelBase):
     ):
         """Reject the reverse-transition API, which is not part of OmniNFT."""
         raise NotImplementedError("LTX-2.3 OmniNFT does not sample reverse transitions or compute their log-probs.")
+
+
+def _gradient_checkpointing_with_cast(param_dtype: Optional[torch.dtype]) -> Callable:
+    """Build a non-reentrant checkpoint wrapper using the FSDP parameter dtype."""
+
+    def cast_fp_tensor(value):
+        if (
+            param_dtype is None
+            or not isinstance(value, torch.Tensor)
+            or not torch.is_floating_point(value)
+            or value.dtype == param_dtype
+        ):
+            return value
+        return value.to(param_dtype)
+
+    def gradient_checkpointing_func(module, *args, **kwargs):
+        def checkpointed_forward(*inner_args, **inner_kwargs):
+            return module.__call__(*tree_map(cast_fp_tensor, inner_args), **tree_map(cast_fp_tensor, inner_kwargs))
+
+        return checkpoint(checkpointed_forward, *args, use_reentrant=False, **kwargs)
+
+    return gradient_checkpointing_func
