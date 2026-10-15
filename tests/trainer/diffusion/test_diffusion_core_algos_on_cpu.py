@@ -25,6 +25,23 @@ from verl_omni.trainer.diffusion import diffusion_algos
 from verl_omni.workers.config.diffusion.actor import DiffusionActorConfig, DiffusionLossConfig
 
 
+@pytest.mark.parametrize("missing_modality", ["video", "audio"])
+@pytest.mark.parametrize("explicit_null", [False, True])
+def test_omni_nft_rejects_missing_routing_weight(missing_modality, explicit_null):
+    weights = {"video": 1.0, "audio": 1.0}
+    if explicit_null:
+        weights[missing_modality] = None
+    else:
+        del weights[missing_modality]
+    with pytest.raises(ValueError, match=rf"Reward 'quality' must define routing_weights\.{missing_modality}"):
+        diffusion_algos.OmniNFTLoss._build_reward_routing_matrix(
+            reward_names=["quality"],
+            reward_functions={"quality": {"routing_weights": weights}},
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+
 @pytest.mark.parametrize("overrides", [{}, {"video_ref_kl_coef": 1e-4, "audio_ref_kl_coef": 1e-4}])
 def test_omni_nft_loss_with_declared_config(overrides):
     config = DiffusionActorConfig(

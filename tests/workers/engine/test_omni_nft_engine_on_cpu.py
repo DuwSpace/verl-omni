@@ -22,8 +22,9 @@ import torch
 from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 
+from verl_omni.pipelines import nft_hooks
 from verl_omni.pipelines.model_base import DiffusionModelBase
-from verl_omni.workers.engine.fsdp import diffusers_impl, nft_hooks
+from verl_omni.workers.engine.fsdp import diffusers_impl
 
 
 class _Policies(torch.nn.Module):
@@ -154,8 +155,7 @@ def test_existing_algorithms_keep_single_latent_hooks():
 def test_shared_engine_noises_each_branch_with_scheduler_time(monkeypatch, multimodal, scale, per_step_noise):
     engine = _engine(monkeypatch, multimodal, scale)
     batch = _batch(multimodal, per_step_noise, scale)
-    positive, negative, training_inputs = engine.prepare_model_inputs(batch, step=1)
-    context = training_inputs.loss_context
+    positive, negative, context = engine.prepare_model_inputs(batch, step=1)
     if multimodal:
         clean, noised, times = (
             tuple(context[modality][name] for modality in ("video", "audio")) for name in ("x0", "xt", "t_expanded")
@@ -276,22 +276,14 @@ def test_checkpoint_wrapper_casts_inputs_and_preserves_gradients():
     torch.testing.assert_close(module.weight.grad, torch.full_like(module.weight, 2.0))
 
 
-def test_algorithm_hook_can_supply_non_nft_loss_context(monkeypatch):
-    class TargetHooks(nft_hooks.NFTTrainingHooks):
-        @staticmethod
-        def prepare_training_inputs(micro_batch, step, scheduler):
-            clean = micro_batch["latents_clean"]
-            return nft_hooks.TrainingInputs(clean, micro_batch["train_timesteps"][:, step], {"target": clean * 3})
+@pytest.mark.parametrize("prefix", ["_omnift_reward_metric::", "renamed_reward_metric::"])
+def test_omni_nft_hooks_use_loss_metric_prefix(monkeypatch, prefix):
+    from verl_omni.trainer.diffusion.diffusion_algos import OmniNFTLoss
 
-    monkeypatch.setitem(nft_hooks.NFT_TRAINING_HOOKS, "diffusion_nft", TargetHooks)
-    engine = _engine(monkeypatch, multimodal=False)
-
-    def loss_function(*, model_output, data, dp_group):
-        assert "x0" not in model_output and "xt" not in model_output
-        loss = (model_output["forward_prediction"] - model_output["target"]).square().mean()
-        return loss, {}
-
-    loss, output = engine.forward_step(_batch(False), loss_function, forward_only=False, step=1)
-    loss.backward()
-    assert engine.module.weights["current"].grad is not None
-    assert output["loss"] == pytest.approx(4.0)
+    monkeypatch.setattr(OmniNFTLoss, "_REWARD_METRIC_PREFIX", prefix)
+    batch = _batch(True)
+    metric_key = f"{prefix}video/quality"
+    batch[metric_key] = torch.ones(2)
+    inputs = nft_hooks.OmniNFTTrainingHooks.prepare_loss_inputs(batch, step=1)
+    assert inputs[metric_key] is batch[metric_key]
+    assert set(inputs) == {"reward_prob"} | {key for key in batch.keys() if key.startswith(prefix)}

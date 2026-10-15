@@ -13,7 +13,6 @@
 # limitations under the License.
 """Algorithm hooks for the shared NFT forward-process engine."""
 
-from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import torch
@@ -21,15 +20,6 @@ from tensordict import TensorDict
 from torch.utils._pytree import tree_map
 from torch.utils.checkpoint import checkpoint
 from verl.utils import tensordict_utils as tu
-
-
-@dataclass
-class TrainingInputs:
-    """Model-facing latents/timesteps and algorithm-owned context for the loss."""
-
-    latents: torch.Tensor
-    timesteps: torch.Tensor
-    loss_context: dict[str, Any]
 
 
 def _flow_time(micro_batch, step, scheduler):
@@ -59,24 +49,16 @@ class NFTTrainingHooks:
     """Default single-latent NFT preparation, also used by existing DGPO adapters."""
 
     @staticmethod
-    def validate_engine_config(engine_config) -> None:
-        """Validate algorithm requirements before distributed initialization."""
-        return
-
-    @staticmethod
-    def configure_gradient_checkpointing(module, engine_config, *, preserve_fp32_modules: bool) -> None:
-        """Keep the checkpointing configured by the model loader unchanged."""
-        return
-
-    @staticmethod
-    def prepare_training_inputs(micro_batch: TensorDict, step: int, scheduler) -> TrainingInputs:
+    def prepare_training_inputs(
+        micro_batch: TensorDict, step: int, scheduler
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Prepare the default NFT noising context using the scheduler's timestep scale."""
         timestep, time = _flow_time(micro_batch, step, scheduler)
         context = _noise_latents(micro_batch, "latents_clean", "forward_noise", step, time)
-        return TrainingInputs(context["xt"], timestep, context)
+        return context["xt"], timestep, context
 
     @staticmethod
-    def prepare_model_outputs(predictions: dict, loss_context: dict, micro_batch: TensorDict) -> dict:
+    def prepare_model_outputs(predictions: dict, loss_context: dict) -> dict:
         """Combine policy predictions with algorithm-owned loss context."""
         return {**loss_context, **predictions}
 
@@ -122,7 +104,9 @@ class OmniNFTTrainingHooks(NFTTrainingHooks):
         module.enable_gradient_checkpointing(gradient_checkpointing_func=_gradient_checkpointing_with_cast(param_dtype))
 
     @staticmethod
-    def prepare_training_inputs(micro_batch: TensorDict, step: int, scheduler) -> TrainingInputs:
+    def prepare_training_inputs(
+        micro_batch: TensorDict, step: int, scheduler
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Noise modalities independently and retain their context separately."""
         timestep, time = _flow_time(micro_batch, step, scheduler)
         context = {
@@ -130,10 +114,10 @@ class OmniNFTTrainingHooks(NFTTrainingHooks):
             for modality in ("video", "audio")
         }
         latents = torch.cat((context["video"]["xt"], context["audio"]["xt"]), dim=1)
-        return TrainingInputs(latents, timestep, context)
+        return latents, timestep, context
 
     @staticmethod
-    def prepare_model_outputs(predictions: dict, loss_context: dict, micro_batch: TensorDict) -> dict:
+    def prepare_model_outputs(predictions: dict, loss_context: dict) -> dict:
         """Map joint model predictions and modality context to OmniNFT loss fields."""
         outputs = {
             f"{modality}_{name}": value for modality, context in loss_context.items() for name, value in context.items()
@@ -146,27 +130,22 @@ class OmniNFTTrainingHooks(NFTTrainingHooks):
     @staticmethod
     def prepare_loss_inputs(micro_batch: TensorDict, step: int) -> dict:
         """Select reward probabilities and retain per-modality reward metrics."""
+        from verl_omni.trainer.diffusion.diffusion_algos import OmniNFTLoss
+
         inputs = {"reward_prob": micro_batch["reward_prob"][:, step]}
         inputs.update(
             {
                 key: micro_batch[key]
                 for key in micro_batch.keys()
-                if isinstance(key, str) and key.startswith("_omnift_reward_metric::")
+                if isinstance(key, str) and key.startswith(OmniNFTLoss._REWARD_METRIC_PREFIX)
             }
         )
         return inputs
 
 
-NFT_TRAINING_HOOKS: dict[str, type[NFTTrainingHooks]] = {
-    "diffusion_nft": NFTTrainingHooks,
-    "dgpo": NFTTrainingHooks,
-    "omni_nft": OmniNFTTrainingHooks,
-}
-
-
 def get_nft_training_hooks(algorithm: str) -> type[NFTTrainingHooks]:
     """Select built-in specialization; other adapters retain the existing NFT contract."""
-    return NFT_TRAINING_HOOKS.get(algorithm, NFTTrainingHooks)
+    return OmniNFTTrainingHooks if algorithm == "omni_nft" else NFTTrainingHooks
 
 
 def _gradient_checkpointing_with_cast(param_dtype: Optional[torch.dtype]) -> Callable:

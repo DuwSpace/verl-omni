@@ -1343,6 +1343,8 @@ class OmniNFTLoss(DiffusionNFTLoss):
             row = []
             for modality in ("video", "audio"):
                 value = routing_weights.get(modality)
+                if value is None:
+                    raise ValueError(f"Reward '{name}' must define routing_weights.{modality}.")
                 if value < 0:
                     raise ValueError(f"Reward '{name}' routing weight for {modality} must be non-negative.")
                 row.append(float(value))

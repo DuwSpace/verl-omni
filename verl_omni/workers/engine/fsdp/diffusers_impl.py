@@ -60,6 +60,7 @@ from verl.workers.engine.spec import ShardSpec
 from verl.workers.engine.utils import enable_full_determinism, prepare_micro_batches
 
 from verl_omni.pipelines.model_base import DiffusionModelBase
+from verl_omni.pipelines.nft_hooks import NFTTrainingHooks, get_nft_training_hooks
 from verl_omni.pipelines.utils import (
     build_scheduler,
     forward,
@@ -70,22 +71,12 @@ from verl_omni.pipelines.utils import (
 from verl_omni.utils.diffusion_compile import _maybe_compile_repeated_blocks
 from verl_omni.utils.fsdp_utils import apply_fsdp2, collect_lora_params
 from verl_omni.workers.config import DiffusionModelConfig
-from verl_omni.workers.engine.fsdp.nft_hooks import NFTTrainingHooks, get_nft_training_hooks
 from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
-
-
-def _detach_predictions(
-    predictions: torch.Tensor | tuple[torch.Tensor, ...],
-) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """Detach a single prediction or each tensor in a joint model's output tuple."""
-    if isinstance(predictions, torch.Tensor):
-        return predictions.detach()
-    return tuple(prediction.detach() for prediction in predictions)
 
 
 def _cast_loaded_diffusers_module(
@@ -1459,12 +1450,13 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
         # Load external adapter registrations before resolving algorithm hooks.
         DiffusionModelBase.get_class(model_config)
         self._training_hooks = get_nft_training_hooks(model_config.algorithm)
-        self._training_hooks.validate_engine_config(engine_config)
+        if model_config.algorithm == "omni_nft":
+            self._training_hooks.validate_engine_config(engine_config)
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
     def _build_module(self):
         module = super()._build_module()
-        if self.model_config.enable_gradient_checkpointing:
+        if self.model_config.algorithm == "omni_nft" and self.model_config.enable_gradient_checkpointing:
             self._training_hooks.configure_gradient_checkpointing(
                 module,
                 self.engine_config,
@@ -1478,7 +1470,9 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
         return self._run_forward_backward_batch(data, loss_function, forward_only, timesteps_key="train_timesteps")
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
-        training_inputs = self._training_hooks.prepare_training_inputs(micro_batch, step, self.scheduler)
+        latents, timesteps, loss_context = self._training_hooks.prepare_training_inputs(
+            micro_batch, step, self.scheduler
+        )
 
         prompt_embeds = micro_batch["prompt_embeds"]
         prompt_embeds_mask = micro_batch["prompt_embeds_mask"]
@@ -1506,8 +1500,8 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
         model_inputs, negative_model_inputs = prepare_model_inputs(
             module=self.module,
             model_config=self.model_config,
-            latents=training_inputs.latents,
-            timesteps=training_inputs.timesteps,
+            latents=latents,
+            timesteps=timesteps,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
             negative_prompt_embeds=negative_prompt_embeds,
@@ -1515,14 +1509,14 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
             micro_batch=micro_batch,
             step=step,
         )
-        return model_inputs, negative_model_inputs, training_inputs
+        return model_inputs, negative_model_inputs, loss_context
 
     def prepare_model_outputs(self, output, micro_batch: TensorDict):
-        predictions, training_inputs = output
-        return self._training_hooks.prepare_model_outputs(predictions, training_inputs.loss_context, micro_batch)
+        predictions, loss_context = output
+        return self._training_hooks.prepare_model_outputs(predictions, loss_context)
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
-        model_inputs, negative_model_inputs, training_inputs = self.prepare_model_inputs(
+        model_inputs, negative_model_inputs, loss_context = self.prepare_model_inputs(
             micro_batch=micro_batch, step=step
         )
 
@@ -1533,7 +1527,11 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
                 model_inputs=model_inputs,
                 negative_model_inputs=negative_model_inputs,
             )
-            old_prediction = _detach_predictions(old_prediction)
+            old_prediction = (
+                old_prediction.detach()
+                if isinstance(old_prediction, torch.Tensor)
+                else tuple(prediction.detach() for prediction in old_prediction)
+            )
 
         forward_prediction = forward(
             module=self.module,
@@ -1550,7 +1548,11 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
                     model_inputs=model_inputs,
                     negative_model_inputs=negative_model_inputs,
                 )
-                ref_forward_prediction = _detach_predictions(ref_forward_prediction)
+                ref_forward_prediction = (
+                    ref_forward_prediction.detach()
+                    if isinstance(ref_forward_prediction, torch.Tensor)
+                    else tuple(prediction.detach() for prediction in ref_forward_prediction)
+                )
         self._set_adapter("default")
 
         model_output = self.prepare_model_outputs(
@@ -1560,7 +1562,7 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
                     "forward_prediction": forward_prediction,
                     "ref_forward_prediction": ref_forward_prediction,
                 },
-                training_inputs,
+                loss_context,
             ),
             micro_batch=micro_batch,
         )
@@ -1578,7 +1580,10 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
             loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
-            loss = torch.tensor(1.0, device=training_inputs.latents.device)
+            x0 = micro_batch.get("latents_clean")
+            if x0 is None:
+                x0 = micro_batch["video_latents_clean"]
+            loss = torch.tensor(1.0, device=x0.device)
             metrics = {}
 
         output = {

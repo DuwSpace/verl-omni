@@ -106,19 +106,17 @@ forwards, and loss invocation. Model adapters retain their existing
 `prepare_model_inputs` and `forward` methods.
 
 Algorithm preparation lives in
-`verl_omni/workers/engine/fsdp/nft_hooks.py`. The engine selects hooks using
+`verl_omni/pipelines/nft_hooks.py`. The engine selects hooks using
 `actor_rollout_ref.model.algorithm`: `omni_nft` selects `OmniNFTTrainingHooks`,
 while existing NFT/DGPO and external adapters retain `NFTTrainingHooks` by
-default. An additional specialization can extend the default hooks and add an
-entry to `NFT_TRAINING_HOOKS`; it does not require another engine or a new
-method on `DiffusionModelBase`.
+default. Both paths reuse the same engine and existing model adapter methods.
 
 The hooks have three data responsibilities:
 
 - `prepare_training_inputs(micro_batch, step, scheduler)` returns
-  `TrainingInputs(latents, timesteps, loss_context)`. The context belongs to
+  `(latents, timesteps, loss_context)`. The context belongs to
   the algorithm; the engine does not assume it contains `x0`, `xt` or `t`.
-- `prepare_model_outputs(predictions, loss_context, micro_batch)` maps the
+- `prepare_model_outputs(predictions, loss_context)` maps the
   three policy predictions and training context to the loss's output fields.
   Current-policy gradients must be preserved.
 - `prepare_loss_inputs(micro_batch, step)` selects per-step reward data and
@@ -131,15 +129,15 @@ video/audio loss fields. Both use the scheduler's `num_train_timesteps`;
 the rollout and model adapter must use the same scale. Reward routing and
 loss weighting remain in actor-batch preparation and `OmniNFTLoss`.
 
-Algorithm hooks validate engine requirements before distributed initialization.
+OmniNFT hooks validate engine requirements before distributed initialization.
 OmniNFT currently requires FSDP2 without Ulysses. It also requires
 `actor_rollout_ref.actor.enable_timestep_staging=False` (the default):
 the existing single-latent staging path cannot stage joint video/audio inputs.
 The trainer rejects this option when enabled, before starting workers.
-When gradient checkpointing
-is enabled, the NFT engine calls `configure_gradient_checkpointing` after
-loading the model and before LoRA, compilation and FSDP wrapping. Default NFT
-hooks retain the loader's checkpointing; only OmniNFT hooks install the
+When gradient checkpointing is enabled for OmniNFT, the NFT engine calls
+`configure_gradient_checkpointing` after loading the model and before LoRA,
+compilation and FSDP wrapping. Other algorithms retain the loader's
+checkpointing. OmniNFT hooks install the
 non-reentrant dtype wrapper. PPO/DPO engines and the public model base do
 not gain a training-module configuration hook.
 
