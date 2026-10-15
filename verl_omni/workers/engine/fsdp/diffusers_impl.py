@@ -60,7 +60,6 @@ from verl.workers.engine.spec import ShardSpec
 from verl.workers.engine.utils import enable_full_determinism, prepare_micro_batches
 
 from verl_omni.pipelines.model_base import DiffusionModelBase
-from verl_omni.pipelines.nft_hooks import NFTTrainingHooks, get_nft_training_hooks
 from verl_omni.pipelines.utils import (
     build_scheduler,
     forward,
@@ -256,7 +255,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
         if self.model_config.enable_gradient_checkpointing:
             try:
-                module.enable_gradient_checkpointing()
+                self._configure_gradient_checkpointing(module)
             except AttributeError:
                 raise NotImplementedError(
                     f"Gradient checkpointing is enabled in config, but {type(module).__name__} "
@@ -270,6 +269,9 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
         module.can_generate = lambda: False
         return module
+
+    def _configure_gradient_checkpointing(self, module):
+        module.enable_gradient_checkpointing()
 
     def _build_module(self):
         from diffusers import AutoModel
@@ -318,7 +320,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             )
 
             if self.model_config.enable_gradient_checkpointing:
-                module.enable_gradient_checkpointing()
+                self._configure_gradient_checkpointing(module)
 
             # patch for checkpoint saving
             def save_config(self, save_directory: str | os.PathLike):
@@ -1438,8 +1440,6 @@ class DPODiffusersFSDPEngine(DiffusersFSDPEngine):
 class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
     """Diffusers FSDP engine for direct-preference / forward-process objectives (e.g. DiffusionNFT)."""
 
-    _training_hooks = NFTTrainingHooks
-
     def __init__(
         self,
         model_config: DiffusionModelConfig,
@@ -1447,22 +1447,11 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
         optimizer_config: FSDPOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
-        # Load external adapter registrations before resolving algorithm hooks.
-        DiffusionModelBase.get_class(model_config)
-        self._training_hooks = get_nft_training_hooks(model_config.algorithm)
-        if model_config.algorithm == "omni_nft":
-            self._training_hooks.validate_engine_config(engine_config)
+        DiffusionModelBase.get_class(model_config).validate_engine_config(engine_config)
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
-    def _build_module(self):
-        module = super()._build_module()
-        if self.model_config.algorithm == "omni_nft" and self.model_config.enable_gradient_checkpointing:
-            self._training_hooks.configure_gradient_checkpointing(
-                module,
-                self.engine_config,
-                preserve_fp32_modules=DiffusionModelBase.get_class(self.model_config).preserve_fp32_modules(),
-            )
-        return module
+    def _configure_gradient_checkpointing(self, module):
+        DiffusionModelBase.get_class(self.model_config).configure_gradient_checkpointing(module, self.engine_config)
 
     def forward_backward_batch(
         self, data: TensorDict, loss_function: Callable, forward_only: bool = False
@@ -1470,7 +1459,7 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
         return self._run_forward_backward_batch(data, loss_function, forward_only, timesteps_key="train_timesteps")
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
-        latents, timesteps, loss_context = self._training_hooks.prepare_training_inputs(
+        latents, timesteps, loss_context = DiffusionModelBase.get_class(self.model_config).prepare_training_inputs(
             micro_batch, step, self.scheduler
         )
 
@@ -1513,7 +1502,7 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
 
     def prepare_model_outputs(self, output, micro_batch: TensorDict):
         predictions, loss_context = output
-        return self._training_hooks.prepare_model_outputs(predictions, loss_context)
+        return DiffusionModelBase.get_class(self.model_config).prepare_model_outputs(predictions, loss_context)
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
         model_inputs, negative_model_inputs, loss_context = self.prepare_model_inputs(
@@ -1568,7 +1557,7 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
         )
 
         if loss_function is not None:
-            loss_inputs = self._training_hooks.prepare_loss_inputs(micro_batch, step)
+            loss_inputs = DiffusionModelBase.get_class(self.model_config).prepare_loss_inputs(micro_batch, step)
             data = tu.get_tensordict(loss_inputs)
             tu.assign_non_tensor(
                 data,
@@ -1580,10 +1569,8 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
             loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
-            x0 = micro_batch.get("latents_clean")
-            if x0 is None:
-                x0 = micro_batch["video_latents_clean"]
-            loss = torch.tensor(1.0, device=x0.device)
+            prediction = forward_prediction if isinstance(forward_prediction, torch.Tensor) else forward_prediction[0]
+            loss = torch.tensor(1.0, device=prediction.device)
             metrics = {}
 
         output = {

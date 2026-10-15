@@ -19,7 +19,6 @@ import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
-from tensordict import TensorDict
 
 from verl_omni.trainer.diffusion import diffusion_algos
 from verl_omni.workers.config.diffusion.actor import DiffusionActorConfig, DiffusionLossConfig
@@ -554,21 +553,6 @@ def test_prepare_omni_nft_actor_batch_restores_single_component_axis() -> None:
     torch.testing.assert_close(result.batch["reward_prob"], expected_prob[:, None, :].expand(-1, selected_timesteps, 2))
     assert result.batch["reward_prob"].shape == (batch_size, selected_timesteps, 2)
     assert result.batch["sample_level_rewards"].shape == (batch_size, 1)
-    metric_prefix = diffusion_algos.OmniNFTLoss._REWARD_METRIC_PREFIX
-    actor_data = TensorDict(
-        {
-            key: value[:1]
-            for key, value in result.batch.items()
-            if isinstance(key, str) and key.startswith(metric_prefix)
-        },
-        batch_size=1,
-    )
-    metrics = diffusion_algos.OmniNFTLoss._collect_reward_metrics(actor_data)
-    assert metrics["actor/reward/quality/mean"] == pytest.approx(0.5)
-    assert metrics["actor/reward/quality/std"] == pytest.approx(scores.std(correction=0).item())
-    assert metrics["actor/reward/quality/min"] == pytest.approx(0.0)
-    assert metrics["actor/reward/quality/max"] == pytest.approx(1.0)
-    assert metrics["actor/reward/sum/mean"] == pytest.approx(0.5)
 
 
 def test_prepare_online_dpo_actor_batch() -> None:

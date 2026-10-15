@@ -97,49 +97,29 @@ After actor updates, the trainer refreshes the `old` adapter from `default`
 using `algorithm.old_policy_decay_schedule` and
 `algorithm.old_policy_update_interval`.
 
-### Extending the NFT engine
+DiffusionNFT and OmniNFT share `NFTDiffusersFSDPEngine`, selected by
+`model_type=diffusion_nft_model`. The engine resolves the model adapter through
+`DiffusionModelBase`'s `(architecture, algorithm)` registry. For each selected
+training timestep, the adapter prepares noisy latents and loss context; the
+engine runs the old, current and reference policies; then the adapter assembles
+the predictions and per-step reward inputs for the configured loss. The engine
+handles policy switching and backward execution, while the current-policy
+prediction retains its gradients.
 
-Single-latent DiffusionNFT and joint video/audio OmniNFT use
-`NFTDiffusersFSDPEngine` with `model_type=diffusion_nft_model`. The engine owns
-prompt preparation, policy-adapter switching, the old/current/reference
-forwards, and loss invocation. Model adapters retain their existing
-`prepare_model_inputs` and `forward` methods.
+The default methods in `verl_omni/pipelines/model_base.py` implement the
+single-latent path used by DiffusionNFT and DGPO. The LTX OmniNFT adapter in
+[PR #750](https://github.com/verl-project/verl-omni/pull/750) overrides these methods
+to noise video and audio latents independently, pack the model inputs, and map
+joint predictions to the two modality losses. Reward routing happens during
+actor-batch preparation, and `OmniNFTLoss` combines the weighted modality losses.
+The trainer logs reward summaries directly from reward extra info.
 
-Algorithm preparation lives in
-`verl_omni/pipelines/nft_hooks.py`. The engine selects hooks using
-`actor_rollout_ref.model.algorithm`: `omni_nft` selects `OmniNFTTrainingHooks`,
-while existing NFT/DGPO and external adapters retain `NFTTrainingHooks` by
-default. Both paths reuse the same engine and existing model adapter methods.
-
-The hooks have three data responsibilities:
-
-- `prepare_training_inputs(micro_batch, step, scheduler)` returns
-  `(latents, timesteps, loss_context)`. The context belongs to
-  the algorithm; the engine does not assume it contains `x0`, `xt` or `t`.
-- `prepare_model_outputs(predictions, loss_context)` maps the
-  three policy predictions and training context to the loss's output fields.
-  Current-policy gradients must be preserved.
-- `prepare_loss_inputs(micro_batch, step)` selects per-step reward data and
-  any additional group metadata or metrics. Forward-only calls skip this hook.
-
-Default NFT hooks retain the original single-latent noising and group fields.
-OmniNFT hooks independently noise `video_latents_clean` and
-`audio_latents_clean`, pack model inputs, and map joint predictions to the
-video/audio loss fields. Both use the scheduler's `num_train_timesteps`;
-the rollout and model adapter must use the same scale. Reward routing and
-loss weighting remain in actor-batch preparation and `OmniNFTLoss`.
-
-OmniNFT hooks validate engine requirements before distributed initialization.
-OmniNFT currently requires FSDP2 without Ulysses. It also requires
-`actor_rollout_ref.actor.enable_timestep_staging=False` (the default):
-the existing single-latent staging path cannot stage joint video/audio inputs.
-The trainer rejects this option when enabled, before starting workers.
-When gradient checkpointing is enabled for OmniNFT, the NFT engine calls
-`configure_gradient_checkpointing` after loading the model and before LoRA,
-compilation and FSDP wrapping. Other algorithms retain the loader's
-checkpointing. OmniNFT hooks install the
-non-reentrant dtype wrapper. PPO/DPO engines and the public model base do
-not gain a training-module configuration hook.
+The engine also calls the resolved adapter to validate its engine configuration
+and configure gradient checkpointing when enabled. The LTX OmniNFT adapter
+requires FSDP2 without Ulysses and installs its non-reentrant checkpointing dtype
+wrapper before LoRA, compilation and FSDP wrapping. OmniNFT timestep staging is
+currently unsupported: the trainer rejects
+`actor_rollout_ref.actor.enable_timestep_staging=True` before starting workers.
 
 ## Configuration
 
