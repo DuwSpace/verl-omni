@@ -3,7 +3,7 @@
 Last updated: 10/15/2026
 
 This recipe trains LoRA adapters for
-`diffusers/LTX-2.3-Diffusers@8eee8edcf067e838b843f926ec4d4cc9b2be1aaf`
+`diffusers/LTX-2.3-Diffusers`
 text-to-audio-video generation on 16 Ascend NPUs. It reuses the standard
 LTX-2.3 diffusers actor, vLLM-Omni rollout pipeline, worker placement, and native
 reward-model lifecycle. OmniNFT adds the dual-modal direct-preference loss and

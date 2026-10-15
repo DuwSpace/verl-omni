@@ -148,7 +148,7 @@ The HPSv3 reward is the only validated configuration. Other reward functions
 
 | Property | Detail |
 |----------|--------|
-| **Hugging Face ID** | FlowGRPO: `dg845/LTX-2.3-Diffusers`; OmniNFT: `diffusers/LTX-2.3-Diffusers@8eee8edcf067e838b843f926ec4d4cc9b2be1aaf` |
+| **Hugging Face ID** | FlowGRPO: `dg845/LTX-2.3-Diffusers`; OmniNFT: `diffusers/LTX-2.3-Diffusers` |
 | **Architecture** | LTX-2 DiT; checkpoint `_class_name` is `LTX2Pipeline` (rollout uses vLLM-Omni `LTX23Pipeline`) |
 | **Modality** | Text → Video + Audio; Text + first-frame image → Video + Audio |
 | **Pipeline** | Flow-matching with joint audio-video rollouts |
