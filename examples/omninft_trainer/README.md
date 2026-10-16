@@ -1,5 +1,7 @@
 # OmniNFT training
 
+Last updated: 10/16/2026
+
 This directory contains the production LTX-2.3 OmniNFT recipe.
 
 Set up the repository by following the
@@ -165,11 +167,11 @@ its own y-axis scale.
 
 #### Training
 
-![OmniNFT batch-32 training rewards](assets/omninft_bs32_rewards_train.jpeg)
+![OmniNFT batch-32 training rewards](https://raw.githubusercontent.com/verl-project/verl-omni/main/examples/omninft_trainer/assets/omninft_bs32_rewards_train.jpeg)
 
 #### Validation
 
-![OmniNFT batch-32 validation rewards](assets/omninft_bs32_rewards_validation.jpeg)
+![OmniNFT batch-32 validation rewards](https://raw.githubusercontent.com/verl-project/verl-omni/main/examples/omninft_trainer/assets/omninft_bs32_rewards_validation.jpeg)
 
 ## Routing
 
