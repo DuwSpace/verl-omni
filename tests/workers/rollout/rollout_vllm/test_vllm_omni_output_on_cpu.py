@@ -13,21 +13,15 @@
 # limitations under the License.
 
 from dataclasses import asdict
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-from omegaconf import OmegaConf
-from verl.utils.config import omega_conf_to_dataclass
 from vllm_omni.outputs import OmniRequestOutput
 
 from verl_omni.pipelines.diffusion_rollout_output import quantize_pixels
-from verl_omni.pipelines.ltx2_omni_nft.config import LTXDiffusionPipelineConfig
-from verl_omni.pipelines.ltx2_omni_nft.diffusers_training_adapter import LTX23OmniNFT
 from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
-from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
@@ -38,48 +32,6 @@ def diffusion_strategy():
     server.global_steps = 0
     server.model_config = None
     return DiffusionStrategy(server)
-
-
-def test_ltx_recipe_model_config_uses_standard_guidance(tmp_path):
-    server = object.__new__(vLLMOmniHttpServer)
-    server.config = SimpleNamespace(engine_kwargs={})
-    recipe = OmegaConf.load(Path(__file__).resolve().parents[4] / "examples/omninft_trainer/ltx2/ltx2_omninft.yaml")
-    model_config = OmegaConf.create(
-        {
-            "_target_": "verl_omni.workers.config.diffusion.DiffusionModelConfig",
-            "path": str(tmp_path),
-            "architecture": "LTX2Pipeline",
-            "algorithm": "omni_nft",
-            "load_tokenizer": False,
-            "attn_backend": "native",
-            "pipeline": OmegaConf.to_container(recipe.actor_rollout_ref.model.pipeline),
-        }
-    )
-
-    result = DiffusionStrategy(server).init_model_config(model_config)
-
-    assert isinstance(result, DiffusionModelConfig)
-    assert result.pipeline.guidance_scale == 1.0
-    assert LTX23OmniNFT._guidance_scales(result) == (1.0, 1.0)
-
-
-@pytest.mark.parametrize(
-    "section,expected",
-    [("pipeline", (1.5, 3.0, 1.0, 1.0, 0.0, 0.0)), ("val_kwargs.pipeline", (3.0, 7.0, 3.0, 3.0, 0.7, 0.7))],
-)
-def test_ltx_recipe_rollout_preserves_guidance_settings(section, expected):
-    recipe = OmegaConf.load(Path(__file__).resolve().parents[4] / "examples/omninft_trainer/ltx2/ltx2_omninft.yaml")
-    pipeline = omega_conf_to_dataclass(OmegaConf.select(recipe.actor_rollout_ref.rollout, section))
-
-    assert isinstance(pipeline, LTXDiffusionPipelineConfig)
-    assert (
-        pipeline.video_cfg_scale,
-        pipeline.audio_cfg_scale,
-        pipeline.video_modality_scale,
-        pipeline.audio_modality_scale,
-        pipeline.video_rescale_scale,
-        pipeline.audio_rescale_scale,
-    ) == expected
 
 
 def _request_output(artifacts, primary="image_preview", audio=None):

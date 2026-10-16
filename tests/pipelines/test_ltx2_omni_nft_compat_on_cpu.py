@@ -13,11 +13,15 @@
 # limitations under the License.
 """CPU tests for the LTX OmniNFT RMSNorm compatibility workaround."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from diffusers.models.normalization import RMSNorm
+from tensordict import TensorDict
 
 from verl_omni.pipelines.ltx2_omni_nft import compat
+from verl_omni.pipelines.ltx2_omni_nft.diffusers_training_adapter import LTX23OmniNFT
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -59,3 +63,45 @@ def test_ltx_npu_workaround_preserves_output_and_gradients(monkeypatch, dtype):
     assert tuple(norm.state_dict()) == state_keys
     assert untouched_norm.forward.__func__ is original
     assert RMSNorm.forward is original
+
+
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+def test_ltx_adapter_scopes_workaround_to_model_instances(monkeypatch, device):
+    monkeypatch.setattr(compat, "get_device_name", lambda: device)
+    module = torch.nn.Sequential(RMSNorm(4, eps=1e-6, elementwise_affine=False), RMSNorm(4, eps=1e-6))
+    untouched = RMSNorm(4, eps=1e-6, elementwise_affine=False)
+    original_forward = RMSNorm.forward
+    latents = torch.randn(1, 5, 4)
+    embeds = torch.randn(1, 2, 4)
+    config = SimpleNamespace(
+        pipeline=SimpleNamespace(
+            guidance_scale=1.0,
+            num_frames=9,
+            height=64,
+            width=64,
+            frame_rate=24,
+        )
+    )
+    batch = TensorDict({"video_latents_clean": latents[:, :3], "audio_prompt_embeds": embeds}, batch_size=[1])
+
+    inputs, negative = LTX23OmniNFT.prepare_model_inputs(
+        module,
+        config,
+        latents,
+        torch.tensor([500.0]),
+        embeds,
+        torch.ones(1, 2, dtype=torch.bool),
+        None,
+        None,
+        batch,
+        0,
+    )
+
+    expected = compat.ltx_affine_free_rms_norm_forward if device == "npu" else original_forward
+    assert module[0].forward.__func__ is expected
+    assert module[1].forward.__func__ is original_forward
+    assert untouched.forward.__func__ is original_forward
+    assert RMSNorm.forward is original_forward
+    assert negative is None
+    torch.testing.assert_close(inputs["hidden_states"], latents[:, :3])
+    torch.testing.assert_close(inputs["audio_hidden_states"], latents[:, 3:])
