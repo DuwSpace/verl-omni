@@ -71,9 +71,7 @@ actor_rollout_ref:
       - audio_ff.net.2
     fsdp_layer_prefixes: [transformer_blocks.]
     pipeline:
-      _target_: verl_omni.pipelines.ltx2_omni_nft.config.LTXDiffusionPipelineConfig
-      video_cfg_scale: 1.0
-      audio_cfg_scale: 1.0
+      guidance_scale: 1.0
   actor:
     strategy: fsdp2
     optim:

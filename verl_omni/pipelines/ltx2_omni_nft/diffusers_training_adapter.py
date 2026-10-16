@@ -116,13 +116,9 @@ class LTX23OmniNFT(DiffusionModelBase):
 
     @staticmethod
     def _guidance_scales(model_config: DiffusionModelConfig) -> tuple[float, float]:
-        """Use common CFG for None modality overrides, then replace None/zero by 1."""
-        common = getattr(model_config.pipeline, "guidance_scale", None)
-        video = getattr(model_config.pipeline, "video_cfg_scale", None)
-        audio = getattr(model_config.pipeline, "audio_cfg_scale", None)
-        video = video if video is not None else common
-        audio = audio if audio is not None else common
-        return float(video or 1.0), float(audio or 1.0)
+        """Use common CFG for both modalities, replacing None/zero by 1."""
+        scale = float(model_config.pipeline.guidance_scale or 1.0)
+        return scale, scale
 
     @classmethod
     def prepare_model_inputs(

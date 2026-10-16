@@ -19,7 +19,6 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.import_utils import import_external_libs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -227,23 +226,6 @@ class DiffusionStrategy(OmniStrategyBase):
 
     rollout_config_cls = DiffusionRolloutConfig
     model_config_cls = DiffusionModelConfig
-
-    def init_model_config(self, model_config: Any) -> DiffusionModelConfig:
-        """Resolve targeted mappings while preserving adapter-specific nested configs.
-
-        Use the base conversion for other inputs. The result must be a
-        DiffusionModelConfig or subclass, otherwise raise TypeError.
-        """
-        if isinstance(model_config, Mapping) and model_config.get("_target_"):
-            resolved = omega_conf_to_dataclass(model_config)
-        else:
-            resolved = super().init_model_config(model_config)
-        if not isinstance(resolved, DiffusionModelConfig):
-            raise TypeError(
-                "Diffusion model config must resolve to DiffusionModelConfig or a subclass; "
-                f"got {type(resolved).__module__}.{type(resolved).__qualname__}."
-            )
-        return resolved
 
     def worker_extension_cls(self, device_type: str) -> str:
         if device_type == "npu":
