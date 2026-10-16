@@ -1,62 +1,55 @@
-# OmniNFT training
+# OmniNFT Trainer
 
 Last updated: 10/16/2026
 
-This directory contains the production LTX-2.3 OmniNFT recipe.
+This example post-trains audio-video generation models with OmniNFT. Independent
+reward components are routed to the video and audio branches for direct-preference
+training. The current recipe trains LTX-2.3 LoRA adapters with a diffusers + FSDP2
+actor, vLLM-Omni rollout, and five native reward models on Ascend NPUs.
 
-Set up the repository by following the
-[NPU installation guide](../../docs/start/install_npu.md), then run the commands
-below from the repository root. The launcher accepts environment variables for
-local model, reward-model, data, and output paths.
+For the shared NFT training flow, see
+[Algorithms - DiffusionNFT](../../docs/algo/diffusionnft.md).
 
-## Prepare data
+## Paper feature coverage
 
-Convert the native OmniNFT VGGSound
-[`train_metadata_20k.jsonl`](https://github.com/zghhui/OmniNFT/blob/fb9237f6e74edf0d0f2a683f4d975b79fde588fe/dataset/vggsound/train_metadata_20k.jsonl)
-and
-[`test_metadata.jsonl`](https://github.com/zghhui/OmniNFT/blob/fb9237f6e74edf0d0f2a683f4d975b79fde588fe/dataset/vggsound/test_metadata.jsonl)
-to the standard RLHF parquet schema:
+The [OmniNFT paper](https://arxiv.org/abs/2605.12480) introduces three core
+techniques. This integration currently implements one of them:
 
-```bash
-python3 examples/omninft_trainer/data_process/prepare_data.py
-```
+| Technique | Status |
+|-----------|--------|
+| Modality-wise advantage routing | Implemented |
+| Layer-wise gradient surgery | Not implemented |
+| Region-wise loss reweighting | Not implemented |
 
-By default, the converter reads both files from the pinned OmniNFT revision
-`fb9237f6e74edf0d0f2a683f4d975b79fde588fe` and writes `train.parquet` and `test.parquet` to
-`./data/omninft/vggsound/verl_omni`. Local JSONL paths can be supplied with `--train_file` and `--val_file`. Each row
-keeps the joint generation prompt, stable prompt-group `uid`, separate video/audio reward prompts, and native source
-metadata. The standard `RLHFDataset` reads these files.
+The training results in this example cover modality-wise advantage routing.
+They do not include layer-wise gradient surgery or the paper's attention-based
+region-wise video-loss weighting.
 
-## Prepare model assets
+## Installation and preparation
 
-```bash
-bash examples/omninft_trainer/download_models.sh
-```
+Follow the [NPU installation guide](../../docs/start/install_npu.md), then use the
+[LTX-2.3 recipe](https://github.com/verl-project/verl-omni/blob/main/examples/omninft_trainer/ltx2/README.md) to prepare the dataset, policy model,
+reward dependencies, and checkpoints. Run the example commands from the repository root.
 
-This downloads the pinned LTX-2.3 base model, installs the reward-specific
-Python packages, downloads all pinned reward checkpoints and Qwen2-VL base
-models, checks out the pinned OmniNFT Synchformer source, and verifies the core
-files. The default `outputs` locations match the launcher. Set `MODEL_ROOT` and
-`REWARD_ROOT` consistently for another location. If the LTX-2.3 base model is
-already available, run `download_reward_models.sh` directly to prepare only
-the rewards. Review the licenses of the reward repositories and checkpoints
-before use.
+## Run training
 
-## Launch
+After preparing the assets, launch the NPU recipe:
 
 ```bash
 WANDB_MODE=offline \
-bash examples/omninft_trainer/ltx2/run_ltx2_3_omninft_lora_npu_bs32.sh
+bash examples/omninft_trainer/ltx2/run_ltx2_3_omninft_lora_npu.sh
 ```
 
-The example uses a batch size of 32, eight rollouts per prompt, 256 generated
-samples per step, four TP=4 rollout replicas with one sample per
-replica, LoRA rank/alpha 32/64, and a learning rate of `3e-5`. Rollout CPU
-offload is disabled. Actor mini/micro batch sizes are 32/8. Validation runs
-every 10 steps with 16 prompts, and checkpoints are saved every 50 steps.
-Override `DATA_DIR`, `MODEL_PATH`, `REWARD_ROOT`, or `OUTPUT_DIR` for local
-paths. The recipe sets `actor_rollout_ref.rollout.max_num_seqs=1`.
-Training batches and eight rollouts per prompt use separate engine requests.
+The default run uses 16 NPUs, batch size 32, eight rollouts per prompt, and four
+TP=4 rollout replicas. Local paths and run settings can be overridden through
+environment variables; additional Hydra overrides can be appended to the command.
+See the [recipe launch settings](https://github.com/verl-project/verl-omni/blob/main/examples/omninft_trainer/ltx2/README.md#launch) for details.
+
+## Variants
+
+| Model | Variant | Script | Devices | Rewards |
+|-------|---------|--------|---------|---------|
+| LTX-2.3 | T2AV LoRA | `examples/omninft_trainer/ltx2/run_ltx2_3_omninft_lora_npu.sh` | 16×NPU | VideoAlign, HPSv3, AudioBox, CLAP, DeSync |
 
 ## Results
 
@@ -167,14 +160,8 @@ its own y-axis scale.
 
 #### Training
 
-![OmniNFT batch-32 training rewards](https://raw.githubusercontent.com/verl-project/verl-omni/main/examples/omninft_trainer/assets/omninft_bs32_rewards_train.jpeg)
+![OmniNFT batch-32 training rewards](https://github.com/user-attachments/assets/8d90d845-bff1-4fcb-ba77-f5e3dc7c1425)
 
 #### Validation
 
-![OmniNFT batch-32 validation rewards](https://raw.githubusercontent.com/verl-project/verl-omni/main/examples/omninft_trainer/assets/omninft_bs32_rewards_validation.jpeg)
-
-## Routing
-
-Routing is keyed by reward name. Video receives weights `1.0`, `1.5`, and
-`1.0` from VideoAlign, HPSv3, and DeSync. Audio receives weights `0.5`, `1.0`,
-and `1.0` from AudioBox, CLAP, and DeSync.
+![OmniNFT batch-32 validation rewards](https://github.com/user-attachments/assets/ccb0d052-792e-445b-b573-ed289266da77)

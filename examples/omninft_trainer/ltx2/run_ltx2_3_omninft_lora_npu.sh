@@ -30,14 +30,10 @@ source "$ASCEND_HOME_PATH/set_env.sh"
 source "$ASCEND_HOME_PATH/../nnal/atb/set_env.sh"
 set -u
 
-MODEL_REVISION=8eee8edcf067e838b843f926ec4d4cc9b2be1aaf
 MODEL_ROOT=${MODEL_ROOT:-$REPO_ROOT/outputs}
-default_model_path=$MODEL_ROOT/models--diffusers--LTX-2.3-Diffusers/snapshots/$MODEL_REVISION
+default_model_path=$MODEL_ROOT/LTX-2.3-Diffusers
 default_reward_root=$MODEL_ROOT/omninft-rewards
 
-if [[ ! -d "$default_model_path" && -d "/hub/models--diffusers--LTX-2.3-Diffusers/snapshots/$MODEL_REVISION" ]]; then
-    default_model_path=/hub/models--diffusers--LTX-2.3-Diffusers/snapshots/$MODEL_REVISION
-fi
 if [[ ! -d "$default_reward_root" && -d /hub/omninft-rewards ]]; then
     default_reward_root=/hub/omninft-rewards
 elif [[ ! -d "$default_reward_root" && -d /hub/omnift-rewards ]]; then

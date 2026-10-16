@@ -1,6 +1,6 @@
 # Supported Models
 
-Last updated: 10/15/2026.
+Last updated: 10/16/2026.
 
 VeRL-Omni supports RL post-training for generative models across image, video,
 audio, and omni modalities. This page catalogues every model with a ready-to-run
@@ -165,7 +165,7 @@ For dataset layout and launch overrides, see
 | Flow-GRPO (T2AV LoRA) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora.sh` | 8×GPU (TP=2) |
 | Flow-GRPO (TI2VA LoRA) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_ti2va_lora.sh` | 8×GPU (TP=1) |
 | Flow-GRPO (T2AV LoRA, NPU) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora_npu.sh` | 16×NPU (TP=4) |
-| OmniNFT (T2AV LoRA, NPU) | `examples/omninft_trainer/ltx2/run_ltx2_3_omninft_lora_npu_bs32.sh` | 16×NPU (TP=4) |
+| OmniNFT (T2AV LoRA, NPU) | `examples/omninft_trainer/ltx2/run_ltx2_3_omninft_lora_npu.sh` | 16×NPU (TP=4) |
 
 **Reward models:** FlowGRPO uses CLAP (`laion/larger_clap_general`) and
 ImageBind (local `.pth`, CC-BY-NC-SA 4.0) for audio-video alignment. OmniNFT
