@@ -36,8 +36,15 @@ def main():
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--frames", type=int, default=33)
     parser.add_argument("--steps", type=int, default=2)
-    parser.add_argument("--recaption-tokens", type=int, default=32)
+    parser.add_argument("--recaption-tokens", type=int, default=4096)
+    parser.add_argument("--video-cfg-scale", type=float, default=1.0)
+    parser.add_argument("--audio-cfg-scale", type=float, default=1.0)
+    parser.add_argument("--modality-scale", type=float, default=1.0)
+    parser.add_argument("--rescale-scale", type=float, default=0.0)
     parser.add_argument("--num-samples", type=int, default=1)
+    parser.add_argument(
+        "--resync-between-samples", action="store_true", help="Probe LoRA eviction/reload after inference"
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--audit-frozen-components", action="store_true")
     parser.add_argument(
@@ -46,6 +53,8 @@ def main():
     args = parser.parse_args()
     if args.num_samples < 1:
         parser.error("--num-samples must be positive")
+    if args.resync_between_samples and (args.policy_bundle is not None or args.num_samples < 2):
+        parser.error("--resync-between-samples requires at least two samples and the default probe adapters")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     model = Path(args.model)
@@ -86,17 +95,18 @@ def main():
             "num_inference_steps": args.steps,
             "max_sequence_length": 1024,
             "extra_args": {
-                "video_cfg_scale": 1.0,
-                "audio_cfg_scale": 1.0,
-                "video_modality_scale": 1.0,
-                "audio_modality_scale": 1.0,
-                "video_rescale_scale": 0.0,
-                "audio_rescale_scale": 0.0,
+                "video_cfg_scale": args.video_cfg_scale,
+                "audio_cfg_scale": args.audio_cfg_scale,
+                "video_modality_scale": args.modality_scale,
+                "audio_modality_scale": args.modality_scale,
+                "video_rescale_scale": args.rescale_scale,
+                "audio_rescale_scale": args.rescale_scale,
             },
         },
         recaption_temperature=1.0,
         recaption_max_new_tokens=args.recaption_tokens,
         sync_timeout_seconds=300,
+        vae_use_tiling=True,
     )
     loading = perf_counter() - start
     try:
@@ -108,9 +118,20 @@ def main():
             frozen_before = backend.engine.collective_rpc("snapshot_joint_frozen_components", timeout=300)
             (output / "frozen_before.json").write_text(json.dumps(frozen_before, indent=2))
         rollout_start = perf_counter()
-        results = backend.generate(
-            [args.prompt] * args.num_samples, list(range(args.seed, args.seed + args.num_samples)), version=version
-        )
+        if args.resync_between_samples:
+            results = []
+            for index in range(args.num_samples):
+                if index:
+                    directory = output / f"policy-{index}"
+                    write_joint_lora_bundle(
+                        directory, weights, LoraConfig(r=8, lora_alpha=8), version=index, base_model=str(model)
+                    )
+                    backend.load_policy(directory)
+                results.extend(backend.generate([args.prompt], [args.seed + index], version=index))
+        else:
+            results = backend.generate(
+                [args.prompt] * args.num_samples, list(range(args.seed, args.seed + args.num_samples)), version=version
+            )
         rollout_time = perf_counter() - rollout_start
         if args.audit_frozen_components:
             frozen_after = backend.engine.collective_rpc("snapshot_joint_frozen_components", timeout=300)
@@ -137,11 +158,15 @@ def main():
                     "seed": record.seed,
                     "original_prompt": record.original_prompt,
                     "recaption": record.recaption,
+                    "planning": record.planning,
+                    "planning_words": len((record.planning or "").split()),
+                    "recaption_words": len(record.recaption.split()),
                     "recaption_tokens": record.response_token_ids.numel(),
                     "recaption_ended_with_eos": int(record.response_token_ids[-1]) in record.eos_token_ids,
                     "policy_version": record.policy_version,
                     "recaption_time": sample["recaption_time"],
                     "generation_time": sample["generation_time"],
+                    "memory_metrics": sample["memory_metrics"],
                     "video_shape": list(sample["video"].shape),
                     "audio_shape": list(sample["audio"].shape),
                     "fps": sample["fps"],
@@ -151,11 +176,13 @@ def main():
         summary = {
             "policy_bundle": str(policy_directory),
             "policy_version": version,
+            "resync_between_samples": args.resync_between_samples,
             "model_load_time": loading,
             "sync_time": sync,
             "rollout_time": rollout_time,
             "samples_per_second": len(results) / rollout_time,
             "frozen_components_audited": args.audit_frozen_components,
+            "memory_after_release": backend.engine.collective_rpc("release_joint_device_memory", timeout=300),
             "samples": summaries,
         }
         (output / "summary.json").write_text(json.dumps(summary, indent=2))

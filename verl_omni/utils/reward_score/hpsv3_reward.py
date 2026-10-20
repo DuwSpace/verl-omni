@@ -754,6 +754,13 @@ class HPSv3Model:
         )
         self._infer_lock = threading.Lock()
 
+    def to(self, device):
+        """Move inference state without reloading weights or changing dtype."""
+        with self._infer_lock:
+            self._inferencer.model.to(device)
+            self._inferencer.device = torch.device(device)
+        return self
+
     def close(self) -> None:
         """Release the inferencer; reuse requires a new adapter."""
         self._inferencer = None

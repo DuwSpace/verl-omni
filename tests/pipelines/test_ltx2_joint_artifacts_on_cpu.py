@@ -16,6 +16,7 @@ import subprocess
 import imageio.v2 as imageio
 import imageio_ffmpeg
 import numpy as np
+import pytest
 import soundfile as sf
 import torch
 from verl import DataProto
@@ -24,10 +25,16 @@ from verl_omni.pipelines.ltx2_unigrpo_nft.artifacts import save_joint_samples
 from verl_omni.pipelines.ltx2_unigrpo_nft.replay import LTXJointReplay
 
 
-def test_joint_review_artifacts_preserve_exact_replay_and_decodable_media(tmp_path):
+@pytest.mark.parametrize("source", ["modality_probability", "combined_reward"])
+def test_joint_review_artifacts_preserve_exact_replay_and_decodable_media(tmp_path, source):
     record = LTXJointReplay(
         original_prompt="A bell rings. <script>alert(1)</script>",
         recaption="One bell sounds in a quiet room.",
+        planning="Match the strike to the chime. <script>planning</script>",
+        response_text=(
+            "<plan>Match the strike to the chime. <script>planning</script></plan>"
+            "<recaption>One bell sounds in a quiet room.</recaption>"
+        ),
         prompt_token_ids=torch.tensor([2, 3]),
         response_token_ids=torch.tensor([4, 1]),
         rollout_logprobs=torch.tensor([-0.4, -0.2]),
@@ -54,16 +61,33 @@ def test_joint_review_artifacts_preserve_exact_replay_and_decodable_media(tmp_pa
             "text_reward_prob": torch.tensor([0.4]),
             "text_advantages": torch.tensor([-1.0]),
         },
-        non_tensors={"uid": np.array(["original-group"]), "ltx_joint_replay": np.array([record], dtype=object)},
+        non_tensors={
+            "uid": np.array(["original-group"]),
+            "ltx_joint_replay": np.array([record], dtype=object),
+            "reward/video_align/ta_raw": np.array([1.5]),
+        },
     )
     names = ["audiobox", "clap", "desync", "hpsv3", "video_align"]
-    save_joint_samples(batch, tmp_path, names)
+    if source == "combined_reward":
+        batch.meta_info["text_reward_source"] = source
+        batch.batch["text_reward"] = batch.batch["rm_scores"].sum(-1)
+    save_joint_samples(batch, tmp_path, names, save_tensors=True)
     index = json.loads((tmp_path / "samples.json").read_text())[0]
     assert index["original_prompt"] == record.original_prompt and index["recaption"] == record.recaption
+    assert index["planning"] == record.planning and index["response_text"] == record.response_text
     assert index["policy_version"] == 7 and index["ended_with_eos"]
     assert index["reward_scores"] == dict(zip(names, range(5), strict=True))
+    assert index["text_reward_source"] == source
+    assert index["text_reward"] == pytest.approx(10.0 if source == "combined_reward" else 0.4)
+    assert index["text_reward_probability"] == pytest.approx(0.4)
+    assert index["video_align_details"] == {"ta_raw": 1.5}
+    assert index["planning_words"] == len(record.planning.split())
     saved = torch.load(tmp_path / index["sample_file"], weights_only=False)
     torch.testing.assert_close(saved["replay"]["rollout_logprobs"], record.rollout_logprobs)
+    assert saved["replay"]["planning"] == record.planning
+    assert saved["video_align_details"] == {"ta_raw": 1.5}
+    assert saved["text_reward_source"] == source
+    assert saved["text_reward"] == index["text_reward"]
     assert saved["ar_inputs"]["response_mask"].tolist() == [[False, False, True, True]]
     assert saved["ar_inputs"]["attention_mask"].all()
     torch.testing.assert_close(saved["video_latents_clean"], batch.batch["video_latents_clean"])
@@ -95,4 +119,19 @@ def test_joint_review_artifacts_preserve_exact_replay_and_decodable_media(tmp_pa
     )
     page = (tmp_path / "index.html").read_text()
     assert "&lt;script&gt;" in page and "<script>" not in page
+    assert "<h3>Planning</h3>" in page and "Match the strike to the chime." in page
     assert record.recaption in page and index["review_video_file"] in page
+    assert source in page and "Text scalar reward:" in page
+
+    # The default must retain review evidence without serializing replay tensors.
+    media_dir = tmp_path / "media_only"
+    save_joint_samples(batch, media_dir, names)
+    media_index = json.loads((media_dir / "samples.json").read_text())[0]
+    assert not list(media_dir.glob("*.pt"))
+    assert media_index["sample_file"] is None
+    assert media_index["sample_id"] == "sample-0000"
+    for key in ("original_prompt", "recaption", "reward_scores", "seed", "policy_version"):
+        assert media_index[key] == index[key]
+    for key in ("video_file", "audio_file", "review_video_file"):
+        assert (media_dir / media_index[key]).stat().st_size > 0
+    assert "<h2>sample-0000</h2>" in (media_dir / "index.html").read_text()

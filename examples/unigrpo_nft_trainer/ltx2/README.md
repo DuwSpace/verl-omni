@@ -1,12 +1,38 @@
 # LTX-2.3 recaption GRPO + OmniNFT
 
-This recipe trains a paired Gemma/DiT LoRA policy using synchronous vLLM-Omni
-rollout. Gemma generates recaptions and encodes them with the same adapter.
-GRPO and OmniNFT both update Gemma; OmniNFT also updates the audio/video DiT.
-Base weights, VAEs and connectors are frozen; connectors retain the gradient
-path to the current Gemma encoder.
+For the architecture, reward equations, gradient paths, policy lifecycle and launch configuration, see the [中文实现文档](IMPLEMENTATION.md).
 
-**Complete under the user-adjusted verification scope.** Five real update rounds, checkpoint restoration,
+This recipe trains a paired Gemma/DiT LoRA policy using synchronous vLLM-Omni
+rollout. Gemma enables its trainable LoRA for planning and recaption, then disables
+that LoRA for AV condition encoding. GRPO updates Gemma LoRA; OmniNFT updates
+only the audio/video DiT LoRA. Base weights, VAEs and connectors are frozen.
+Both stages reuse the same Gemma base weights; encoding runs without gradients.
+
+Historical results below predate frozen base encoding and do not validate the new gradient contract.
+
+## Direct audiovisual prompt rewriting
+
+Gemma now returns only the final audiovisual generation prompt, without tags,
+headings or a separate planning section. The instruction retains the user's
+requirements for intent, temporal/spatial coherence, audio and original-language
+dialogue. It sets no word count. The entire response conditions AV generation
+and receives GRPO credit; reward targets remain the dataset's original video/audio
+prompts. Gemma LoRA is active during rewriting and disabled during encoding.
+
+`actor_rollout_ref.rollout.ltx_joint.max_new_tokens=4096` is the response ceiling;
+normal generation ends at EOS. Temperature remains 1.0. A token-budget cutoff
+raises a diagnostic error instead of silently using incomplete text. The AV
+encoder separately retains `max_sequence_length=1024`; an overlong final prompt
+is rejected rather than silently truncated. These are different limits.
+
+New replay uses `response_format="caption"`, `planning=null`, and retains the
+complete response text, token IDs and logprobs. Historical tagged replay remains
+readable. Live generation no longer invokes the two-section parser. Failure
+messages retain seed, policy version, token count, EOS status and raw response.
+
+## Historical verification before planning
+
+**Complete under the earlier user-adjusted verification scope.** Five real update rounds, checkpoint restoration,
 subsequent rollout and fixed evaluation have run successfully on eight Ascend
 910B devices. Numerical alignment corrections passed the real FSDP paired forward and joint
 backward in experiment `011`, which exited successfully. Native decoder freezing also passed an actual before/after audit. The user accepted the existing training duration and requested no further
@@ -17,6 +43,38 @@ of code changed afterward.
 
 ## Run the joint trainer
 
+The default dataset uses the complete pinned
+[OmniNFT VGGSound recipe](https://github.com/DuwSpace/verl-omni/tree/98dc6a06ccef1b701b2a917bf4f02a3f4d6c373b/examples/omninft_trainer):
+19,487 training records and 16 validation records. Prepare both full splits:
+
+```bash
+python examples/unigrpo_nft_trainer/ltx2/prepare_omninft_data.py
+```
+
+The converter pins OmniNFT data revision
+`fb9237f6e74edf0d0f2a683f4d975b79fde588fe`. Its default `--train_size=-1`
+and `--val_size=-1` preserve every record. Use explicit positive limits and a
+separate `--output_dir` for smoke datasets. Default outputs are
+`data/omninft/vggsound/ltx_joint_full/train.parquet` and `test.parquet`.
+The launcher uses them unless `LTX_TRAIN_FILE` / `LTX_VAL_FILE` override them.
+The existing `ltx_joint_1x1` smoke files are retained.
+
+The converter preserves `prompt_av` as the joint generation prompt and
+`prompt_v` / `prompt_a` as the original video/audio reward targets, along with
+source metadata and stable group IDs. The full parquet contents have been
+checked against every source record; this preparation does not run training.
+
+Defaults are `train_batch_size=32`, `rollout.n=8` (256 generated samples per
+training step), actor mini-batch size 256, and four samples per micro-batch
+per rank. On eight ranks, eight micro-batches accumulate into one optimizer update. Checkpoint saving and validation run every 2 steps. Total training is
+capped at 100 steps, so this run uses the full data source without completing
+an epoch. Validation uses all 16 records with one candidate per prompt.
+The launcher does not override rollout group or actor mini-batch sizes with
+the device count. `run_train.sh` is the single training entry point and uses the current recipe defaults.
+
+The launcher leaves `LTX_ACTOR_NPU_MEMORY_FRACTION` unset by default; an
+explicit value is forwarded through the Ray runtime environment.
+
 The tested environment is eight Ascend 910B devices with 64 GB each, CPU offload,
 local model/reward assets and substantial host RAM. Runtime versions are recorded
 in `/tmp/ltx-joint-artifacts/training-007-runtime-environment.json`: PyTorch
@@ -25,18 +83,27 @@ vLLM 0.28.0 and vLLM-Omni 0.28.0rc2.dev68+gded893462.npu. The installed native
 source has an unavailable external Git directory; package version is not proof
 of a clean checkout. Other versions and GPU execution are unverified.
 
+Initialize CANN/ATB for your installation and set the model, reward and output
+paths before launching. See the [NPU installation guide](../../../docs/start/install_npu.md).
+The script defaults to eight devices, CPU offload and W&B offline, and writes
+`train.log` under `LTX_OUTPUT_DIR`. Additional Hydra overrides can be appended.
+
 ```bash
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
+# Source your installation's CANN/ATB environment scripts first.
 export LTX_MODEL_PATH=/path/to/LTX-2.3-Diffusers
 export LTX_REWARD_ROOT=/path/to/omnift-rewards
-export LTX_TRAIN_FILE=/path/to/train.parquet
-export LTX_VAL_FILE=/path/to/fixed-eval.parquet
+export LTX_TRAIN_FILE="$PWD/data/omninft/vggsound/ltx_joint_full/train.parquet"
+export LTX_VAL_FILE="$PWD/data/omninft/vggsound/ltx_joint_full/test.parquet"
 export LTX_OUTPUT_DIR=/path/to/new-run
 export LTX_NUM_DEVICES=8
-bash examples/unigrpo_nft_trainer/ltx2/run_joint_npu.sh
+bash examples/unigrpo_nft_trainer/ltx2/run_train.sh
 ```
 
-To reproduce the exact four-prompt functional experiment:
+Set `LTX_DISABLE_PROGRESS_BAR=1` before launching to hide the LTX denoising
+progress bar. The recipe forwards it to Ray workers; `0` (default) keeps the
+backend's normal display behavior. Model loading bars and training logs are unaffected.
+
+To reproduce the historical four-prompt functional experiment instead:
 
 ```bash
 python examples/unigrpo_nft_trainer/ltx2/prepare_smoke_data.py --output /path/to/new-smoke-data
@@ -57,10 +124,11 @@ requires at least five devices, but real distributed verification used eight.
 Extra launcher arguments are Hydra overrides; `--cfg job --resolve` checks the
 resolved configuration without training.
 
-The default diagnostic geometry is 256 × 256, 33 frames at 24 fps, 30 denoising
-steps, two prompts with eight samples each. Mini-batch size counts complete
-recaption/AV samples, so 16 samples with mini-batch size eight produce two joint
-optimizer steps. Micro-batch size is one per rank. FP32 LoRA masters use learning
+The current geometry is 256 × 384, 121 frames at 24 fps, with 20 denoising
+steps for training rollout and 40 for evaluation. A training step contains
+32 prompts with eight samples each. Mini-batch size counts complete recaption/AV
+samples, so 256 samples with mini-batch size 256 produce one joint optimizer
+step per training step when `ppo_epochs=1`. Micro-batch size is four per rank. FP32 LoRA masters use learning
 rates 1e-6 for Gemma and 1e-5 for DiT. Gemma uses original FP32 base weights;
 DiT/connectors use BF16. The recipe is a short functional experiment, not a
 production-quality generation setting.
@@ -68,18 +136,29 @@ production-quality generation setting.
 To restore a paired checkpoint into a new output directory:
 
 ```bash
-bash examples/unigrpo_nft_trainer/ltx2/run_joint_npu.sh \
+bash examples/unigrpo_nft_trainer/ltx2/run_train.sh \
   trainer.resume_mode=resume_path \
   trainer.resume_from_path=/path/to/previous/checkpoints/global_step_4 \
   trainer.total_training_steps=5
 ```
 
-`ref` remains the training-start snapshot on resume. Every rollout freezes a new
-paired `old` from current parameters; all mini-batches retain that same `old`.
+`ref` remains the training-start snapshot on resume. All mini-batches retain
+the same paired EMA `old`; it is refreshed only after the full actor update.
 Each export contains both adapters, a version manifest and checksums. Replicas
 must acknowledge the complete pair before generation. Training rollout versions
 are `2 * step - 1`; evaluation versions are `2 * step`, with zero for initial
 evaluation. Immutable old/ref hashes are checked during updates and serialization.
+
+## Offline logging
+
+The recipe enables `trainer.logger=[console,wandb]`. The launcher sets
+`WANDB_MODE=offline`, and the Ray runtime environment also explicitly sets offline
+mode so the trainer process records locally. `WANDB_DIR` defaults to
+`LTX_OUTPUT_DIR`; runs are written under `$LTX_OUTPUT_DIR/wandb/offline-run-*`.
+Set `WANDB_DIR` to another writable directory before launching to relocate them.
+No W&B login is required and this recipe does not upload runs. Console metrics
+remain enabled. A local smoke check using the actual `Tracking` class confirmed
+that an offline `.wandb` run file is created.
 
 ## Backend and numerical contract
 
@@ -88,7 +167,80 @@ evaluation. Immutable old/ref hashes are checked during updates and serializatio
 Each rollout replica uses one vLLM-Omni diffusion worker. Recaption invokes
 Transformers `generate` on that worker's existing Gemma; it is not a separate
 paged-KV autoregressive engine. The same Gemma then supplies native AV conditions.
-The initial implementation uses conditional-only AV generation.
+Training rollout and validation now use separate native guidance settings from
+[the reference recipe](https://github.com/DuwSpace/verl-omni/blob/split/omninft-ltx2-recipe/examples/omninft_trainer/ltx2/ltx2_omninft.yaml):
+
+| Setting | Training rollout | Evaluation |
+| --- | --- | --- |
+| Height × width / frames / fps | 256 × 384 / 121 / 24 | 256 × 384 / 121 / 24 |
+| Denoising steps | 20 | 40 |
+| Video / audio CFG | 1.5 / 3.0 | 3.0 / 7.0 |
+| Video / audio modality CFG | 1.0 / 1.0 (disabled) | 3.0 / 3.0 |
+| Video / audio rescale | 0.0 / 0.0 (disabled) | 0.7 / 0.7 |
+
+Override training fields under `actor_rollout_ref.rollout.pipeline` and evaluation
+fields under `actor_rollout_ref.rollout.val_kwargs.pipeline`. Settings travel with
+each batch to the cached backend; evaluation does not mutate training defaults.
+Replay saves the selected geometry and guidance. To disable modality guidance
+or rescale in evaluation too, set both corresponding evaluation scales to 1.0
+or 0.0 respectively. Gemma allows up to 4096 generated tokens and temperature 1.0.
+
+TP remains 1 with eight independent replicas and CPU offload; VAE tiling is
+now enabled through `rollout.ltx_joint.vae_use_tiling`. VAE patch parallelism
+remains 1. The reference recipe's TP, full-batch sizes, LoRA/optimizer settings,
+old-adapter rollout and training schedule are not adopted. Evaluation uses independent `rollout.val_kwargs.n=1` and fixed seeds.
+The FSDP collective dispatch pads requests to the actor world size, then removes
+padded outputs before rewards, metrics and saving. With one prompt on eight ranks,
+this currently runs eight copies with the same seed but retains only one result;
+it does not yet reduce physical generation work to one active rank. With a single
+candidate, group-relative probabilities are neutral (0.5); compare the five raw
+reward components rather than that normalized probability. The native LTX sampler
+uses its deterministic denoising path, without injecting FlowGRPO SDE noise.
+The FSDP OmniNFT forward remains conditional; sampling guidance changes the
+generated samples, not the actor's noise-prediction objective.
+
+With `rollout.ltx_joint.cpu_offload=true`, the native backend delegates
+residency to this repository's `JointRolloutOffload`. Gemma, connectors, DiT,
+video VAE, audio VAE and vocoder run with mutually exclusive model residency.
+The controller also covers `generate()` / `decode()` entry points and native
+DiT LoRA tensor sidecars. Each request releases all managed components in
+`finally`; consecutive DiT steps keep their weights resident. Transfers preserve
+dtypes and use blocking CPU copies without pinning the entire Gemma model.
+Both positive and negative CFG embeddings use the connector dtype (BF16), while
+Gemma weights and encoding computation remain FP32. This addresses the observed
+negative-connector OOM caused by overlap with resident Gemma and FP32 conditions.
+The installed backend must support the pipeline-owned
+`enable_omni_model_cpu_offload` protocol; current container initialization logs
+confirm that delegation. Framework/communication allocations and live outputs
+are outside this controller and can still occupy device memory after release.
+
+All five native reward models enable `offload: true` and `cpu_offload: true`
+in `rewards.yaml`. The first scoring batch loads checkpoints; afterward sleep
+moves weights to CPU memory and wake moves the same model back to its assigned
+device. Processors and mixed parameter dtypes are preserved, including HPSv3's
+FP32 reward head and DeSync's mel transform. Sleeping executors reject inference
+and wait for active requests before moving weights. Set a model's
+`reward.models.<name>.cpu_offload=false` to restore destruction/reloading on
+sleep; `offload=false` instead keeps it resident on the accelerator. Cached
+weights consume host RAM until the executor is closed or its worker exits.
+Restart training to pick up this code/config change in existing Ray workers.
+
+The explicit offload change passed real-weight single-worker probes at
+256 × 384 / 121 frames: two consecutive requests with training CFG and two
+denoising steps, plus one request with the full 40-step evaluation guidance.
+All three produced MP4/WAV and replay tensors. Peak PyTorch allocated memory
+was 48.75 GiB (reserved 50.63–50.65 GiB); after explicit release, each worker
+reported 1 KiB allocated and 2 MiB reserved. These probes use base-equivalent
+zero-B adapters, not a complete training policy, and do not establish eight-rank
+training memory safety or output quality. Results are under
+`outputs/oom-offload-probe-train-v2/summary.json` and
+`outputs/oom-offload-probe-val/summary.json`. The offload/model/planning and
+trainer/GRPO CPU suites passed 90 tests; Ruff check/format and diff checks passed.
+Earlier 256 × 256 / 33-frame results are historical.
+Validation for this change: 84 joint CPU regression tests passed, followed by
+two focused hook tests covering TensorDict sampling overrides and the fallback
+path. Resolved Hydra configs instantiate the intended pipeline dataclasses;
+actor defaults match training rollout, and evaluation uses its own guidance.
 
 Replay records retain prompt context, sampled token IDs/logprobs, masks,
 temperature, seeds, policy/group identifiers, clean AV latents, training noise
@@ -148,8 +300,11 @@ The source modality weights are both 1.0 and reference MSE coefficients are both
 
 ## Artifacts, evaluation and timing
 
-Each saved sample has replay tensors, silent MP4, stereo WAV and an `-av.mp4`
-with audio, plus `samples.json` and an HTML gallery. Training samples are under
+Each saved sample has a silent MP4, stereo WAV and an `-av.mp4` with audio,
+plus `samples.json` and an HTML gallery. Sample `.pt` files are disabled by
+default (`trainer.joint_sample_save_tensors=false`); enable this option only
+when full tensor replay is needed. JSON retains prompts, seeds, generation
+parameters, response token IDs/logprobs and reward scores. Training samples are under
 `$LTX_OUTPUT_DIR/samples/step-NNNNNN`; fixed evaluation is under
 `samples/evaluation/step-NNNNNN`. Checkpoints contain all actor/optimizer shards
 and paired old/ref state. Raw update metrics are saved atomically under
@@ -185,7 +340,7 @@ correlation metadata under `actor/` and `generate/`. A run can consume over
 120 GB of diagnostic storage. The wrapper defaults to one training prompt and
 disables evaluation; explicit trailing overrides can change these settings.
 Use the documented MSProbe and root-cause-analysis workflow for dump mapping and
-analysis; the current investigation is recorded in [RUN_JOURNAL.md](RUN_JOURNAL.md).
+analysis. See [IMPLEMENTATION.md](IMPLEMENTATION.md) for the current inference and gradient boundaries.
 
 Run `010` used the same old policy and 235 valid recaption tokens: mean absolute
 logprob error 4.21e-6, p99 4.28e-5, maximum ratio deviation from one 4.77e-5,
@@ -275,8 +430,7 @@ not be added as distinct test counts. The combined regression suite passed 255 t
 (`/tmp/ltx-joint-final-regression.log`), including reward dispatch, scorer, dtype
 and BAGEL regressions. CPU tests
 use tiny models or explicit stand-ins and are not real LTX acceptance evidence.
-Historical test commands, failures and fixes are retained in
-[RUN_JOURNAL.md](RUN_JOURNAL.md).
+See [IMPLEMENTATION.md](IMPLEMENTATION.md) for the current implementation scope.
 
 The opt-in native decoder audit is separate from training. After loading a
 paired policy, it hashes all connectors, video/audio VAE and vocoder parameters,
@@ -318,3 +472,51 @@ Run 012 was launched to extend training through steps 6 and 7, then stopped at
 the user's request during initialization, before another update or evaluation.
 All recorded descendants of its verified driver have exited. The last verified
 checkpoint remains run 011 step 5. Log: `/tmp/ltx-joint-training-012.log`.
+
+## First-step diagnostics and policy reload regression
+
+The 2026-10-13 first-step GRPO cancellation, VideoAlign raw/calibrated scores,
+planning length changes, ten-step artifact cadence and second-policy LoRA
+reload behavior is described in [IMPLEMENTATION.md](IMPLEMENTATION.md).
+The real-worker two-policy probe used the original volleyball prompt and
+produced plan/recaption word counts of 135/53 and 146/60. The probe used two
+denoising steps and base-equivalent adapters; a full eight-rank training rerun
+is still needed for end-to-end acceptance.
+
+
+### Current frozen-encoder and reward contract (2026-10-13)
+
+Planning uses Gemma LoRA at temperature 1 with only format/AV-goal instructions.
+Positive and negative condition encoding disable that LoRA and retain frozen
+base/connectors; only text GRPO updates Gemma. Historical AV-to-Gemma gradient
+results above describe the previous design. Dataset video/audio reward targets
+now survive native dispatch instead of both being replaced by the joint prompt.
+AudioBox retains the reference `(CE+CU-PC+PQ)/40` score and reports all four axes.
+See implementation sections 17–18 for branch comparison and real rescore evidence.
+
+## Old-policy EMA and text KL
+
+The joint recipe uses `algorithm.old_policy_decay_schedule=linear_to_0_5`
+and `old_policy_update_interval=1`, matching the standalone LTX OmniNFT recipe.
+After each completed actor update round (all mini-batches and PPO epochs), the
+paired Gemma/DiT old snapshots are updated as
+`old = decay * old + (1 - decay) * current`, using that completed training
+step's `decay = min(step * 0.001, 0.5)`. This occurs before checkpoint saving
+and validation, matching the standalone recipe's timing. The first rollout
+copies current weights. Training and validation export the same EMA old
+policy; generation never advances EMA. Old-policy replay uses that same
+snapshot throughout the actor update. Current trainable weights are restored
+after export. Checkpoints already contain the just-completed step's EMA, and
+resume must not apply it again. The reference snapshot remains fixed.
+
+Text optimization uses `text_loss_weight * (GRPO + text_kl_coef * KL)`.
+The recipe sets `text_kl_coef=0.001`, `text_loss_weight=1.0`, and
+`av_loss_weight=1.0`. KL is the sampled-token k3 penalty
+`exp(logp_ref - logp_current) - (logp_ref - logp_current) - 1`, averaged over
+valid response tokens and then samples. The reference is the fixed initial
+Gemma policy, not EMA; reference forward passes receive no gradients.
+Set `text_kl_coef=0` to disable its extra reference text forward pass.
+The estimate uses rollout tokens and is not a full-vocabulary KL.
+Monitor `actor/text/kl_loss`, `actor/text/weighted_kl_loss`,
+`actor/text/total_loss`, `old_policy/decay`, and
+`old_policy/update_applied` alongside reward and gradient metrics.

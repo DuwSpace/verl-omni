@@ -381,6 +381,32 @@ whose size is controlled by `reward.reward_model.n_gpus_per_node` and `nnodes`.
 - `true` (default): wake before scoring and sleep afterward;
 - `false`: keep the model resident across training steps.
 
+Native models additionally accept `cpu_offload: true` (default: `false`). With
+`offload: true`, this retains weights in CPU memory during sleep and restores
+them to the original inference device on wake. The checkpoint is read only on
+the first wake; dtype and preprocessing state are preserved. Without this
+option, native sleep closes the model and the next wake reconstructs it.
+`offload: false` still keeps the model on the accelerator, regardless of
+`cpu_offload`. Engine backends do not accept this native-only option.
+
+The native adapter must implement a synchronous `to(device)` method that moves
+all inference modules, buffers and device-dependent state. VideoAlign, HPSv3,
+AudioBox, CLAP and DeSync implement this contract. Unsupported adapters fail
+before loading when CPU offload is requested. The executor rejects inference
+while asleep and waits for active inference before moving or closing weights.
+Its `close()` method destroys even a CPU-cached model. Host RAM remains occupied
+until close or worker termination.
+
+```yaml
+reward:
+  models:
+    video_align:
+      backend: native
+      offload: true
+      cpu_offload: true
+      # Keep the existing model_path, placement and executor settings.
+```
+
 Independent named models are woken, scored, and slept concurrently. Native
 batches are padded and split evenly across the workers assigned to that model.
 There is currently no dynamic load balancing or work stealing.

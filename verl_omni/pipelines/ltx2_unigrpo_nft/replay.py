@@ -19,13 +19,16 @@ from dataclasses import dataclass
 
 import torch
 
+from .planning import direct_recaption, parse_planned_recaption
+
 
 @dataclass
 class LTXJointReplay:
     """CPU token record; the enclosing batch carries media and clean latent tensors.
 
     Condition tokens/mask are the exact padded encoder inputs captured during
-    rollout, not a later decode/re-tokenization. Generated response tokens include
+    rollout, not a later decode/re-tokenization. Generated response tokens cover
+    the entire final prompt (or the historical tagged response), and include
     a sampled terminal EOS when present; prompt tokens never receive GRPO credit.
     """
 
@@ -42,10 +45,16 @@ class LTXJointReplay:
     eos_token_ids: tuple[int, ...]
     generation_params: dict
     logprob_kind: str = "temperature_scaled"
+    # None keeps historical replay readable; direct rewriting has no separate plan.
+    planning: str | None = None
+    response_text: str | None = None
+    # Old replay dictionaries default to the historical two-section protocol.
+    response_format: str = "planned"
 
     def validate(self):
         if not self.original_prompt.strip() or not self.recaption.strip():
             raise ValueError("Joint replay requires original task and nonempty recaption text")
+
         for tokens in (self.prompt_token_ids, self.response_token_ids, self.condition_token_ids):
             if tokens.ndim != 1 or tokens.dtype != torch.int64 or tokens.numel() == 0 or bool((tokens < 0).any()):
                 raise ValueError("Joint replay token IDs must be nonempty nonnegative int64 vectors")
@@ -75,6 +84,24 @@ class LTXJointReplay:
             raise ValueError("Replay requires tokenizer EOS IDs")
         if any(int(token) in self.eos_token_ids for token in self.response_token_ids[:-1]):
             raise ValueError("Recaption contains tokens after a sampled EOS")
+        if self.response_format not in ("planned", "caption"):
+            raise ValueError("Unknown joint response format")
+        if self.response_format == "caption":
+            if self.planning is not None or not isinstance(self.response_text, str):
+                raise ValueError("Caption replay requires response_text and no separate planning")
+            caption = direct_recaption(
+                self.response_text, ended_with_eos=int(self.response_token_ids[-1]) in self.eos_token_ids
+            )
+            if caption != self.recaption:
+                raise ValueError("Caption replay differs from the generated response_text")
+        elif self.planning is not None or self.response_text is not None:
+            if not isinstance(self.planning, str) or not isinstance(self.response_text, str):
+                raise ValueError("Planning replay requires both planning and response_text")
+            planning, recaption = parse_planned_recaption(
+                self.response_text, ended_with_eos=int(self.response_token_ids[-1]) in self.eos_token_ids
+            )
+            if planning != self.planning or recaption != self.recaption:
+                raise ValueError("Planning replay sections differ from the generated response_text")
         for key in ("height", "width", "num_frames", "frame_rate", "num_inference_steps"):
             value = self.generation_params.get(key)
             if not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:

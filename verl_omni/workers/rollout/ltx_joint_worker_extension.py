@@ -99,10 +99,8 @@ class LTXJointWorkerExtension:
     def release_joint_device_memory(self):
         """Release managed model residency before colocated reward/training.
 
-        Sequential offload swaps Gemma and DiT on their next forward; it does
-        not promise to offload the last-used model at the end of a request.
-        Their installed pre-forward hooks restore residency on the next batch.
-        VAEs and connectors retain their existing backend lifecycle.
+        The joint controller also releases connectors, codecs and unregistered
+        diffusion LoRA sidecars. Retain the legacy path for older pipelines.
         """
         import torch
 
@@ -111,7 +109,10 @@ class LTXJointWorkerExtension:
         device_api = torch.get_device_module(device) if device.type != "cpu" else None
         if device_api is not None:
             device_api.synchronize()
-        if getattr(pipeline.od_config, "enable_cpu_offload", False):
+        controller = getattr(pipeline, "_joint_offload", None)
+        if controller is not None:
+            controller.release()
+        elif getattr(pipeline.od_config, "enable_cpu_offload", False):
             pipeline.text_encoder.to("cpu")
             pipeline.transformer.to("cpu")
         if device_api is not None:
@@ -158,12 +159,13 @@ class LTXJointWorkerExtension:
             lora_name=f"ltx-joint-{version}", lora_int_id=version + 1, lora_path=str(directory / "dit")
         )
         self.lora_manager.set_active_adapter(request, 1.0)
-        # Model-level offload moves parameters/buffers, but native LoRA stores
-        # its small sidecars in tensor tuples. Keep them on the compute device
-        # using the backend's residency hook (also retained on rank resizing).
+        # Native LoRA sidecars are tuples rather than registered buffers. The
+        # joint controller owns their residency too, including rank resizing.
+        controller = getattr(pipeline, "_joint_offload", None)
+        sidecar_device = "cpu" if controller is not None else pipeline.device
         for module in pipeline.transformer.modules():
             if isinstance(module, DiffusionBaseLinearLayerWithLoRA):
-                module._set_diffusion_lora_buffer_device(pipeline.device)
+                module._set_diffusion_lora_buffer_device(sidecar_device)
         pipeline._joint_lora_request = request
         pipeline._joint_policy_version = version
         pipeline._joint_sync_in_progress = False

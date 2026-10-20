@@ -136,13 +136,23 @@ class LTXJointLossConfig(OmniNFTLossConfig):
     loss_mode: str = "ltx2_unigrpo_nft"
     # AV coefficient; text_loss_weight is inherited. No normalization by their sum.
     av_loss_weight: float = 1.0
+    # Token-level GRPO or length-normalized sequence-level GSPO.
+    text_policy_loss: str = "grpo"
+    # Select the scalar optimized by the Gemma branch; AV rewards are unchanged.
+    text_advantage_source: str = "modality_probability"
     # Scalar text reward uses the mean of the source video/audio probabilities.
     text_probability_reduction: str = "mean"
     # Within-prompt population-standard-deviation stabilization for text GRPO.
     text_advantage_epsilon: float = 1e-6
+    # Sampled-token k3 KL against the fixed initial Gemma policy; zero disables it.
+    text_kl_coef: float = 0.0
 
     def __post_init__(self):
         super().__post_init__()
+        if self.text_advantage_source not in {"modality_probability", "combined_reward"}:
+            raise ValueError("Supported text_advantage_source: modality_probability, combined_reward")
+        if self.text_policy_loss not in {"grpo", "gspo"}:
+            raise ValueError("Supported text_policy_loss: grpo, gspo")
         if not math.isfinite(self.av_loss_weight) or self.av_loss_weight < 0:
             raise ValueError("av_loss_weight must be finite and nonnegative")
         if self.text_loss_weight + self.av_loss_weight <= 0:
@@ -151,6 +161,8 @@ class LTXJointLossConfig(OmniNFTLossConfig):
             raise ValueError("Supported text_probability_reduction: mean")
         if not math.isfinite(self.text_advantage_epsilon) or self.text_advantage_epsilon <= 0:
             raise ValueError("text_advantage_epsilon must be finite and positive")
+        if not math.isfinite(self.text_kl_coef) or self.text_kl_coef < 0:
+            raise ValueError("text_kl_coef must be finite and nonnegative")
 
 
 @dataclass

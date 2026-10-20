@@ -95,11 +95,12 @@ def test_teacher_forcing_matches_real_gemma_logits_and_masks(model):
     assert all(p.grad is None for p in model.transformer.parameters())
 
 
-def test_av_gradients_cross_frozen_connector_into_same_gemma_lora(model):
+def test_av_trains_only_dit_with_frozen_base_condition(model):
     ids = torch.tensor([[2, 3, 4, 1]])
     video, audio = model(task="av", input_ids=ids, attention_mask=torch.ones_like(ids))
     (video.square().mean() + audio.square().mean()).backward()
-    for prefix in ("gemma.", "transformer."):
+    assert all(p.grad is None for p in model.gemma.parameters())
+    for prefix in ("transformer.",):
         gradients = [p.grad for n, p in model.named_parameters() if n.startswith(prefix) and p.requires_grad]
         assert gradients and all(g is not None and torch.isfinite(g).all() for g in gradients)
         assert sum(g.abs().sum() for g in gradients) > 0
@@ -109,10 +110,10 @@ def test_av_gradients_cross_frozen_connector_into_same_gemma_lora(model):
     optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.1)
     optimizer.step()
     after = model.encode_condition(ids, torch.ones_like(ids))[0].detach()
-    assert not torch.equal(before, after)
+    torch.testing.assert_close(before, after, rtol=0, atol=0)
 
 
-def test_fp32_gemma_gradient_crosses_bf16_condition_boundary(model):
+def test_fp32_base_gemma_produces_frozen_bf16_condition(model):
     model.connectors.bfloat16()
     model.transformer.bfloat16()
     ids = torch.tensor([[2, 3, 4, 1]])
@@ -120,8 +121,7 @@ def test_fp32_gemma_gradient_crosses_bf16_condition_boundary(model):
     assert video.dtype == audio.dtype == torch.bfloat16
     (video.float().square().mean() + audio.float().square().mean()).backward()
     gradients = [p.grad for p in model.gemma.parameters() if p.requires_grad]
-    assert gradients and all(g is not None and g.dtype == torch.float32 for g in gradients)
-    assert sum(g.abs().sum() for g in gradients) > 0
+    assert gradients and all(g is None for g in gradients)
     assert all(p.grad is None for p in model.connectors.parameters())
 
 
@@ -283,7 +283,8 @@ def _joint_batch(model):
     return data, records
 
 
-def test_joint_generate_exports_frozen_pair_and_preserves_av_reward_replay(model, monkeypatch):
+@pytest.mark.parametrize("override_sampling", [False, True])
+def test_joint_generate_exports_frozen_pair_and_preserves_av_reward_replay(model, monkeypatch, override_sampling):
     from types import SimpleNamespace
 
     from verl.utils import tensordict_utils as tu
@@ -300,10 +301,18 @@ def test_joint_generate_exports_frozen_pair_and_preserves_av_reward_replay(model
             assert kwargs["geometry"]["extra_args"]["video_cfg_scale"] == 1.0
 
         def load_actor_policy(self, module, version):
-            assert module is model and hooks.policies.rollout_started and hooks.policies.version == version == 0
+            assert module is model and hooks.policies.rollout_started and hooks.policies.version == version == 1
+            for name, parameter in hooks.policies._parameters().items():
+                expected = initial[name] + 1.0
+                torch.testing.assert_close(parameter, expected)
             events.append("sync")
 
-        def generate(self, prompts, seeds, version):
+        def generate(self, prompts, seeds, version, sampling_params=None):
+            if override_sampling:
+                assert sampling_params["num_inference_steps"] == 40
+                assert sampling_params["extra_args"]["audio_cfg_scale"] == 7.0
+            else:
+                assert sampling_params is None
             assert events == ["sync"] and prompts == ["A bell rings."] * 2 and seeds == [4, 5]
             events.append("generate")
             return [
@@ -330,11 +339,21 @@ def test_joint_generate_exports_frozen_pair_and_preserves_av_reward_replay(model
     hooks = LTXJointHooks(
         model, SimpleNamespace(ltx_joint=LTXJointRolloutConfig(), pipeline=geometry, local_path="fixture"), None
     )
-    result = hooks.generate(
-        tu.get_tensordict(
-            {"raw_prompt": ["A bell rings."] * 2, "_ltx_policy_version": [0, 0], "_ltx_sample_seed": [4, 5]}
-        )
-    )
+    monkeypatch.setattr(hooks, "_device", lambda: torch.device("cpu"))
+    hooks.begin_rollout(version=0)
+    initial = hooks.policies._snapshot()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.add_(2)
+    current = hooks.policies._snapshot()
+    hooks.ema_update_adapter(source="default", target="old", decay=0.5)
+    request_data = {"raw_prompt": ["A bell rings."] * 2, "_ltx_policy_version": [1, 1], "_ltx_sample_seed": [4, 5]}
+    if override_sampling:
+        request_data["_ltx_sampling_params"] = [{"num_inference_steps": 40, "extra_args": {"audio_cfg_scale": 7.0}}] * 2
+    result = hooks.generate(tu.get_tensordict(request_data))
+    for name, parameter in hooks.policies._parameters().items():
+        torch.testing.assert_close(parameter, current[name])
     assert result["responses"].shape == (2, 25, 3, 32, 32)
     assert result["responses"].dtype == torch.uint8
     assert result["audio_sample_rate"].tolist() == [48000, 48000]
@@ -421,7 +440,8 @@ def test_joint_hooks_accumulate_both_losses_before_engine_step_and_keep_old_ref(
             torch.testing.assert_close(hooks.state_dict()[policy][name], frozen[policy][name])
 
 
-def test_joint_actor_preparation_uses_probability_for_text_reward_without_changing_av(model):
+@pytest.mark.parametrize("source", ["modality_probability", "combined_reward"])
+def test_joint_actor_preparation_selects_text_credit_without_changing_av(model, source):
     from types import SimpleNamespace
 
     import numpy as np
@@ -439,7 +459,7 @@ def test_joint_actor_preparation_uses_probability_for_text_reward_without_changi
             norm_adv_by_std_in_grpo=True, global_std=True, adv_mode="continuous", timestep_fraction=1.0
         ),
         actor_rollout_ref=SimpleNamespace(
-            actor=SimpleNamespace(diffusion_loss=LTXJointLossConfig(), data_loader_seed=42)
+            actor=SimpleNamespace(diffusion_loss=LTXJointLossConfig(text_advantage_source=source), data_loader_seed=42)
         ),
         reward=SimpleNamespace(
             reward_functions={
@@ -454,12 +474,19 @@ def test_joint_actor_preparation_uses_probability_for_text_reward_without_changi
     )
     result = LTXJointLoss.prepare_actor_batch(batch, data["rm_scores"], config)
     probability = result.batch["reward_prob"][:, 0].mean(-1)
-    expected = (probability - probability.mean()) / (probability.std(correction=0) + 1e-6)
+    scalar = probability if source == "modality_probability" else data["rm_scores"].sum(-1)
+    expected = (scalar - scalar.mean()) / (scalar.std(correction=0) + 1e-6)
     torch.testing.assert_close(result.batch["text_reward_prob"], probability)
     torch.testing.assert_close(result.batch["text_advantages"], expected)
     # Video favors sample 1, audio favors sample 0 more strongly.
     torch.testing.assert_close(probability, torch.tensor([0.525, 0.475]), atol=1e-5, rtol=0)
-    assert result.batch["text_advantages"][0] > 0 > result.batch["text_advantages"][1]
+    torch.testing.assert_close(result.batch["text_reward"], scalar)
+    assert result.meta_info["text_reward_source"] == source
+    if source == "modality_probability":
+        assert result.batch["text_advantages"][0] > 0 > result.batch["text_advantages"][1]
+    else:
+        # Equal raw totals must give zero text credit despite different AV preferences.
+        torch.testing.assert_close(result.batch["text_advantages"], torch.zeros(2))
     assert result.batch["reward_prob"].shape == (2, 2, 2)
 
 
@@ -494,7 +521,7 @@ def test_each_joint_loss_contributes_to_the_correct_parameters(model, text_weigh
     metrics = result["metrics"]
     assert (metrics["train/text_gemma_grad_norm_local"][0] > 0) == bool(text_weight)
     assert metrics["train/text_dit_grad_norm_local"][0] == 0
-    assert (metrics["train/av_gemma_grad_norm_local"][0] > 0) == bool(av_weight)
+    assert metrics["train/av_gemma_grad_norm_local"][0] == 0
     assert (metrics["train/av_dit_grad_norm_local"][0] > 0) == bool(av_weight)
     assert metrics["train/text_nonfinite_gradient_elements_local"][0] == 0
     assert metrics["train/av_nonfinite_gradient_elements_local"][0] == 0
@@ -504,7 +531,7 @@ def test_each_joint_loss_contributes_to_the_correct_parameters(model, text_weigh
     dit = sum(
         p.grad.abs().sum() for n, p in model.named_parameters() if n.startswith("transformer.") and p.grad is not None
     )
-    assert gemma > 0
+    assert (gemma > 0) == bool(text_weight)
     assert (dit > 0) if av_weight else (dit == 0)
 
 
@@ -547,7 +574,8 @@ def _rollout_gemma(model):
     return gemma
 
 
-def test_joint_bundle_loads_exact_gemma_adapter_and_commits_pair(model, tmp_path, monkeypatch):
+@pytest.mark.parametrize("selected_layers", [(0, 1), (1,)])
+def test_joint_bundle_loads_exact_gemma_adapter_and_commits_pair(model, tmp_path, monkeypatch, selected_layers):
     import json
     import re
     from types import SimpleNamespace
@@ -572,8 +600,7 @@ def test_joint_bundle_loads_exact_gemma_adapter_and_commits_pair(model, tmp_path
             r=2,
             lora_alpha=2,
             target_modules=[
-                "gemma.model.language_model.layers.0.self_attn.o_proj",
-                "gemma.model.language_model.layers.1.self_attn.o_proj",
+                *(f"gemma.model.language_model.layers.{layer}.self_attn.o_proj" for layer in selected_layers),
                 "transformer.proj",
             ],
         )
@@ -613,6 +640,10 @@ def test_joint_bundle_loads_exact_gemma_adapter_and_commits_pair(model, tmp_path
     result = worker.load_joint_lora_bundle(str(bundle))
     assert result["policy_version"] == pipeline._joint_policy_version == 0
     assert set(result["components"]) == {"gemma", "dit"}
+    native_layers = {
+        int(re.search(r"layers\.(\d+)\.", name)[1]) for name, _ in native.named_parameters() if ".lora_" in name
+    }
+    assert native_layers == set(selected_layers)
     assert not pipeline._joint_sync_in_progress
     assert activated[0][0].lora_int_id == 1 and activated[0][1] == 1.0
     ids = torch.tensor([[2, 3, 4]])
@@ -624,7 +655,9 @@ def test_joint_bundle_loads_exact_gemma_adapter_and_commits_pair(model, tmp_path
     with pytest.raises(ValueError, match="increase"):
         worker.load_joint_lora_bundle(str(bundle))
     original_config = LoraConfig.from_pretrained(bundle / "gemma").to_dict()
-    assert native.peft_config["joint"].to_dict() != original_config
+    if len(selected_layers) > 1:
+        # Multiple targets exercise PEFT compression; a single target need not compress.
+        assert native.peft_config["joint"].to_dict() != original_config
     assert pipeline._joint_gemma_config == original_config
     with torch.no_grad():
         for name, parameter in model.named_parameters():
@@ -881,3 +914,272 @@ def test_native_dit_attention_backpropagates_to_all_lora_and_condition_inputs():
             assert torch.isfinite(parameter.grad).all() and parameter.grad.abs().sum() > 0, name
         else:
             assert parameter.grad is None, name
+
+
+def test_encoding_ignores_nonzero_planning_lora_and_restores_state(model):
+    from verl_omni.pipelines.ltx2_unigrpo_nft.adapters import base_encoder
+
+    ids = torch.tensor([[2, 3, 4, 1]])
+    mask = torch.ones_like(ids)
+    flags = [p.requires_grad for p in model.parameters()]
+    before = model.encode_condition(ids, mask)[0]
+    logits_before = model.gemma(input_ids=ids).logits.detach()
+    with torch.no_grad():
+        for name, parameter in model.gemma.named_parameters():
+            if "lora_" in name:
+                parameter.normal_(std=1.0)
+    after = model.encode_condition(ids, mask)[0]
+    assert not after.requires_grad
+    torch.testing.assert_close(before, after, rtol=0, atol=0)
+    assert not torch.allclose(logits_before, model.gemma(input_ids=ids).logits)
+    with pytest.raises(RuntimeError, match="probe"):
+        with base_encoder(model.gemma):
+            with base_encoder(model.gemma):
+                raise RuntimeError("probe")
+    assert [p.requires_grad for p in model.parameters()] == flags
+    assert not model.gemma.model.language_model.layers[0].self_attn.q_proj.disable_adapters
+
+
+def test_rollout_positive_negative_encoding_disable_planning_adapter(model, monkeypatch):
+    from types import SimpleNamespace
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.vllm_omni_rollout_adapter import LTX2Pipeline, LTXJointPipeline
+
+    pipeline = object.__new__(LTXJointPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.text_encoder = model.gemma
+    pipeline.connectors = model.connectors
+    pipeline.device = torch.device("cpu")
+    ids = torch.tensor([[2, 3, 4, 1]])
+    mask = torch.ones_like(ids)
+
+    class Tokenizer:
+        def __call__(self, *args, **kwargs):
+            return SimpleNamespace(input_ids=ids, attention_mask=mask)
+
+    pipeline.tokenizer = Tokenizer()
+    layer = model.gemma.model.language_model.layers[0].self_attn.q_proj
+    with torch.no_grad():
+        layer.lora_B["default"].weight.normal_()
+    from verl_omni.pipelines.ltx2_unigrpo_nft.adapters import base_encoder
+
+    with torch.no_grad(), base_encoder(model.gemma):
+        hidden = model.gemma(input_ids=ids, attention_mask=mask.bool(), output_hidden_states=True).hidden_states
+    expected = torch.stack(hidden, dim=-1).flatten(2, 3)
+    actual, _, _ = pipeline._condition("caption", 4)
+    torch.testing.assert_close(actual, expected)
+    assert not layer.disable_adapters
+
+    def negative(*args, **kwargs):
+        assert layer.disable_adapters
+        assert kwargs["dtype"] == next(model.connectors.parameters()).dtype
+        raise RuntimeError("negative probe")
+
+    monkeypatch.setattr(LTX2Pipeline, "encode_prompt", negative)
+    with pytest.raises(RuntimeError, match="negative probe"):
+        pipeline.encode_prompt(prompt="", negative_prompt="noise")
+    assert not layer.disable_adapters
+
+
+def test_joint_ema_freezes_reference_survives_evaluation_and_resume(model):
+    from verl_omni.pipelines.ltx2_unigrpo_nft.policy_state import LTXJointPolicyState
+
+    policy = LTXJointPolicyState(model)
+    initial = policy.state_dict()["reference"]
+    policy.begin_rollout(version=1)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.add_(2)
+    current = policy._snapshot()
+    policy.update_old(decay=0.25)
+    policy.begin_rollout(version=3)
+    for name in initial:
+        torch.testing.assert_close(policy.old[name], initial[name] + 1.5)
+        torch.testing.assert_close(policy.reference[name], initial[name])
+    with policy.use("old"):
+        for name, parameter in policy._parameters().items():
+            torch.testing.assert_close(parameter, policy.old[name])
+    for name, parameter in policy._parameters().items():
+        torch.testing.assert_close(parameter, current[name])
+    saved = policy.state_dict()
+    policy.begin_rollout(version=4)
+    for name in initial:
+        torch.testing.assert_close(policy.old[name], saved["old"][name])
+    restored = LTXJointPolicyState(model)
+    restored.load_state_dict(policy.state_dict())
+    # Starting another generation after resume must not advance EMA again.
+    restored.begin_rollout(version=5)
+    for name in initial:
+        torch.testing.assert_close(restored.old[name], saved["old"][name])
+    policy.update_old(decay=0.5)
+    restored.update_old(decay=0.5)
+    policy.begin_rollout(version=5)
+    restored.begin_rollout(version=6)
+    for name in initial:
+        torch.testing.assert_close(restored.old[name], initial[name] + 1.75)
+        torch.testing.assert_close(restored.old[name], policy.old[name])
+        torch.testing.assert_close(restored.reference[name], initial[name])
+    restored.assert_frozen()
+
+
+@pytest.mark.parametrize("decay", [-0.1, 1.1, float("nan")])
+def test_joint_ema_rejects_invalid_decay_without_changing_snapshots(model, decay):
+    from verl_omni.pipelines.ltx2_unigrpo_nft.policy_state import LTXJointPolicyState
+
+    policy = LTXJointPolicyState(model)
+    with pytest.raises(ValueError, match="decay"):
+        policy.update_old(decay=decay)
+    policy.assert_frozen()
+    assert not policy.rollout_started
+
+
+def test_joint_hook_text_kl_uses_frozen_initial_policy(model):
+    from functools import partial
+    from types import SimpleNamespace
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.hooks import LTXJointHooks
+    from verl_omni.pipelines.ltx2_unigrpo_nft.loss import LTXJointLoss
+    from verl_omni.workers.config.diffusion.actor import LTXJointLossConfig
+
+    hooks = LTXJointHooks(model, None, None)
+    hooks._device = lambda: torch.device("cpu")
+    hooks.begin_rollout(version=0)
+    data, _ = _joint_batch(model)
+    data["text_advantages"].zero_()
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if parameter.requires_grad and name.startswith("gemma."):
+                parameter.add_(0.05)
+    config = SimpleNamespace(
+        diffusion_loss=LTXJointLossConfig(text_kl_coef=0.001, av_loss_weight=0.0), ppo_micro_batch_size_per_gpu=1
+    )
+    result = hooks.forward_backward_batch(data, partial(LTXJointLoss(), config=config))
+    metrics = result["metrics"]
+    assert metrics["text/kl_loss"][0] > 0
+    assert metrics["text/weighted_kl_loss"][0] == pytest.approx(0.001 * metrics["text/kl_loss"][0])
+    assert metrics["train/text_gemma_grad_norm_local"][0] > 0
+    assert metrics["train/av_dit_grad_norm_local"][0] == 0
+    hooks.policies.assert_frozen()
+
+
+def test_engine_ema_rpc_routes_to_joint_snapshot_state(model):
+    from types import SimpleNamespace
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.hooks import LTXJointHooks
+    from verl_omni.workers.engine.fsdp.diffusers_impl import DiffusersFSDPEngine
+
+    hooks = LTXJointHooks(model, None, None)
+    hooks.begin_rollout(version=0)
+    initial = hooks.state_dict()["old"]
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.add_(2)
+    engine = SimpleNamespace(_engine_hooks=hooks)
+    DiffusersFSDPEngine.ema_update_adapter(engine, source="default", target="old", decay=0.25)
+    saved = hooks.state_dict()
+    for name in initial:
+        torch.testing.assert_close(saved["old"][name], initial[name] + 1.5)
+        torch.testing.assert_close(saved["reference"][name], initial[name])
+    with pytest.raises(ValueError, match="default -> old"):
+        DiffusersFSDPEngine.ema_update_adapter(engine, source="default", target="ref", decay=0.25)
+
+
+def test_joint_forward_noise_replays_by_sample_seed_independently_of_global_rng(model):
+    from types import SimpleNamespace
+
+    import numpy as np
+    from verl import DataProto
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.loss import LTXJointLoss
+    from verl_omni.workers.config.diffusion.actor import LTXJointLossConfig
+
+    data, records = _joint_batch(model)
+    data["rm_scores"] = torch.tensor([[0.2], [0.8]])
+    data["video_latents_clean"] = torch.zeros(2, 2, 4)
+    data["audio_latents_clean"] = torch.zeros(2, 2, 4)
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(
+            norm_adv_by_std_in_grpo=True, global_std=True, adv_mode="continuous", timestep_fraction=1.0
+        ),
+        actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(diffusion_loss=LTXJointLossConfig(), data_loader_seed=42)
+        ),
+        reward=SimpleNamespace(reward_functions={"synthetic": {"routing_weights": {"video": 1.0, "audio": 1.0}}}),
+    )
+    batch = DataProto(
+        batch=data,
+        non_tensor_batch={"uid": np.array(["a", "a"]), "ltx_joint_replay": np.array(records, dtype=object)},
+        meta_info={"reward_names": ["synthetic"]},
+    )
+    torch.manual_seed(11)
+    first = LTXJointLoss.prepare_actor_batch(batch, data["rm_scores"], config)
+    saved = {m: first.batch[f"{m}_forward_noise"].clone() for m in ("video", "audio")}
+    torch.manual_seed(999)
+    second = LTXJointLoss.prepare_actor_batch(batch, data["rm_scores"], config)
+    for m in ("video", "audio"):
+        torch.testing.assert_close(second.batch[f"{m}_forward_noise"], saved[m], atol=0, rtol=0)
+    assert not torch.equal(saved["video"], saved["audio"])
+    reversed_batch = batch.select_idxs([1, 0])
+    third = LTXJointLoss.prepare_actor_batch(reversed_batch, reversed_batch.batch["rm_scores"], config)
+    for m in ("video", "audio"):
+        torch.testing.assert_close(third.batch[f"{m}_forward_noise"], saved[m].flip(0), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("policy_loss", ["grpo", "gspo"])
+def test_microbatch_four_matches_single_sample_gradients_with_ragged_text(model, policy_loss):
+    from copy import deepcopy
+    from functools import partial
+    from types import SimpleNamespace
+
+    import numpy as np
+    from verl.utils import tensordict_utils as tu
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.hooks import LTXJointHooks
+    from verl_omni.pipelines.ltx2_unigrpo_nft.loss import LTXJointLoss
+    from verl_omni.workers.config.diffusion.actor import LTXJointLossConfig
+
+    hooks = LTXJointHooks(model, None, None)
+    hooks._device = lambda: torch.device("cpu")
+    hooks.begin_rollout(version=0)
+    data, source_records = _joint_batch(model)
+    indices = [0, 1, 0, 1, 0, 1, 0]
+    data = data[torch.tensor(indices)].clone()
+    records = [deepcopy(source_records[i]) for i in indices]
+    for i, record in enumerate(records):
+        record.prompt_token_ids = torch.cat([torch.full((i % 3,), 2), record.prompt_token_ids])
+        with torch.no_grad():
+            values = model(task="recaption", **record.ar_inputs("cpu"))
+            record.rollout_logprobs = values[record.ar_inputs("cpu")["response_mask"][:, 1:]].clone()
+    tu.assign_non_tensor(data, ltx_joint_replay=np.array(records, dtype=object))
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.add_(0.01)
+    observed = []
+    handle = model.register_forward_pre_hook(
+        lambda module, args, kwargs: observed.append((kwargs["task"], kwargs["input_ids"].shape[0])),
+        with_kwargs=True,
+    )
+    runs = []
+    try:
+        for micro_size in (1, 4):
+            model.zero_grad(set_to_none=True)
+            observed.clear()
+            config = SimpleNamespace(
+                diffusion_loss=LTXJointLossConfig(text_kl_coef=0.001, text_policy_loss=policy_loss),
+                ppo_micro_batch_size_per_gpu=micro_size,
+            )
+            output = hooks.forward_backward_batch(data, partial(LTXJointLoss(), config=config))
+            gradients = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+            runs.append((output, gradients))
+            if micro_size == 4:
+                assert ("recaption", 4) in observed and ("av", 4) in observed
+                assert ("recaption", 3) in observed and ("av", 3) in observed
+    finally:
+        handle.remove()
+    assert runs[0][0]["loss"][0] == pytest.approx(runs[1][0]["loss"][0], rel=2e-5, abs=2e-6)
+    assert runs[0][1].keys() == runs[1][1].keys()
+    for name in runs[0][1]:
+        torch.testing.assert_close(runs[0][1][name], runs[1][1][name], rtol=2e-4, atol=2e-6, msg=name)

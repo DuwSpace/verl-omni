@@ -74,3 +74,14 @@ def test_algorithm_without_extra_policy_state_preserves_existing_checkpoint_api(
     assert not (tmp_path / "algorithm_state_rank_0.pt").exists()
     engine.load_checkpoint(str(tmp_path))
     engine.checkpoint_manager.load_checkpoint.assert_called_once()
+
+
+def test_ema_without_snapshot_hook_preserves_adapter_mixin(monkeypatch):
+    from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
+
+    engine = object.__new__(diffusers_impl.PPODiffusersFSDPEngine)
+    engine._engine_hooks = None
+    update = Mock()
+    monkeypatch.setattr(LoRAAdapterMixin, "ema_update_adapter", update)
+    engine.ema_update_adapter(source="default", target="old", decay=0.2)
+    update.assert_called_once_with(source="default", target="old", decay=0.2)

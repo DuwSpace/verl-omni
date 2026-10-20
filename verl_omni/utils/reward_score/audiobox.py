@@ -122,7 +122,13 @@ async def compute_score(
     score = (local_scores * window_weights).sum() / window_weights.sum()
     if not torch.isfinite(score):
         raise ValueError("AudioBox score must be finite.")
-    return {"score": float(score)}
+    details = {}
+    for axis, predictions in _validate_predictions(output["predictions"], windows.shape[0]).items():
+        mean, std = output["target_transform"][axis]
+        restored = predictions.detach().float().cpu() * std + mean
+        details[axis.lower()] = float((restored * window_weights).sum() / window_weights.sum())
+    raw_score = sum(details[axis.lower()] * weight for axis, weight in axis_weights.items())
+    return {"score": float(score), "raw_score": raw_score, **details}
 
 
 class AudioBoxModel:
@@ -137,6 +143,13 @@ class AudioBoxModel:
         self.device = torch.device(device)
         self.model.to(self.device).eval()
         self._infer_lock = threading.Lock()
+
+    def to(self, device):
+        """Move inference state without reloading weights or changing dtype."""
+        with self._infer_lock:
+            self.model.to(device)
+            self.device = torch.device(device)
+        return self
 
     def close(self) -> None:
         """Drop model/transform references; further inference requires a new adapter."""

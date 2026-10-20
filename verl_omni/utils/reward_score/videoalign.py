@@ -284,7 +284,13 @@ async def compute_score(
     score = (((values - means) / stds) * weights).sum()
     if not torch.isfinite(score):
         raise ValueError("VideoAlign score must be finite.")
-    return {"score": float(score)}
+    return {
+        "score": float(score),
+        "raw_score": float((values * weights).sum()),
+        "vq_raw": float(values[0, 0]),
+        "mq_raw": float(values[0, 1]),
+        "ta_raw": float(values[0, 2]),
+    }
 
 
 class VideoAlignModel:
@@ -295,6 +301,13 @@ class VideoAlignModel:
         self.device = torch.device(device)
         self.model.to(self.device).eval()
         self._infer_lock = threading.Lock()
+
+    def to(self, device):
+        """Move inference state without reloading weights or changing dtype."""
+        with self._infer_lock:
+            self.model.to(device)
+            self.device = torch.device(device)
+        return self
 
     def close(self) -> None:
         """Drop model/processor references; reuse requires constructing a new adapter."""

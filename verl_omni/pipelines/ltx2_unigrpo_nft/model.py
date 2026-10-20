@@ -66,7 +66,7 @@ class LTXJointModel(NonDiffusersModelBase):
     """Own the exact same Gemma parameters for autoregressive and AV conditioning passes.
 
     Only the trainable model components are loaded; VAEs and vocoder belong to
-    rollout. Connectors remain in the autograd graph despite frozen parameters.
+    rollout. AV conditioning uses frozen base Gemma weights and connectors.
     """
 
     _no_split_modules = ["Gemma3DecoderLayer", "LTX2VideoTransformerBlock"]
@@ -149,15 +149,19 @@ class LTXJointModel(NonDiffusersModelBase):
         self.gemma.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         self.transformer.enable_gradient_checkpointing(gradient_checkpointing_func=gradient_checkpointing_func)
 
+    @torch.no_grad()
     def encode_condition(self, input_ids, attention_mask):
         """Match LTX's stack-all-Gemma-layers layout without computing vocabulary logits."""
-        output = self.gemma.model.language_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-            return_dict=True,
-        )
+        from .adapters import base_encoder
+
+        with base_encoder(self.gemma):
+            output = self.gemma.model.language_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+                return_dict=True,
+            )
         hidden = torch.stack(output.hidden_states, dim=-1).flatten(2, 3)
         hidden = hidden.to(next(self.connectors.parameters()).dtype)
         return self.connectors(hidden, attention_mask, padding_side="left")

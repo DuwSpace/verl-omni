@@ -68,10 +68,12 @@ async def _scorer(ground_truth, batch, reward_model, **kwargs):
 async def test_reward_runner_retains_columns_and_releases_models(monkeypatch, fail):
     names = ["video_align", "hpsv3", "audiobox", "clap", "desync"]
     calls = []
+    created = []
 
     class Executor:
         def __init__(self, spec):
             self.name = spec.name
+            created.append(self)
 
         async def wake_up(self):
             calls.append((self.name, "load"))
@@ -121,3 +123,5 @@ async def test_reward_runner_retains_columns_and_releases_models(monkeypatch, fa
         assert calls == [(name, event) for name in order for event in ("load", "infer", "infer", "release")]
         assert infos[0]["reward/video_align"] == 1.0
         assert metrics["reward/total_time"] > 0
+        await runner.score([_sample()])
+        assert len(created) == 5  # reuse each executor across batches

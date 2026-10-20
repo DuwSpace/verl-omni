@@ -15,6 +15,7 @@
 """Paired Gemma/DiT LoRA snapshots with immutable rollout versions."""
 
 import hashlib
+import math
 from contextlib import contextmanager
 
 import torch
@@ -66,11 +67,26 @@ class LTXJointPolicyState(TrainablePolicyState):
         return parameters
 
     def begin_rollout(self, *, version):
+        """Freeze a rollout version without advancing the post-update EMA."""
         self.assert_frozen()
         if type(version) is not int or version < 0 or (self.rollout_started and version <= self.version):
             raise ValueError("Each joint rollout requires a new strictly increasing nonnegative integer version")
-        super().begin_rollout(version=version)
+        if not self.rollout_started:
+            self.old = self._snapshot()
+        self.version = version
         self.rollout_started = True
+        self._frozen_digests = self._snapshot_digests()
+
+    def update_old(self, *, decay):
+        """Update paired old adapters once after an entire actor update round."""
+        self.assert_frozen()
+        if not math.isfinite(decay) or not 0 <= decay <= 1:
+            raise ValueError("Joint old-policy decay must be finite and in [0, 1]")
+        if not self.rollout_started:
+            raise ValueError("Begin a rollout before updating its old policy")
+        current = self._snapshot()
+        for name, value in current.items():
+            self.old[name].lerp_(value, 1.0 - decay)
         self._frozen_digests = self._snapshot_digests()
 
     @contextmanager

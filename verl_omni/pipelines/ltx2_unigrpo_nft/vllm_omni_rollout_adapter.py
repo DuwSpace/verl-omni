@@ -14,7 +14,7 @@
 
 """Two-stage recaption and AV generation in one native vLLM-Omni LTX worker."""
 
-import math
+import os
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import asdict, replace
@@ -29,6 +29,9 @@ from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 
+from .adapters import base_encoder
+from .config import GUIDANCE_DEFAULTS
+from .planning import direct_recaption, planning_instruction
 from .replay import LTXJointReplay
 
 
@@ -47,6 +50,8 @@ class LTXJointPipeline(LTX2Pipeline):
 
     def __init__(self, *, od_config, prefix=""):
         super().__init__(od_config=od_config, prefix=prefix)
+        if os.environ.get("LTX_DISABLE_PROGRESS_BAR", "0") == "1":
+            self.set_progress_bar_config(disable=True)
         from transformers import Gemma3ForConditionalGeneration
 
         # The native loader currently applies one dtype to every component.
@@ -68,6 +73,27 @@ class LTXJointPipeline(LTX2Pipeline):
             if isinstance(component, torch.nn.Module):
                 component.requires_grad_(False)
 
+    def enable_omni_model_cpu_offload(self, *, device, pin_memory, use_hsdp):
+        from .offload import JointRolloutOffload
+
+        if use_hsdp:
+            raise ValueError("Joint rollout component offload requires an unsharded worker")
+        if getattr(self, "_joint_offload", None) is None:
+            self._joint_offload = JointRolloutOffload(self, device)
+
+    def disable_omni_model_cpu_offload(self):
+        controller = getattr(self, "_joint_offload", None)
+        if controller is not None:
+            controller.disable()
+            self._joint_offload = None
+
+    def encode_prompt(self, *args, **kwargs):
+        # Native negative encoding otherwise inherits FP32 from Gemma, while
+        # the positive embedding already uses the connector's BF16 dtype.
+        kwargs["dtype"] = next(self.connectors.parameters()).dtype
+        with base_encoder(self.text_encoder):
+            return super().encode_prompt(*args, **kwargs)
+
     def _unpack_and_denormalize_stage(self, forward_ctx, latents, audio_latents):
         self._joint_clean = (latents, audio_latents[:, : forward_ctx.original_audio_num_frames])
         self._joint_forward_context = forward_ctx
@@ -78,21 +104,7 @@ class LTXJointPipeline(LTX2Pipeline):
 
         if type(max_new_tokens) is not int or max_new_tokens <= 0:
             raise ValueError("Recaption max_new_tokens must be a positive integer")
-        timing = ""
-        if duration_seconds is not None:
-            if not math.isfinite(duration_seconds) or duration_seconds <= 0:
-                raise ValueError("Recaption clip duration must be finite and positive")
-            timing = (
-                f"The generated clip spans {duration_seconds:.3f} seconds. All actions and sound events "
-                "must fit within this duration; do not specify a longer clip or event. "
-            )
-        instruction = (
-            "Rewrite the user request as a description for audio-video generation. Preserve the user's intent "
-            "and constraints. Describe actions, camera, dialogue, sound events and timing where relevant. "
-            + timing
-            + "Return only the description, without analysis or commentary.\nUser request:\n"
-            + prompt
-        )
+        instruction = planning_instruction(prompt, duration_seconds)
         ids = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": instruction}],
             tokenize=True,
@@ -120,7 +132,9 @@ class LTXJointPipeline(LTX2Pipeline):
         rng_kwargs = {} if device.type == "cpu" else {"device_type": device.type}
         devices = [] if device.type == "cpu" else [device.index or 0]
         residency = nullcontext()
-        if getattr(getattr(self, "od_config", None), "enable_cpu_offload", False):
+        if getattr(self, "_joint_offload", None) is None and getattr(
+            getattr(self, "od_config", None), "enable_cpu_offload", False
+        ):
             from vllm_omni.diffusion.offloader.sequential_backend import sequential_offload_component
 
             # generate() consults model.device before invoking forward hooks.
@@ -159,7 +173,8 @@ class LTXJointPipeline(LTX2Pipeline):
             raise ValueError("Recaption exceeds encoder context; refusing silent truncation")
         ids = encoded.input_ids.to(self.device)
         mask = encoded.attention_mask.to(self.device).bool()
-        hidden = self.text_encoder(input_ids=ids, attention_mask=mask, output_hidden_states=True).hidden_states
+        with torch.no_grad(), base_encoder(self.text_encoder):
+            hidden = self.text_encoder(input_ids=ids, attention_mask=mask, output_hidden_states=True).hidden_states
         embeddings = torch.stack(hidden, dim=-1).flatten(2, 3).to(next(self.connectors.parameters()).dtype)
         return embeddings, ids, mask
 
@@ -192,13 +207,25 @@ class LTXJointPipeline(LTX2Pipeline):
             if device_api is not None:
                 device_api.reset_peak_memory_stats()
             started = perf_counter()
-            text, prompt_ids, response_ids, logprobs, eos = self._recaption(
+            response_text, prompt_ids, response_ids, logprobs, eos = self._recaption(
                 original,
                 seed=seed,
                 temperature=temperature,
                 max_new_tokens=extra["recaption_max_new_tokens"],
                 duration_seconds=(incoming.sampling_params.num_frames - 1) / incoming.sampling_params.frame_rate,
             )
+            ended_with_eos = int(response_ids[-1]) in eos
+            try:
+                text = direct_recaption(response_text, ended_with_eos=ended_with_eos)
+            except ValueError as error:
+                # Keep the sampled text in the RPC error: failed requests never
+                # reach periodic sample saving, making the old error unactionable.
+                raise ValueError(
+                    f"{error}; policy_version={version}, seed={seed}, "
+                    f"response_tokens={response_ids.numel()}, "
+                    f"max_new_tokens={extra['recaption_max_new_tokens']}, "
+                    f"ended_with_eos={ended_with_eos}, response_text={response_text!r}"
+                ) from error
             recaption_time = perf_counter() - started
             generation_start = perf_counter()
             maximum = incoming.sampling_params.max_sequence_length or self.tokenizer_max_length
@@ -220,6 +247,9 @@ class LTXJointPipeline(LTX2Pipeline):
             record = LTXJointReplay(
                 original_prompt=original,
                 recaption=text,
+                planning=None,
+                response_format="caption",
+                response_text=response_text,
                 prompt_token_ids=prompt_ids,
                 response_token_ids=response_ids,
                 rollout_logprobs=logprobs,
@@ -236,6 +266,8 @@ class LTXJointPipeline(LTX2Pipeline):
                     "frame_rate": geometry.frame_rate,
                     "num_inference_steps": geometry.num_inference_steps,
                     "gemma_dtype": str(self.text_encoder.dtype),
+                    "max_sequence_length": maximum,
+                    **{key: extra.get(key, default) for key, default in GUIDANCE_DEFAULTS.items()},
                 },
             )
             record.validate()
@@ -268,6 +300,9 @@ class LTXJointPipeline(LTX2Pipeline):
             )
         finally:
             self._joint_clean = self._joint_forward_context = None
+            controller = getattr(self, "_joint_offload", None)
+            if controller is not None:
+                controller.release()
 
 
 __all__ = ["LTXJointPipeline"]

@@ -30,7 +30,7 @@ from .policy_state import LTXJointPolicyState
 
 
 class LTXJointHooks(DiffusionEngineHooks):
-    """One local PPO mini-batch per call; exact one-sample micro-batches initially.
+    """One local PPO mini-batch per call, accumulated in configurable micro-batches.
 
     The engine clears gradients and steps after this call. All reference outputs
     precede each sample's differentiable forwards, and every current graph is
@@ -62,6 +62,7 @@ class LTXJointHooks(DiffusionEngineHooks):
         from verl_omni.workers.rollout.bagel_joint_backend import original_prompt_text
         from verl_omni.workers.rollout.ltx_joint_backend import LTXJointVllmBackend
 
+        from .config import sampling_params
         from .rewards import reward_sample
 
         prompts = tu.get(data, "raw_prompt")
@@ -85,39 +86,30 @@ class LTXJointHooks(DiffusionEngineHooks):
             started = perf_counter()
             self._rollout_backend = LTXJointVllmBackend(
                 model_path=self.model_config.local_path,
-                geometry={
-                    key: getattr(geometry, key)
-                    for key in (
-                        "height",
-                        "width",
-                        "num_frames",
-                        "frame_rate",
-                        "num_inference_steps",
-                        "max_sequence_length",
-                    )
-                }
-                | {
-                    "extra_args": {
-                        "video_cfg_scale": 1.0,
-                        "audio_cfg_scale": 1.0,
-                        "video_modality_scale": 1.0,
-                        "audio_modality_scale": 1.0,
-                        "video_rescale_scale": 0.0,
-                        "audio_rescale_scale": 0.0,
-                    }
-                },
+                geometry=sampling_params(geometry),
                 recaption_temperature=settings.temperature,
                 recaption_max_new_tokens=settings.max_new_tokens,
                 sync_timeout_seconds=settings.sync_timeout_seconds,
                 enable_cpu_offload=settings.cpu_offload,
+                vae_use_tiling=settings.vae_use_tiling,
             )
             loading = perf_counter() - started
         if device.type != "cpu":
             torch.get_device_module(device).reset_peak_memory_stats()
         started = perf_counter()
-        self._rollout_backend.load_actor_policy(self.module, version=version)
+        # Training samples and old-policy replay must use the identical EMA.
+        # Restore trainable current parameters immediately after adapter export.
+        with self.policies.use("old"):
+            self._rollout_backend.load_actor_policy(self.module, version=version)
         sync = perf_counter() - started
-        results = self._rollout_backend.generate(texts, seeds, version=version)
+        request_configs = tu.get(data, "_ltx_sampling_params")
+        overrides = {}
+        if request_configs is not None:
+            request_configs = list(request_configs)
+            if len(request_configs) != len(texts) or any(item != request_configs[0] for item in request_configs):
+                raise ValueError("Joint rollout requires uniform sampling settings within each worker batch")
+            overrides["sampling_params"] = request_configs[0]
+        results = self._rollout_backend.generate(texts, seeds, version=version, **overrides)
         media = DataProto.concat([reward_sample(sample) for sample in results])
         values = dict(media.batch.items())
         # Original data_source/reward_model remain on the trainer's source batch.
@@ -146,6 +138,11 @@ class LTXJointHooks(DiffusionEngineHooks):
 
     def begin_rollout(self, *, version):
         self.policies.begin_rollout(version=version)
+
+    def ema_update_adapter(self, *, source, target, decay):
+        if (source, target) != ("default", "old"):
+            raise ValueError("Joint EMA only supports default -> old")
+        self.policies.update_old(decay=decay)
 
     def state_dict(self):
         return self.policies.state_dict()
@@ -201,6 +198,46 @@ class LTXJointHooks(DiffusionEngineHooks):
         predictions = self.module(task="av", **inputs)
         return tuple(value.float() for value in predictions), clean, noisy, sigma
 
+    def _ar_batch_inputs(self, records):
+        from torch.nn.utils.rnn import pad_sequence
+
+        inputs = [record.ar_inputs(self._device()) for record in records]
+        temperatures = {item["temperature"] for item in inputs}
+        if len(temperatures) != 1:
+            raise ValueError("Joint text micro-batch requires a shared sampling temperature")
+        # Right padding preserves each replay's original causal positions.
+        return {
+            **{
+                key: pad_sequence([item[key][0] for item in inputs], batch_first=True, padding_value=0)
+                for key in ("input_ids", "attention_mask", "response_mask")
+            },
+            "temperature": inputs[0]["temperature"],
+        }
+
+    def _ar_batch(self, records):
+        return self.module(task="recaption", **self._ar_batch_inputs(records))
+
+    def _av_batch(self, records, video_clean, audio_clean, video_noise, audio_noise, timesteps):
+        if any(record.generation_params != records[0].generation_params for record in records):
+            raise ValueError("Joint AV micro-batch requires uniform generation geometry")
+        # Rollout encodes conditions with padding=max_length. Do not introduce
+        # additional padding here: that would change the replay's positions.
+        if len({record.condition_token_ids.numel() for record in records}) != 1:
+            raise ValueError("Joint AV micro-batch requires equal padded condition lengths")
+        items = [
+            self._av_inputs(record, video_clean[i], audio_clean[i], video_noise[i], audio_noise[i], timesteps[i])
+            for i, record in enumerate(records)
+        ]
+        inputs = {
+            key: torch.cat([item[0][key] for item in items], dim=0) if torch.is_tensor(value) else value
+            for key, value in items[0][0].items()
+        }
+        clean = tuple(torch.cat([item[1][column] for item in items]) for column in (0, 1))
+        noisy = tuple(torch.cat([item[2][column] for item in items]) for column in (0, 1))
+        sigma = torch.cat([item[3] for item in items])
+        predictions = self.module(task="av", **inputs)
+        return tuple(value.float() for value in predictions), clean, noisy, sigma
+
     def forward_backward_batch(self, data, loss_function, forward_only=False):
         from .diagnostics import gradient_delta_metrics, gradient_snapshot
 
@@ -210,8 +247,9 @@ class LTXJointHooks(DiffusionEngineHooks):
         config = getattr(loss_function, "keywords", {}).get("config")
         if config is None or config.diffusion_loss.loss_mode != "ltx2_unigrpo_nft":
             raise ValueError("LTX joint hooks require the joint loss configuration")
-        if config.ppo_micro_batch_size_per_gpu != 1:
-            raise ValueError("Initial LTX joint replay requires ppo_micro_batch_size_per_gpu=1")
+        micro_size = config.ppo_micro_batch_size_per_gpu
+        if type(micro_size) is not int or micro_size <= 0:
+            raise ValueError("Joint micro-batch size must be a positive integer")
         records = tu.get(data, "ltx_joint_replay")
         if records is None or len(records) == 0:
             raise ValueError("Missing exact LTX joint rollout records")
@@ -254,7 +292,11 @@ class LTXJointHooks(DiffusionEngineHooks):
             for key, value in values.items():
                 metrics[key] = metrics.get(key, 0.0) + float(value) * scale
 
-        for index, record in enumerate(records):
+        for index in range(0, len(records), micro_size):
+            group = records[index : index + micro_size]
+            record = group[0]
+            selection = slice(index, index + len(group))
+            sample_scale = len(group) / len(records)
             from .consistency_probe import capture_forward, probe_identity, probe_selected, to_cpu
 
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -265,6 +307,8 @@ class LTXJointHooks(DiffusionEngineHooks):
             )
             identity = None
             if probe:
+                if len(group) != 1:
+                    raise ValueError("Paired single-sample probing requires micro-batch size 1")
                 if self._rollout_backend is None:
                     raise RuntimeError("Paired collection requires the live native rollout worker")
                 identity = probe_identity(record, times[index, 0])
@@ -283,20 +327,20 @@ class LTXJointHooks(DiffusionEngineHooks):
                 )
                 self._probe_versions.add(record.policy_version)
 
-            def av(step, record=record, index=index):
-                return self._av(
-                    record,
-                    data["video_latents_clean"][index],
-                    data["audio_latents_clean"][index],
-                    data["video_forward_noise"][index, step],
-                    data["audio_forward_noise"][index, step],
-                    times[index, step],
+            def av(step, group=group, selection=selection):
+                return self._av_batch(
+                    group,
+                    data["video_latents_clean"][selection],
+                    data["audio_latents_clean"][selection],
+                    data["video_forward_noise"][selection, step],
+                    data["audio_forward_noise"][selection, step],
+                    times[selection, step],
                 )
 
             self._synchronize()
             reference_start = perf_counter()
             with self.policies.use("old"):
-                old_logprobs = self._ar(record).detach().cpu()
+                old_logprobs = self._ar_batch(group).detach().cpu()
                 old_predictions = []
                 for step in range(times.shape[1]):
                     capture = (
@@ -319,29 +363,31 @@ class LTXJointHooks(DiffusionEngineHooks):
                             )
                         old_predictions.append(tuple(p.cpu() for p in av(step)[0]))
             with self.policies.use("ref"):
+                ref_logprobs = self._ar_batch(group).detach().cpu() if config.diffusion_loss.text_kl_coef else None
                 ref_predictions = [tuple(p.cpu() for p in av(step)[0]) for step in range(times.shape[1])]
             self._synchronize()
             collect({"train/reference_time": perf_counter() - reference_start})
             text_start = perf_counter()
             before_text = gradient_snapshot(self.module)
-            current = self._ar(record)
+            current = self._ar_batch(group)
             old = old_logprobs.to(current.device)
-            mask = record.ar_inputs(current.device)["response_mask"][:, 1:]
+            mask = self._ar_batch_inputs(group)["response_mask"][:, 1:]
             loss, values = LTXJointLoss.text_loss(
                 current=current,
                 old=old,
-                advantages=data["text_advantages"][index : index + 1].to(current.device),
+                advantages=data["text_advantages"][selection].to(current.device),
                 mask=mask,
                 config=config,
+                reference=ref_logprobs.to(current.device) if ref_logprobs is not None else None,
             )
-            (loss / len(records)).backward()
+            (loss * sample_scale).backward()
             after_text = gradient_snapshot(self.module)
-            collect(gradient_delta_metrics(before_text, after_text, "text"), 1 / len(records))
+            collect(gradient_delta_metrics(before_text, after_text, "text"), sample_scale)
             del before_text
-            total += loss.detach().item() / len(records)
-            collect(values, 1 / len(records))
+            total += loss.detach().item() * sample_scale
+            collect(values, sample_scale)
             replay_train.append(old[mask].detach().cpu())
-            replay_rollout.append(record.rollout_logprobs)
+            replay_rollout.extend(item.rollout_logprobs for item in group)
             self._synchronize()
             collect({"train/text_time": perf_counter() - text_start})
             av_start = perf_counter()
@@ -362,16 +408,16 @@ class LTXJointHooks(DiffusionEngineHooks):
                     )
                 loss, values = LTXJointLoss.av_loss(
                     model_output=output,
-                    probabilities=data["reward_prob"][index : index + 1, step].to(predictions[0].device),
+                    probabilities=data["reward_prob"][selection, step].to(predictions[0].device),
                     config=config,
                 )
-                scale = 1 / (len(records) * times.shape[1])
+                scale = sample_scale / times.shape[1]
                 (loss * scale).backward()
                 total += loss.detach().item() * scale
                 collect(values, scale)
             self._synchronize()
             after_av = gradient_snapshot(self.module)
-            collect(gradient_delta_metrics(after_text, after_av, "av"), 1 / len(records))
+            collect(gradient_delta_metrics(after_text, after_av, "av"), sample_scale)
             del after_text, after_av
             collect({"train/av_time": perf_counter() - av_start})
         replay_train = torch.cat(replay_train).unsqueeze(0)

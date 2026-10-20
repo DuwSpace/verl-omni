@@ -205,6 +205,9 @@ async def test_audiobox_native_duration_weighted_windows():
     )
     # De-normalized windows score 3 and 7; CE+CU-PC+PQ gives 2x each.
     assert result["score"] == pytest.approx(((3.0 * 2 + 7.0) / 3) * 2 * 0.025)
+    assert result["raw_score"] == pytest.approx(result["score"] / 0.025)
+    for axis in ("ce", "cu", "pc", "pq"):
+        assert result[axis] == pytest.approx(13 / 3)
 
 
 def test_audiobox_windows_preserve_tail_and_mask_padding():
@@ -229,6 +232,8 @@ async def test_videoalign_native_sampling_prompt_and_calibration():
         score_stds=[2.0, 1.0, 2.0],
     )
     assert result["score"] == pytest.approx(1.5)
+    assert result["raw_score"] == pytest.approx(5.0)
+    assert [result[key] for key in ("vq_raw", "mq_raw", "ta_raw")] == [3.0, 5.0, 7.0]
     videos, prompts = model.infer.call_args.args
     assert prompts == ["video prompt"]
     assert videos[0][:, 0, 0, 0].tolist() == [0, 2, 5, 7]
@@ -411,3 +416,34 @@ async def test_new_audio_scorers_do_not_inherit_clap_rate_default(scorer):
             reward_model=model, solution_image=_video([0, 1]), fps=24, extra_info={"audio": torch.ones(16)}
         )
     model.infer.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [videoalign.VideoAlignModel, hpsv3_reward.HPSv3Model, audiobox.AudioBoxModel, clap.CLAPModel, desync.DeSyncModel],
+)
+def test_native_model_device_transfer_keeps_weights_and_preprocessing(cls):
+    wrapper = object.__new__(cls)
+    wrapper._infer_lock = threading.Lock()
+    module = torch.nn.Linear(2, 2).to(torch.bfloat16)
+    module.register_buffer("statistics", torch.ones(2, dtype=torch.float32))
+    weights = module.weight.detach().clone()
+    processor = object()
+    if cls is hpsv3_reward.HPSv3Model:
+        wrapper._inferencer = SimpleNamespace(model=module, processor=processor, device="cpu")
+        owner = wrapper._inferencer
+    else:
+        wrapper.model = module
+        wrapper.processor = processor
+        wrapper.device = torch.device("cpu")
+        owner = wrapper
+    if cls is desync.DeSyncModel:
+        wrapper.mel = torch.nn.Linear(2, 2)
+    for device in ("cpu", torch.device("cpu", 0)):
+        assert wrapper.to(device) is wrapper
+        assert owner.device == torch.device(device)
+        assert owner.model is module and owner.processor is processor
+        torch.testing.assert_close(module.weight, weights)
+        assert module.statistics.dtype == torch.float32
+    if cls is desync.DeSyncModel:
+        assert next(wrapper.mel.parameters()).device.type == "cpu"

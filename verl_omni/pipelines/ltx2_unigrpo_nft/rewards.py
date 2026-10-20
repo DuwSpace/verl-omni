@@ -66,7 +66,8 @@ def reward_sample(sample) -> DataProto:
 class LTXJointRewardRunner:
     """Score a rollout batch one model at a time using the shared reward manager.
 
-    Each model is loaded once for the batch and released before the next model.
+    Each model is woken once per term and slept before the next model. Executors
+    persist across batches, retaining CPU weights when cpu_offload is enabled.
     Scorer preprocessing, weights and routing come exclusively from config.
     The caller must release/offload rollout models before invoking this runner
     when both use the same device.
@@ -74,6 +75,7 @@ class LTXJointRewardRunner:
 
     def __init__(self, config):
         self.config = config
+        self._executors = {}
         if config.reward.aggregation != "preserve_components":
             raise ValueError("Joint rewards require preserve_components aggregation")
         if len(config.reward.reward_functions) != 5:
@@ -96,14 +98,17 @@ class LTXJointRewardRunner:
             model = config.reward.models[model_name]
             if model.backend != "native":
                 raise ValueError("Initial synchronous LTX reward runner requires native models")
-            executor = NativeRewardExecutor(
-                RewardModelSpec(
-                    name=model_name,
-                    backend="native",
-                    model_path=model.model_path,
-                    executor_config=OmegaConf.to_container(model.executor, resolve=True),
+            if model_name not in self._executors:
+                self._executors[model_name] = NativeRewardExecutor(
+                    RewardModelSpec(
+                        name=model_name,
+                        backend="native",
+                        model_path=model.model_path,
+                        executor_config=OmegaConf.to_container(model.executor, resolve=True),
+                        cpu_offload=model.get("cpu_offload", False),
+                    )
                 )
-            )
+            executor = self._executors[model_name]
             manager = MultiVisualRewardManager(config, tokenizer=None, compute_score=None)
             manager.set_reward_executors({}, {model_name: executor})
             load_start = perf_counter()
@@ -127,3 +132,15 @@ class LTXJointRewardRunner:
             raise ValueError("All five required reward components must be finite")
         metrics["reward/total_time"] = perf_counter() - started
         return scores, names, infos, metrics
+
+    async def close(self):
+        """Release cached executors, including weights retained in CPU memory."""
+        import asyncio
+
+        results = await asyncio.gather(
+            *(executor.close() for executor in self._executors.values()), return_exceptions=True
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        self._executors.clear()

@@ -260,6 +260,9 @@ ltx_joint:
   # Sequential native model offload.
   cpu_offload: true
 
+  # Tile native VAE decoding to reduce memory.
+  vae_use_tiling: false
+
 # Rollout Algorithm configuration
 algo:
 

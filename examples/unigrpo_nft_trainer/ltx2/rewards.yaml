@@ -27,11 +27,13 @@ reward:
     video_align:
       backend: native
       offload: true
+      cpu_offload: true
       executor:
         model: verl_omni.utils.reward_score.videoalign:VideoAlignModel
     hpsv3:
       backend: native
       offload: true
+      cpu_offload: true
       executor:
         model: verl_omni.utils.reward_score.hpsv3_reward:HPSv3Model
         kwargs:
@@ -39,16 +41,19 @@ reward:
     audiobox:
       backend: native
       offload: true
+      cpu_offload: true
       executor:
         model: verl_omni.utils.reward_score.audiobox:AudioBoxModel
     clap:
       backend: native
       offload: true
+      cpu_offload: true
       executor:
         model: verl_omni.utils.reward_score.clap:CLAPModel
     desync:
       backend: native
       offload: true
+      cpu_offload: true
       executor:
         model: verl_omni.utils.reward_score.desync:DeSyncModel
   reward_functions:

@@ -10,6 +10,7 @@
 
 """Synchronous native LTX rollout and joint GRPO/OmniNFT actor updates."""
 
+from copy import deepcopy
 from pathlib import Path
 from time import perf_counter
 
@@ -17,12 +18,15 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.reward import extract_reward
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.pipelines.ltx2_unigrpo_nft.loss import LTXJointLoss
 from verl_omni.trainer.diffusion.bagel_joint_ray_trainer import BagelJointRayTrainer
-from verl_omni.trainer.diffusion.diffusion_trainer_utils import _to_diffusion_worker_tensordict
+from verl_omni.trainer.diffusion.diffusion_metric_utils import compute_old_policy_metrics
+from verl_omni.trainer.diffusion.diffusion_trainer_utils import _to_diffusion_worker_tensordict, old_policy_decay
+from verl_omni.trainer.diffusion.native_ray_trainer import NativeRayDiffusionTrainer
 
 
 class LTXJointRayTrainer(BagelJointRayTrainer):
@@ -42,8 +46,14 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
             return self.config.actor_rollout_ref.rollout.seed + np.arange(count)
         return super()._rollout_seeds(count, version)
 
+    def _validation_n(self):
+        value = self.config.actor_rollout_ref.rollout.get("val_kwargs", {}).get("n", 1)
+        if type(value) is not int or value <= 0:
+            raise ValueError("Joint validation val_kwargs.n must be a positive integer")
+        return value
+
     def _validate(self):
-        """Evaluate the current paired policy once, after all mini-batches finish."""
+        """Evaluate the EMA paired policy once, after all mini-batches finish."""
         from verl_omni.pipelines.ltx2_unigrpo_nft.artifacts import save_joint_samples
 
         started = perf_counter()
@@ -52,7 +62,7 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
             raise ValueError("Joint evaluation requires a nonempty fixed validation dataset")
         source = DataProto.concat(batches)
         source.non_tensor_batch["uid"] = np.array([f"eval-{i}" for i in range(len(source))], dtype=object)
-        batch = self._get_gen_batch(source).repeat(self.config.actor_rollout_ref.rollout.n, interleave=True)
+        batch = self._get_gen_batch(source).repeat(self._validation_n(), interleave=True)
         if batch.batch is None:
             batch.batch = TensorDict({}, batch_size=[len(batch)])
         batch.meta_info["global_steps"] = self.global_steps
@@ -69,7 +79,12 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
             root = self.config.trainer.get("rollout_data_dir") or self.config.trainer.default_local_dir
             directory = Path(root) / "evaluation" / f"step-{self.global_steps:06d}"
             names = sorted(self.config.reward.reward_functions)
-            index = save_joint_samples(batch, directory, names)
+            index = save_joint_samples(
+                batch,
+                directory,
+                names,
+                save_tensors=self.config.trainer.get("joint_sample_save_tensors", False),
+            )
             metrics = {
                 "val/joint/total_time": perf_counter() - started,
                 "val/joint/samples": len(batch),
@@ -105,21 +120,61 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
             raise ValueError("Joint LTX requires online grouped samples on one node")
         if model.lora_rank <= 0 or tuple(model.policy_state_adapters) != ("default",):
             raise ValueError("Joint LTX requires default Gemma/DiT LoRA and snapshot-owned old/ref")
-        if rollout.seed is None or actor.ppo_micro_batch_size_per_gpu != 1:
-            raise ValueError("Joint LTX requires an explicit seed and one-sample micro-batches")
+        if rollout.seed is None:
+            raise ValueError("Joint LTX requires an explicit seed")
+        micro = actor.ppo_micro_batch_size_per_gpu
+        if type(micro) is not int or micro <= 0:
+            raise ValueError("Joint micro-batch size must be a positive integer")
         world = config.trainer.n_gpus_per_node
         samples = config.data.train_batch_size * rollout.n
         if world <= 0 or samples <= 0 or actor.ppo_mini_batch_size <= 0:
             raise ValueError("Joint actor world and batch sizes must be positive")
         if samples % world or actor.ppo_mini_batch_size % world or samples % actor.ppo_mini_batch_size:
             raise ValueError("Joint sample batches and actual-sample PPO mini-batches must divide across actor ranks")
+        if (actor.ppo_mini_batch_size // world) % micro:
+            raise ValueError("Joint per-rank mini-batch must divide by micro-batch size")
 
     def _generate_native(self, gen_batch_output):
-        if len(gen_batch_output) % self.config.trainer.n_gpus_per_node:
-            raise ValueError("Joint rollout samples must divide across all actor ranks")
-        output = super()._generate_native(gen_batch_output)
-        # These original-prompt reward/media fields come from the native result;
-        # avoid union conflicts with optional dataset-supplied placeholders.
+        from omegaconf import OmegaConf
+
+        from verl_omni.pipelines.ltx2_unigrpo_nft.config import sampling_params
+
+        rollout = self.config.actor_rollout_ref.rollout
+        if "pipeline" in rollout:
+            pipeline = rollout.pipeline
+            if getattr(self, "_evaluating", False):
+                pipeline = OmegaConf.merge(pipeline, rollout.get("val_kwargs", {}).get("pipeline", {}))
+            params = sampling_params(pipeline)
+            gen_batch_output.non_tensor_batch["_ltx_sampling_params"] = np.array(
+                [params for _ in range(len(gen_batch_output))], dtype=object
+            )
+        world = self.config.trainer.n_gpus_per_node
+        if getattr(self, "_evaluating", False):
+            count, group_size = len(gen_batch_output), self._validation_n()
+            if count == 0 or count % group_size:
+                raise ValueError("Joint validation requires complete prompt groups")
+            version = self._rollout_version()
+            gen_batch_output.non_tensor_batch[self.policy_version_key] = np.full(count, version)
+            gen_batch_output.non_tensor_batch[self.sample_seed_key] = self._rollout_seeds(count, version)
+            permutation = np.arange(count).reshape(-1, group_size).T.reshape(-1)
+            # Every FSDP rank must join paired LoRA export. Pad only dispatch;
+            # replicas of real requests keep their seeds and are never scored.
+            padded, padding = pad_dataproto_to_divisor(gen_batch_output.select_idxs(permutation), world)
+            output = NativeRayDiffusionTrainer._generate_native(self, padded)
+            output = unpad_dataproto(output, padding).select_idxs(np.argsort(permutation))
+        else:
+            if len(gen_batch_output) % world:
+                raise ValueError("Joint rollout samples must divide across all actor ranks")
+            output = super()._generate_native(gen_batch_output)
+        # Dataset modality targets must survive generation/reordering. Native
+        # workers use the original AV prompt only as a fallback for plain tasks.
+        targets = gen_batch_output.non_tensor_batch.get("reward_inputs")
+        if targets is not None:
+            for target in targets:
+                text = target.get("text", {}) if isinstance(target, dict) else {}
+                if any(not isinstance(text.get(key), str) or not text[key].strip() for key in ("video", "audio")):
+                    raise ValueError("Joint reward_inputs requires nonempty text.video and text.audio")
+            output.non_tensor_batch["reward_inputs"] = deepcopy(targets)
         for key in ("reward_inputs", "fps", "audio_layout"):
             gen_batch_output.non_tensor_batch.pop(key, None)
         return output
@@ -153,8 +208,23 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
             batch,
             Path(rollout_data_dir) / f"step-{self.global_steps:06d}",
             sorted(self.config.reward.reward_functions),
+            save_tensors=self.config.trainer.get("joint_sample_save_tensors", False),
         )
         timing_raw["dump_rollout_generations"] = perf_counter() - started
+
+    def _update_old_policy(self):
+        """Refresh both LoRA components after all actor mini-batches, before saving."""
+        algorithm = self.config.algorithm
+        interval = algorithm.get("old_policy_update_interval", 1)
+        if type(interval) is not int or interval <= 0:
+            raise ValueError("Joint old_policy_update_interval must be a positive integer")
+        if self.global_steps % interval:
+            return False, 0.0, "none"
+        decay = algorithm.get("old_policy_decay")
+        if decay is None:
+            decay = old_policy_decay(self.global_steps, algorithm.get("old_policy_decay_schedule", "copy"))
+        self.actor_rollout_wg.ema_update_adapter(source="default", target="old", decay=decay)
+        return True, float(decay), "copy" if decay == 0 else "ema"
 
     def _update_actor(self, batch):
         data = _to_diffusion_worker_tensordict(batch)
@@ -170,8 +240,10 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
         )
         started = perf_counter()
         result = self.actor_rollout_wg.update_actor(data)
+        old_policy_metrics = compute_old_policy_metrics(self._update_old_policy())
         finished = perf_counter()
         metrics = {f"actor/{key}": value for key, value in tu.get(result, "metrics").items()}
+        metrics.update(old_policy_metrics)
         metrics.update(batch.meta_info.get("text_reward_metrics", {}))
         metrics["train/total_time"] = finished - started
         if hasattr(self, "_joint_reward_time"):
@@ -186,7 +258,10 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
             metrics["step/samples_per_second"] = len(batch) / wall
             for key in ("rollout/sync_time", "rollout/model_load_time"):
                 metrics[key] = max(item[key] for item in timings)
-            for key in ("rollout/max_memory_allocated_gib", "rollout/max_memory_reserved_gib"):
+            for key in (
+                "rollout/max_memory_allocated_gib",
+                "rollout/max_memory_reserved_gib",
+            ):
                 values = [item[key] for item in timings if key in item]
                 if values:
                     metrics[key] = max(values)

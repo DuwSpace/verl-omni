@@ -8,7 +8,7 @@ export DUMP_PHASE=update_actor
 export MSPROBE_DUMP_GLOBAL_STEP="${MSPROBE_DUMP_GLOBAL_STEP:-1}"
 export MSPROBE_CONFIG_ACTOR="${MSPROBE_CONFIG_ACTOR:-$script_dir/msprobe_av.json}"
 export MSPROBE_CONFIG_GENERATE="${MSPROBE_CONFIG_GENERATE:-$script_dir/msprobe_av.json}"
-exec bash "$script_dir/run_joint_npu.sh" \
+exec bash "$script_dir/run_train.sh" \
     data.train_batch_size=1 \
     trainer.val_before_train=false trainer.test_freq=-1 \
     "trainer.total_training_steps=$MSPROBE_DUMP_GLOBAL_STEP" \

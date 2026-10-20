@@ -290,6 +290,7 @@ actor_rollout_ref:
       temperature: 1.0
       sync_timeout_seconds: 600
       cpu_offload: true
+      vae_use_tiling: false
     algo:
       _target_: verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig
       noise_level: 1.0
@@ -409,6 +410,7 @@ actor_rollout_ref:
       temperature: ${oc.select:actor_rollout_ref.rollout.ltx_joint.temperature,1.0}
       sync_timeout_seconds: ${oc.select:actor_rollout_ref.rollout.ltx_joint.sync_timeout_seconds,600}
       cpu_offload: ${oc.select:actor_rollout_ref.rollout.ltx_joint.cpu_offload,true}
+      vae_use_tiling: ${oc.select:actor_rollout_ref.rollout.ltx_joint.vae_use_tiling,false}
     algo:
       _target_: verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig
       noise_level: ${oc.select:actor_rollout_ref.rollout.algo.noise_level,1.0}

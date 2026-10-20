@@ -36,6 +36,7 @@ class LTXJointVllmBackend:
         recaption_max_new_tokens,
         sync_timeout_seconds,
         enable_cpu_offload=True,
+        vae_use_tiling=False,
     ):
         from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
         from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -63,6 +64,7 @@ class LTXJointVllmBackend:
                 diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
                 enforce_eager=True,
                 enable_cpu_offload=enable_cpu_offload,
+                vae_use_tiling=vae_use_tiling,
                 # LTX reads extras during construction; pass a concrete mapping
                 # even on backends whose dataclass default is a Pydantic Field.
                 extras={},
@@ -135,7 +137,7 @@ class LTXJointVllmBackend:
         self.policy_version = version
         return manifest
 
-    def generate(self, prompts, seeds, *, version):
+    def generate(self, prompts, seeds, *, version, sampling_params=None):
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -143,7 +145,7 @@ class LTXJointVllmBackend:
             raise RuntimeError("Load the complete paired policy before rollout")
         results = []
         for index, (prompt, seed) in enumerate(zip(prompts, seeds, strict=True)):
-            params = dict(self.geometry)
+            params = dict(self.geometry if sampling_params is None else sampling_params)
             extra = dict(params.pop("extra_args", {}))
             extra.update(
                 policy_version=version,

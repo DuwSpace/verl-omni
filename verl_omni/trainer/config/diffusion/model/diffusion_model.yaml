@@ -196,6 +196,9 @@ ltx_joint:
   # Sequential native model offload.
   cpu_offload: ${oc.select:actor_rollout_ref.rollout.ltx_joint.cpu_offload,true}
 
+  # Tile native VAE decoding to reduce memory.
+  vae_use_tiling: ${oc.select:actor_rollout_ref.rollout.ltx_joint.vae_use_tiling,false}
+
 # Rollout Algorithm configuration
 algo:
 

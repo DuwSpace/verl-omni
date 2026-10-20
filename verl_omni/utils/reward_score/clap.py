@@ -279,6 +279,13 @@ class CLAPModel:
         self.processor = AutoProcessor.from_pretrained(model_path, **(processor_kwargs or {}))
         self._infer_lock = threading.Lock()
 
+    def to(self, device):
+        """Move inference state without reloading weights or changing dtype."""
+        with self._infer_lock:
+            self.model.to(device)
+            self.device = torch.device(device)
+        return self
+
     def close(self) -> None:
         """Drop model/processor references; reuse requires constructing a new adapter."""
         self.model = None

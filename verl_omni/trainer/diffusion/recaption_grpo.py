@@ -25,26 +25,38 @@ import torch
 def probability_group_advantages(
     probabilities: torch.Tensor, group_ids: Sequence[Any], *, epsilon: float = 1e-6
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Normalize sample reward probabilities within each original-prompt group.
+    """Legacy probability credit with the original bounds and metric names."""
+    if not bool(torch.isfinite(probabilities).all()) or bool(((probabilities < 0) | (probabilities > 1)).any()):
+        raise ValueError("Recaption rewards must be finite probabilities in [0, 1]")
+    advantages, metrics = reward_group_advantages(probabilities, group_ids, epsilon=epsilon)
+    metrics["text/probability_mean"] = metrics.pop("text/reward_mean")
+    metrics["text/probability_std"] = metrics.pop("text/reward_std")
+    return advantages, metrics
+
+
+def reward_group_advantages(
+    rewards: torch.Tensor, group_ids: Sequence[Any], *, epsilon: float = 1e-6
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Normalize finite scalar rewards within each original-prompt group.
 
     The caller selects its scalar probability from the reward pipeline; this
     helper never aggregates or reroutes the component scorers. Population std
     keeps singleton and equal-reward groups well-defined with zero advantage.
     """
-    if probabilities.ndim != 1 or probabilities.numel() == 0 or len(group_ids) != probabilities.numel():
-        raise ValueError("Recaption requires one scalar probability and group ID per sample")
+    if rewards.ndim != 1 or rewards.numel() == 0 or len(group_ids) != rewards.numel():
+        raise ValueError("Recaption requires one scalar reward and group ID per sample")
     if not math.isfinite(epsilon) or epsilon <= 0:
         raise ValueError("Recaption advantage epsilon must be finite and positive")
-    probabilities = probabilities.detach().float()
-    if not bool(torch.isfinite(probabilities).all()) or bool(((probabilities < 0) | (probabilities > 1)).any()):
-        raise ValueError("Recaption rewards must be finite probabilities in [0, 1]")
+    rewards = rewards.detach().float()
+    if not bool(torch.isfinite(rewards).all()):
+        raise ValueError("Recaption scalar rewards must be finite")
     groups = defaultdict(list)
     for index, group_id in enumerate(group_ids):
         groups[group_id].append(index)
-    advantages = torch.empty_like(probabilities)
+    advantages = torch.empty_like(rewards)
     constant_groups = 0
     for indices in groups.values():
-        values = probabilities[indices]
+        values = rewards[indices]
         constant = bool((values == values[0]).all())
         constant_groups += int(constant)
         if constant:
@@ -52,9 +64,11 @@ def probability_group_advantages(
         else:
             advantages[indices] = (values - values.mean()) / (values.std(correction=0) + epsilon)
     return advantages, {
-        "text/probability_mean": probabilities.mean().item(),
-        "text/probability_std": probabilities.std(correction=0).item(),
+        "text/reward_mean": rewards.mean().item(),
+        "text/reward_std": rewards.std(correction=0).item(),
         "text/constant_group_fraction": constant_groups / len(groups),
+        "text/advantage_abs_mean": advantages.abs().mean().item(),
+        "text/advantage_std": advantages.std(correction=0).item(),
     }
 
 
@@ -76,8 +90,9 @@ def clipped_recaption_loss(
     response_mask: torch.Tensor,
     *,
     clip_ratio: float,
+    policy_loss: str = "grpo",
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Average clipped token GRPO over tokens per response, then over samples.
+    """Sample-mean token GRPO or length-normalized sequence GSPO.
 
     Frozen old probabilities and outcome advantages never receive gradients.
     Prompt and padding tokens are excluded, including from diagnostics. The
@@ -88,21 +103,43 @@ def clipped_recaption_loss(
         raise ValueError("Recaption requires one finite group-relative advantage per sample")
     if not math.isfinite(clip_ratio) or not 0 < clip_ratio < 1:
         raise ValueError("Recaption clip ratio must be finite and in (0, 1)")
+    if policy_loss not in {"grpo", "gspo"}:
+        raise ValueError("Supported recaption policy losses: grpo, gspo")
     delta = torch.where(response_mask, current_logprobs.float() - old_logprobs.detach().float(), 0.0)
+    if policy_loss == "gspo":
+        delta = delta.sum(dim=-1, keepdim=True) / response_mask.sum(dim=-1, keepdim=True)
     ratio = delta.exp()
     if not bool(torch.isfinite(ratio).all()):
         raise ValueError("Recaption current/old probability ratio overflowed")
     advantage = advantages.detach().float()[:, None]
     clipped = ratio.clamp(1 - clip_ratio, 1 + clip_ratio)
     token_loss = -torch.minimum(ratio * advantage, clipped * advantage)
-    sample_loss = torch.where(response_mask, token_loss, 0.0).sum(dim=-1) / response_mask.sum(dim=-1)
+    if policy_loss == "gspo":
+        sample_loss = token_loss.squeeze(-1)
+    else:
+        sample_loss = torch.where(response_mask, token_loss, 0.0).sum(dim=-1) / response_mask.sum(dim=-1)
     loss = sample_loss.mean()
-    valid_ratios = ratio.detach()[response_mask]
+    valid_ratios = ratio.detach().flatten() if policy_loss == "gspo" else ratio.detach()[response_mask]
     return loss, {
-        "text/grpo_loss": loss.detach().item(),
+        f"text/{policy_loss}_loss": loss.detach().item(),
+        f"text/{policy_loss}_abs_sample_loss": sample_loss.detach().abs().mean().item(),
         "text/ratio_mean": valid_ratios.mean().item(),
         "text/clip_fraction": ((valid_ratios - 1).abs() > clip_ratio).float().mean().item(),
     }
+
+
+def recaption_reference_kl(current_logprobs, reference_logprobs, response_mask):
+    """Sampled-token k3 penalty, averaged over response tokens then samples.
+
+    This is an estimate on rollout tokens, not a full-vocabulary KL. Only the
+    current policy receives gradients; padding is removed before exponentiation.
+    """
+    _validate_token_logprobs(current_logprobs, reference_logprobs, response_mask)
+    delta = torch.where(response_mask, reference_logprobs.detach().float() - current_logprobs.float(), 0.0)
+    penalty = delta.expm1() - delta
+    if not bool(torch.isfinite(penalty).all()):
+        raise ValueError("Recaption reference KL overflowed")
+    return (penalty.sum(dim=-1) / response_mask.sum(dim=-1)).mean()
 
 
 def old_policy_logprob_metrics(

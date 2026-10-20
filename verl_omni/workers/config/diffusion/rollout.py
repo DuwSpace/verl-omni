@@ -44,6 +44,7 @@ class LTXJointRolloutConfig(BaseConfig):
     temperature: float = 1.0
     sync_timeout_seconds: int = 600
     cpu_offload: bool = True
+    vae_use_tiling: bool = False
 
     def __post_init__(self):
         import math

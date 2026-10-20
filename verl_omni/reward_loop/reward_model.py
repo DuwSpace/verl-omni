@@ -249,6 +249,7 @@ class NativeManagedRewardModel(ManagedRewardModel):
                 backend="native",
                 model_path=model.model_path,
                 executor_config=executor_config,
+                cpu_offload=model.cpu_offload,
             ),
             offload=offload,
         )

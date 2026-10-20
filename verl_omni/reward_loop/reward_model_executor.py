@@ -70,6 +70,8 @@ class NativeRewardExecutor:
             raise ValueError(f"NativeRewardExecutor requires a native spec, got {spec.backend!r}")
         self.spec = spec
         self._model: Any | None = None
+        self._awake = False
+        self._device = None
         self._inflight = 0
         self._idle = asyncio.Event()
         self._idle.set()
@@ -77,14 +79,23 @@ class NativeRewardExecutor:
 
     async def wake_up(self) -> None:
         async with self._lock:
+            if self._awake:
+                return
             if self._model is not None:
+                await asyncio.to_thread(self._model.to, self._device)
+                self._awake = True
                 return
             model_cls = _load_native_model(self.spec.executor_config["model"])
+            if self.spec.cpu_offload and not callable(getattr(model_cls, "to", None)):
+                raise TypeError(f"Native reward model {model_cls.__name__!r} must define to(device) for cpu_offload")
             kwargs = dict(self.spec.executor_config.get("kwargs", {}))
             if self.spec.model_path is not None:
                 kwargs.setdefault("model_path", self.spec.model_path)
-            kwargs.setdefault("device", torch.device(get_device_name(), get_device_id()))
+            if "device" not in kwargs:
+                kwargs["device"] = torch.device(get_device_name(), get_device_id())
+            self._device = torch.device(kwargs["device"])
             self._model = model_cls(**kwargs)
+            self._awake = True
 
     def reward_kwargs(self) -> dict[str, Any]:
         return {"reward_model": self}
@@ -92,7 +103,7 @@ class NativeRewardExecutor:
     async def infer(self, *args, **kwargs):
         """Run model inference while protecting the wake/sleep boundary."""
         async with self._lock:
-            if self._model is None:
+            if self._model is None or not self._awake:
                 raise RuntimeError(f"Native reward model {self.spec.name!r} is not awake")
             self._inflight += 1
             self._idle.clear()
@@ -112,11 +123,24 @@ class NativeRewardExecutor:
                     self._idle.set()
 
     async def sleep(self) -> None:
+        """Offload to host memory when configured; otherwise destroy the model."""
+        await self._sleep(release=not self.spec.cpu_offload)
+
+    async def close(self) -> None:
+        """Destroy the model, including any retained CPU weights."""
+        await self._sleep(release=True)
+
+    async def _sleep(self, *, release: bool) -> None:
         while True:
             await self._idle.wait()
             async with self._lock:
                 if self._inflight:
                     continue
+                self._awake = False
+                if not release and self._model is not None:
+                    await asyncio.to_thread(self._model.to, torch.device("cpu"))
+                    _empty_accelerator_cache()
+                    return
                 model, self._model = self._model, None
                 if model is not None:
                     close = getattr(model, "close", None)
@@ -124,6 +148,7 @@ class NativeRewardExecutor:
                         result = await close() if inspect.iscoroutinefunction(close) else await asyncio.to_thread(close)
                         if inspect.isawaitable(result):
                             await result
+                del model
                 gc.collect()
                 _empty_accelerator_cache()
                 return

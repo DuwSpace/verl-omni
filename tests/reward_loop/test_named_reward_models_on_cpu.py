@@ -1254,3 +1254,156 @@ def test_reward_manager_accepts_scalar_default(monkeypatch):
     manager = OmniRewardLoopManager(config)
     assert initialized == [manager]
     assert manager._preserve_reward_components is False
+
+
+@pytest.mark.asyncio
+async def test_native_cpu_offload_retains_weights_and_rejects_sleeping_inference(monkeypatch):
+    class Model(_FakeModel):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.moves = []
+            self.weights = torch.nn.Linear(2, 1).to(torch.bfloat16)
+
+        def to(self, device):
+            self.moves.append(torch.device(device))
+            self.weights.to(device)
+            self.device = torch.device(device)
+            return self
+
+    Model.instances = []
+    monkeypatch.setattr(executor_module, "_load_native_model", lambda _: Model)
+    spec = RewardModelSpec(
+        name="cached",
+        backend="native",
+        model_path="/unused",
+        cpu_offload=True,
+        executor_config={"model": "tests.fake:Model", "kwargs": {"device": "cpu"}},
+    )
+    executor = NativeRewardExecutor(spec)
+    await executor.wake_up()
+    model = executor._model
+    weights = model.weights.weight.detach().clone()
+    for _ in range(2):
+        await executor.sleep()
+        assert executor._model is model and not model.closed
+        with pytest.raises(RuntimeError, match="not awake"):
+            await executor.infer([], [])
+        await executor.wake_up()
+        await executor.wake_up()  # already awake: no extra transfer/load
+        result = await executor.infer(["prompt"], [torch.zeros(3, 2, 2)])
+        torch.testing.assert_close(result, torch.tensor([0.75]))
+        torch.testing.assert_close(model.weights.weight, weights)
+    assert len(Model.instances) == 1
+    assert model.moves == [torch.device("cpu")] * 4
+    await executor.sleep()
+    await executor.close()
+    assert model.closed and executor._model is None
+
+
+@pytest.mark.asyncio
+async def test_native_cpu_offload_waits_for_active_inference(monkeypatch):
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    class Model:
+        def __init__(self, **kwargs):
+            self.moves = []
+
+        async def infer(self):
+            entered.set()
+            await finish.wait()
+            return 1.0
+
+        def to(self, device):
+            self.moves.append(device)
+
+    monkeypatch.setattr(executor_module, "_load_native_model", lambda _: Model)
+    executor = NativeRewardExecutor(
+        RewardModelSpec(
+            name="cached",
+            backend="native",
+            cpu_offload=True,
+            executor_config={"model": "tests.fake:Model", "kwargs": {"device": "cpu"}},
+        )
+    )
+    await executor.wake_up()
+    task = asyncio.create_task(executor.infer())
+    await entered.wait()
+    sleeper = asyncio.create_task(executor.sleep())
+    await asyncio.sleep(0)
+    assert not sleeper.done() and executor._model.moves == []
+    finish.set()
+    assert await task == 1.0
+    await sleeper
+    assert executor._model.moves == [torch.device("cpu")]
+    await executor.close()
+
+
+def test_native_cpu_offload_config_reaches_worker_spec():
+    from verl_omni.reward_loop.reward_model import NativeManagedRewardModel
+
+    model = NativeManagedRewardModel(
+        "cached",
+        {
+            "backend": "native",
+            "offload": True,
+            "cpu_offload": True,
+            "placement": {"devices": [0]},
+            "executor": {"model": "tests.fake:Model"},
+        },
+    )
+    assert model.spec.cpu_offload is True
+
+
+@pytest.mark.asyncio
+async def test_native_cpu_offload_requires_transfer_contract_before_loading(monkeypatch):
+    _FakeModel.instances.clear()
+    monkeypatch.setattr(executor_module, "_load_native_model", lambda _: _FakeModel)
+    executor = NativeRewardExecutor(
+        RewardModelSpec(
+            name="unsupported",
+            backend="native",
+            cpu_offload=True,
+            executor_config={"model": "tests.fake:FakeModel"},
+        )
+    )
+    with pytest.raises(TypeError, match=r"to\(device\)"):
+        await executor.wake_up()
+    assert not _FakeModel.instances
+
+
+@pytest.mark.asyncio
+async def test_failed_cpu_reload_does_not_admit_inference(monkeypatch):
+    class Model:
+        fail = False
+
+        def __init__(self, **kwargs):
+            pass
+
+        def to(self, device):
+            if self.fail:
+                raise RuntimeError("transfer failed")
+
+        def infer(self):
+            return 0.5
+
+    monkeypatch.setattr(executor_module, "_load_native_model", lambda _: Model)
+    executor = NativeRewardExecutor(
+        RewardModelSpec(
+            name="cached",
+            backend="native",
+            cpu_offload=True,
+            executor_config={"model": "tests.fake:Model", "kwargs": {"device": "cpu"}},
+        )
+    )
+    await executor.wake_up()
+    await executor.sleep()
+    executor._model.fail = True
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        await executor.wake_up()
+    with pytest.raises(RuntimeError, match="not awake"):
+        await executor.infer()
+    executor._model.fail = False
+    await executor.sleep()
+    await executor.wake_up()
+    assert await executor.infer() == 0.5
+    await executor.close()

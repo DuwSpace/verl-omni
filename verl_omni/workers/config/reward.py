@@ -216,6 +216,7 @@ class NativeRewardModelConfig(RewardModelConfig):
 
     placement: RewardModelPlacementConfig | None = None
     executor: NativeRewardModelExecutorConfig | None = None
+    cpu_offload: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -225,11 +226,13 @@ class NativeRewardModelConfig(RewardModelConfig):
             raise ValueError(f"Native reward model {self.name!r} requires placement.devices")
         if not isinstance(self.executor, NativeRewardModelExecutorConfig):
             raise ValueError(f"Native reward model {self.name!r} requires executor.model")
+        if not isinstance(self.cpu_offload, bool):
+            raise ValueError("Native reward model cpu_offload must be a boolean")
 
     @classmethod
     def from_mapping(cls, name: str, value) -> NativeRewardModelConfig:
         model = to_mapping(value)
-        allowed = {"backend", "offload", "model_path", "placement", "executor"}
+        allowed = {"backend", "offload", "cpu_offload", "model_path", "placement", "executor"}
         _reject_unknown_fields(name, model, allowed)
         return cls(
             name=name,
@@ -238,6 +241,7 @@ class NativeRewardModelConfig(RewardModelConfig):
             model_path=model.get("model_path"),
             placement=RewardModelPlacementConfig.from_mapping(name, model.get("placement")),
             executor=NativeRewardModelExecutorConfig.from_mapping(name, model.get("executor")),
+            cpu_offload=model.get("cpu_offload", False),
         )
 
 
@@ -250,6 +254,7 @@ class RewardModelSpec(BaseConfig):
     model_path: str | None = None
     router_address: str | None = None
     executor_config: dict[str, Any] = field(default_factory=dict)
+    cpu_offload: bool = False
 
 
 def to_mapping(value) -> dict[str, Any]:
