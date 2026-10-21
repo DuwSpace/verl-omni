@@ -619,14 +619,19 @@ async def _ensure_consumer(state: _BatchingState):
             state.consumer_task = asyncio.create_task(_consumer_loop(state))
 
 
-async def _infer_frame_scores(reward_model, images: list[Image.Image], prompt: str, max_batch_size: int) -> list[float]:
+async def _infer_frame_scores(
+    reward_model, images: list[Image.Image], prompt: str, max_batch_size: int, diagnostic_request=None
+) -> list[float]:
     """Infer raw scores in frame order with at most max_batch_size frames per call."""
     if not images:
         raise ValueError("HPSv3 reward requires at least one image frame")
     scores = []
     for start in range(0, len(images), max_batch_size):
         frames = images[start : start + max_batch_size]
-        logits = await reward_model.infer(frames, [prompt] * len(frames))
+        diagnostic_kwargs = (
+            {"diagnostic_request": diagnostic_request, "frame_offset": start} if diagnostic_request is not None else {}
+        )
+        logits = await reward_model.infer(frames, [prompt] * len(frames), **diagnostic_kwargs)
         scores.extend(logits[:, 0].detach().float().cpu().tolist())
     return scores
 
@@ -671,10 +676,43 @@ async def compute_score_hpsv3(
         prompt = batch[0].non_tensor_batch["reward_inputs"]["text"][prompt_key]
 
     if reward_model is not None:
-        images = _select_reward_frames(solution_image, extra_info, num_frames)
-        raw_scores = await _infer_frame_scores(reward_model, images, prompt, max_batch_size)
-        raw_score = _aggregate_frame_scores(raw_scores, top_fraction, score_cap)
-        return {"score": raw_score * reward_scale, "hpsv3_raw": raw_score}
+        recorder = getattr(reward_model, "reward_diagnostics", None)
+        record = None
+        if recorder is not None:
+            row = batch[0].non_tensor_batch if batch is not None and len(batch) == 1 else extra_info
+            record = await asyncio.to_thread(
+                recorder.begin_request,
+                solution_image,
+                prompt,
+                uid=row.get("uid"),
+                seed=row.get("_ltx_sample_seed", row.get("seeds", row.get("seed"))),
+                data_source=data_source,
+                settings={
+                    "prompt_key": prompt_key,
+                    "num_frames": num_frames,
+                    "frame_interval": extra_info.get("frame_interval", 4),
+                    "max_batch_size": max_batch_size,
+                    "top_fraction": top_fraction,
+                    "score_cap": score_cap,
+                    "reward_scale": reward_scale,
+                },
+            )
+        try:
+            if record is not None and record["raw_video"]["finite_count"] != record["raw_video"]["numel"]:
+                raise ValueError("HPSv3 raw video contains nonfinite values")
+            images = _select_reward_frames(solution_image, extra_info, num_frames)
+            raw_scores = await _infer_frame_scores(reward_model, images, prompt, max_batch_size, record)
+            raw_score = _aggregate_frame_scores(raw_scores, top_fraction, score_cap)
+            result = {"score": raw_score * reward_scale, "hpsv3_raw": raw_score}
+            if record is not None and not all(math.isfinite(value) for value in result.values()):
+                raise ValueError("HPSv3 aggregated reward contains nonfinite values")
+        except Exception as exc:
+            if record is not None:
+                await asyncio.to_thread(recorder.finish_request, record, error=exc)
+            raise
+        if record is not None:
+            await asyncio.to_thread(recorder.finish_request, record, result=result)
+        return result
 
     checkpoint_path = os.getenv("custom_reward_model_path", model_name)
     assert checkpoint_path is not None, "HPSv3 checkpoint path must be provided via reward.reward_model.model_path"
@@ -744,8 +782,27 @@ class HPSv3Model:
     """Executor-owned HPSv3 inference using the shared loader and preprocessing."""
 
     def __init__(
-        self, model_path: str, device, base_model_path: str = _BASE_MODEL, use_sequential_position_ids: bool = False
+        self,
+        model_path: str,
+        device,
+        base_model_path: str = _BASE_MODEL,
+        use_sequential_position_ids: bool = False,
+        health_check: dict | None = None,
     ) -> None:
+        self._health_probe = None
+        if health_check is not None and type(health_check.get("enabled", False)) is not bool:
+            raise ValueError("HPS health_check.enabled must be a boolean")
+        if health_check and health_check.get("enabled", False):
+            from .hpsv3_health import HPSHealthProbe
+
+            self._health_probe = HPSHealthProbe(
+                health_check,
+                {
+                    "model_path": str(model_path),
+                    "base_model_path": str(base_model_path),
+                    "use_sequential_position_ids": use_sequential_position_ids,
+                },
+            )
         self._inferencer = _HPSv3Inferencer(
             checkpoint_path=model_path,
             base_config=base_model_path,
@@ -753,6 +810,21 @@ class HPSv3Model:
             use_sequential_position_ids=use_sequential_position_ids,
         )
         self._infer_lock = threading.Lock()
+
+    def check_health(self, *, stage: str, context: dict) -> None:
+        if self._health_probe is not None:
+            with self._infer_lock:
+                recorder = self.reward_diagnostics
+                if recorder is not None:
+                    if stage in ("after_load", "after_wake", "before_batch"):
+                        recorder.begin_batch(context)
+                    elif stage in ("before_sleep", "after_batch"):
+                        recorder.finish_batch()
+                self._health_probe.check(self._inferencer, stage=stage, context=context)
+
+    @property
+    def reward_diagnostics(self):
+        return self._health_probe.input_stats if self._health_probe is not None else None
 
     def to(self, device):
         """Move inference state without reloading weights or changing dtype."""
@@ -766,7 +838,29 @@ class HPSv3Model:
         self._inferencer = None
 
     @torch.inference_mode()
-    def infer(self, images: list[Image.Image], prompts: list[str]) -> torch.Tensor:
+    def infer(
+        self, images: list[Image.Image], prompts: list[str], *, diagnostic_request=None, frame_offset=0
+    ) -> torch.Tensor:
         """Return raw frame logits; sampling and aggregation belong to the scorer."""
         with self._infer_lock:
+            if diagnostic_request is not None and self.reward_diagnostics is not None:
+                import numpy as np
+
+                from .hpsv3_health import evaluate_images
+
+                frames = torch.from_numpy(np.stack([np.asarray(image).copy() for image in images])).permute(0, 3, 1, 2)
+                observed = {
+                    "device": str(self._inferencer.device),
+                    "training_modules": [
+                        name for name, module in self._inferencer.model.named_modules() if module.training
+                    ],
+                }
+                try:
+                    evaluate_images(self._inferencer, images, prompts, observed)
+                finally:
+                    self.reward_diagnostics.record_call(diagnostic_request, frames, observed, frame_offset=frame_offset)
+                logits = observed["logits"]
+                if logits.shape != (len(images), 2) or not torch.isfinite(logits).all():
+                    raise ValueError("HPSv3 frame logits must be finite [N,2]")
+                return logits
             return self._inferencer.reward(images, prompts).detach().cpu()

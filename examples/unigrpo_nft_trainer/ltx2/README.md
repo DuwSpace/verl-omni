@@ -520,3 +520,188 @@ The estimate uses rollout tokens and is not a full-vocabulary KL.
 Monitor `actor/text/kl_loss`, `actor/text/weighted_kl_loss`,
 `actor/text/total_loss`, `old_policy/decay`, and
 `old_policy/update_applied` alongside reward and gradient metrics.
+
+## Adapter-only model checkpoints
+
+The joint recipe sets `actor_rollout_ref.actor.checkpoint.save_lora_only=true`.
+Model shards contain both Gemma and DiT adapters, omitting frozen base weights.
+Optimizer, scheduler, RNG, trainer/data-loader state and the paired old/reference
+adapter snapshots remain saved for resume. Restore with the same base model,
+adapter configuration and sharding layout. Existing full-model checkpoints can
+still be loaded; subsequent saves use the adapter-only format. This changes new
+checkpoints only and does not convert existing files.
+
+Override `actor_rollout_ref.actor.checkpoint.save_lora_only=false` to save full
+model shards again. This setting requires the installed verl checkpoint manager
+to support `save_lora_only`. The saved files remain distributed training
+checkpoints, not standalone PEFT `adapter_model.safetensors` exports.
+
+## Optional HPS fixed-input health checks
+
+`reward.models.hpsv3.executor.kwargs.health_check.enabled` defaults to `false`.
+When enabled, the same HPS worker scores fixed raw frames after loading weights,
+after each CPU-to-device restore, and after all scoring requests finish but
+before offload. Resident deployments (`offload=false`) check before and after
+each scoring batch. Checks never contribute samples or scores to training.
+LTX attaches the training step, `train`/`validation` phase and policy version to
+each check. Other callers may supply `batch.meta_info.reward_diagnostics_context`.
+
+First collect trusted raw joint samples using
+`trainer.joint_sample_save_tensors=true`. Select a few low/mid/high scoring
+samples and explicitly prepare a reference in the same runtime environment:
+
+```bash
+python examples/unigrpo_nft_trainer/ltx2/prepare_hps_health_reference.py \
+  --samples /path/to/sample-low.pt /path/to/sample-mid.pt /path/to/sample-high.pt \
+  --model-path "$LTX_REWARD_ROOT/HPSv3/HPSv3.safetensors" \
+  --base-model-path "$LTX_REWARD_ROOT/Qwen2-VL-7B-Instruct" \
+  --device npu:1 --num-frames 5 \
+  --output /path/to/hps-reference.pt
+```
+
+The tool uses the normal processor and strict checkpoint loader, skipping only
+random parameter initialization before checkpoint loading. It stores raw frames,
+original reward prompts, processor tensors, explicit decoder position IDs,
+both columns of frame logits, and parameter/buffer fingerprints. Review the
+reference scores before enabling checks. It refuses to overwrite an existing
+reference; training never creates or updates the baseline. MP4 frames are not
+accepted as raw joint sample files. Match the configured frame batch size and
+position-ID mode (`--no-sequential-position-ids` if that scorer setting is false).
+
+Append these overrides to the normal launch/resume command:
+
+```bash
+reward.models.hpsv3.executor.kwargs.health_check.enabled=true \
+reward.models.hpsv3.executor.kwargs.health_check.baseline_path=/path/to/hps-reference.pt \
+reward.models.hpsv3.executor.kwargs.health_check.output_dir="$LTX_OUTPUT_DIR/hps_health"
+```
+
+All paths must be visible inside the reward workers' environment/container.
+Checks require identical preprocessed input hashes and finite frame logits within
+`atol=0.001, rtol=0.0`; the tolerance can be explicitly overridden after measuring
+normal variability. A mean reward alone is not used as the health criterion.
+The normal cost is two probe passes per scoring batch plus the initial load
+check (one forward per selected sample per pass). No full weight hashing occurs
+during successful checks; baseline creation and failure capture hash the model.
+
+Each worker writes `checks-<pid>.jsonl`. On failure, it first saves
+`failure-*/failure.json` and `probes.pt`, then records model fingerprints,
+changed tensor names, buffers (including nonpersistent ones), and reward-head
+weights. Set `health_check.dump_model_state=true` to additionally save the full
+model, which requires substantial disk and host memory. Capture failures are
+reported in `model_capture_error`. The failed executor rejects further inference
+and wake requests; it does not silently reload or reset its baseline. The
+exception reaches the trainer before that reward batch can be used for an
+optimizer update, while explicit cleanup remains available.
+
+This diagnoses state/input drift under fixed probes; it does not establish
+reward quality for every prompt or guarantee detection of every model change.
+Preserve the failure directory before restarting a failed run.
+
+With health checks enabled, `health_check.input_stats.enabled=true` also records
+actual managed HPS scoring requests. `requests-<pid>.jsonl` contains a unique
+request ID, sample UID/seed (when available), step/phase, the selected reward prompt's hash, raw video
+shape/dtype/range/finite count/hash, frame selection and aggregation settings,
+and each micro-batch's frame offsets, selected-frame hash, processor input
+statistics (including effective position IDs), model device/training mode, both columns of logits and final
+reward. Captures use the actual forward, with no extra model inference. Tensor
+statistics require CPU copies/scans and add overhead when enabled.
+
+`batches-<pid>.jsonl` and the `HPS inputs` console summary report counts, errors,
+mean/min/max reward and changes against the preceding batch of the **same phase**.
+The default `score_drop_threshold=3.0` alerts on an absolute decrease in the mean
+scaled HPS reward, with at least `min_batch_samples=4` successful samples in both
+batches. This is a warning and evidence trigger, not a scorer-failure verdict or
+an automatic training stop. Set the threshold to `null` to disable drop alerts.
+
+Actual raw videos, prompts, selected frames and preprocessed tensors remain in a
+CPU ring buffer, bounded per worker by **all** of `max_batches=2`,
+`max_samples=16`, and `max_bytes=21474836480` (20 GiB of cached tensor payload).
+Those are upper limits, not a guarantee that two full batches fit. Oversize
+samples and evicted samples retain their JSON statistics but no cached tensors;
+`raw_input_cached` describes availability when the request finishes. The memory
+limit does not include temporary preprocessing/statistics tensors or the fixed
+health reference. Normal scoring writes no raw-sample files.
+
+Inference/invalid-input/nonfinite-output errors and drop alerts save the recent
+cache to `input-anomaly-*/recent_requests.pt`, at most `max_anomaly_dumps=2` times
+per worker process. A fixed-probe failure independently saves the cache into its
+`failure-*` directory before model fingerprinting. Preserve these files for exact
+raw-input and micro-batch replay; the anomaly dumps do not launch an independent
+rescoring process automatically. JSON encodes nonfinite diagnostic values as
+strings (`"nan"`, `"inf"`); tensor evidence preserves the original values.
+
+All these knobs are under
+`reward.models.hpsv3.executor.kwargs.health_check.input_stats`. Set its `enabled`
+to `false` to keep only the fixed-probe health checks.
+
+### Text rollout/actor logprob diagnosis
+
+Use this when historical rollout scores disagree with actor old-policy replay.
+Diagnostics are disabled by default. With the same model/data/reward environment
+variables as `run_train.sh`, launch a new diagnostic run with:
+
+```bash
+export LTX_OUTPUT_DIR=/absolute/path/to/new-diagnostic-run
+bash examples/unigrpo_nft_trainer/ltx2/run_text_diagnostics.sh
+```
+
+The wrapper preserves the original launcher's model, data, parallelism, generation
+length, validation schedule and reward settings, and forwards extra CLI overrides.
+It does not resume the historical run automatically. It explicitly transports the
+settings through actor configuration and the native policy RPC, so an existing
+Ray runtime does not need to inherit extra diagnostic environment variables.
+
+Every native worker records **R**, the original generation logprobs, then immediately
+computes **Rprime** for the same original prompt/response token IDs with the actor's
+teacher-forcing implementation. This happens before condition encoding, video
+execution or offload. Every actor rank computes **T** under the corresponding old
+policy at its original call site, before that micro-batch's backward. The text/AV
+forward order is preserved, and the actor does not run an extra old-policy forward.
+If a later micro-batch fails, earlier gradients may exist, but no optimizer step
+is allowed to consume them.
+
+Artifacts are written under `$LTX_OUTPUT_DIR/text_diagnostics`, or the absolute
+`LTX_TEXT_DIAGNOSTIC_DIR` path. Each process has its own directory:
+
+- `policy-<version>.json/.pt`: loaded LoRA, adapter state, all buffers including
+  nonpersistent RoPE, and tensor hashes. Frozen base tensors are hashed on the
+  first version. Native LoRA values and enabled/scaling state are checked against
+  the exported policy after loading, beyond checking the transport file hash.
+- `sample-*.json/.pt`: unique sample ID, policy version, seed, source rollout rank,
+  actor rank, PID/device visibility, original tokens, actual masks, temperature,
+  R/Rprime/T where available, and current LoRA/buffer hashes. Actor metadata links
+  to the original native artifact. Input and score hashes detect transport changes.
+- `failure-*.json/.pt`: first-failure full live Gemma parameters and **all** buffers,
+  saved before restoring actor current weights or restarting native workers.
+  Actor tensors retain FSDP shard coordinates/placements; they are not standalone
+  full-model checkpoints. Native snapshots are unsharded. Numeric mismatch capture
+  is bounded to one full snapshot per process. JSON `complete=true` is written only
+  after its tensor file is saved successfully.
+
+The default trigger is **per-sample** mean absolute logprob error above `0.001`,
+or maximum absolute error above `0.05`, or a nonfinite comparison. These are
+configurable diagnostic triggers, not universal numerical acceptance tolerances:
+
+```bash
+bash examples/unigrpo_nft_trainer/ltx2/run_text_diagnostics.sh \
+  actor_rollout_ref.rollout.ltx_joint.text_diagnostics.mean_abs_threshold=0.001 \
+  actor_rollout_ref.rollout.ltx_joint.text_diagnostics.max_abs_threshold=0.05
+```
+
+With `stop_on_mismatch=true` (the wrapper default), ranks coordinate a stop before
+an optimizer update. A native R/Rprime mismatch saves the original native state
+before raising; actor ranks coordinate when their rollout calls finish. An actor
+mismatch captures all actor shards and requests native snapshots before exiting.
+Successful samples still produce evidence files. Validation produces R/Rprime
+only, since it does not execute actor training. There is one extra full text
+forward per native sample, CPU transfer/hash overhead, and substantial disk/host
+memory cost on a full-model failure capture (across eight replicas this can be
+hundreds of GB). Use a diagnostic run with sufficient capacity.
+
+Interpret the first divergence: R vs Rprime points to the original native
+execution; Rprime vs T with R matching Rprime points to cross-worker state or
+execution differences. Compare tensor hashes **by name**, and compare actor shards
+by their recorded layout, not by rank-level aggregate hashes. These captures
+support a subsequent paired module/MSProbe investigation; they do not themselves
+prove a hardware fault or SDC, and this mode does not collect MSProbe layer dumps.

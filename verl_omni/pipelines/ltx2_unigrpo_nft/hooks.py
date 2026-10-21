@@ -47,6 +47,14 @@ class LTXJointHooks(DiffusionEngineHooks):
         self.policies = LTXJointPolicyState(module)
         self._rollout_backend = None
         self._probe_versions = set()
+        from .text_diagnostics import TextDiagnostics
+
+        settings = getattr(model_config, "ltx_joint", None)
+        self.text_diagnostics = TextDiagnostics(
+            getattr(settings, "text_diagnostics", None),
+            side="actor",
+            source_rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+        )
         device = self._device()
         if device.type == "npu" and "LTX_ACTOR_NPU_MEMORY_FRACTION" in os.environ:
             # CANN kernels also allocate outside PyTorch's caching allocator.
@@ -92,6 +100,7 @@ class LTXJointHooks(DiffusionEngineHooks):
                 sync_timeout_seconds=settings.sync_timeout_seconds,
                 enable_cpu_offload=settings.cpu_offload,
                 vae_use_tiling=settings.vae_use_tiling,
+                text_diagnostics=getattr(settings, "text_diagnostics", None),
             )
             loading = perf_counter() - started
         if device.type != "cpu":
@@ -109,7 +118,19 @@ class LTXJointHooks(DiffusionEngineHooks):
             if len(request_configs) != len(texts) or any(item != request_configs[0] for item in request_configs):
                 raise ValueError("Joint rollout requires uniform sampling settings within each worker batch")
             overrides["sampling_params"] = request_configs[0]
-        results = self._rollout_backend.generate(texts, seeds, version=version, **overrides)
+        if self.text_diagnostics.enabled:
+            from .text_diagnostics import stop_collectively
+
+            # A native diagnostic failure must not strand other actor ranks at
+            # their next FSDP collective. All finish this phase before stopping.
+            error = None
+            try:
+                results = self._rollout_backend.generate(texts, seeds, version=version, **overrides)
+            except Exception as exc:
+                error = f"rollout policy {version}: {type(exc).__name__}: {exc}"
+            stop_collectively(error)
+        else:
+            results = self._rollout_backend.generate(texts, seeds, version=version, **overrides)
         media = DataProto.concat([reward_sample(sample) for sample in results])
         values = dict(media.batch.items())
         # Original data_source/reward_model remain on the trainer's source batch.
@@ -217,6 +238,61 @@ class LTXJointHooks(DiffusionEngineHooks):
     def _ar_batch(self, records):
         return self.module(task="recaption", **self._ar_batch_inputs(records))
 
+    def _validate_text_diagnostic_batches(self, records, micro_size):
+        """Require equal forward/check counts before entering diagnostic collectives."""
+        if self.text_diagnostics.enabled and torch.distributed.is_initialized():
+            counts = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(counts, (len(records), micro_size))
+            if any(count != counts[0] for count in counts):
+                raise RuntimeError(f"Text diagnostics require equal actor batch/micro-batch counts: {counts}")
+
+    def _check_text_diagnostic_batch(self, records, old_logprobs, inputs):
+        """Capture T at its original call site, before this micro-batch's backward.
+
+        The caller still has old installed. Previous micro-batches may already
+        have gradients, but the engine cannot step until this hook returns.
+        """
+        from .text_diagnostics import collective_errors, stop_collectively
+
+        diagnostic = self.text_diagnostics
+        if not diagnostic.enabled:
+            return
+        error, evidence_error = None, False
+        try:
+            self.policies._reshard()
+            diagnostic.policy(self.module.gemma, self.policies.version)
+            for row, record in enumerate(records):
+                row_inputs = {
+                    key: value[row : row + 1] if isinstance(value, torch.Tensor) else value
+                    for key, value in inputs.items()
+                }
+                mask = inputs["response_mask"][row, 1:].cpu()
+                mismatch, artifact = diagnostic.actor(self.module.gemma, record, old_logprobs[row][mask], row_inputs)
+                if mismatch:
+                    error = f"text mismatch policy={record.policy_version}; evidence={artifact}"
+        except Exception as exc:
+            evidence_error = True
+            error = f"text evidence failure: {type(exc).__name__}: {exc}"
+        errors = collective_errors(error)
+        if errors:
+            # All actor ranks save their local old shards. Never condition a
+            # full-model FSDP gather on only the rank that detects a mismatch.
+            dump_error = None
+            try:
+                diagnostic.snapshot(self.module.gemma, "; ".join(errors))
+                if self._rollout_backend is not None:
+                    self._rollout_backend.engine.collective_rpc(
+                        "snapshot_joint_text_failure",
+                        args=("; ".join(errors),),
+                        timeout=self._rollout_backend.timeout,
+                    )
+            except Exception as exc:
+                dump_error = f"failure snapshot incomplete: {type(exc).__name__}: {exc}"
+            # Pairing/I/O errors always stop; warn-only applies solely to a
+            # successfully recorded numerical mismatch.
+            fatal = diagnostic.config.stop_on_mismatch or evidence_error
+            stop_collectively(dump_error or (error if fatal else None))
+
     def _av_batch(self, records, video_clean, audio_clean, video_noise, audio_noise, timesteps):
         if any(record.generation_params != records[0].generation_params for record in records):
             raise ValueError("Joint AV micro-batch requires uniform generation geometry")
@@ -251,12 +327,30 @@ class LTXJointHooks(DiffusionEngineHooks):
         if type(micro_size) is not int or micro_size <= 0:
             raise ValueError("Joint micro-batch size must be a positive integer")
         records = tu.get(data, "ltx_joint_replay")
-        if records is None or len(records) == 0:
-            raise ValueError("Missing exact LTX joint rollout records")
-        for record in records:
-            record.validate()
-            if not self.policies.rollout_started or record.policy_version != self.policies.version:
-                raise ValueError("Rollout policy version differs from frozen old")
+        validation_error = None
+        try:
+            if records is None or len(records) == 0:
+                raise ValueError("Missing exact LTX joint rollout records")
+            for record in records:
+                record.validate()
+                if not self.policies.rollout_started or record.policy_version != self.policies.version:
+                    raise ValueError("Rollout policy version differs from frozen old")
+        except Exception as exc:
+            if not self.text_diagnostics.enabled:
+                raise
+            validation_error = f"invalid text replay: {type(exc).__name__}: {exc}"
+            try:
+                self.text_diagnostics.save(
+                    "invalid-replay",
+                    {"error": validation_error, "policy_version": self.policies.version},
+                    {"records": [asdict(record) for record in records] if records is not None else []},
+                )
+            except Exception as dump_exc:
+                validation_error += f"; replay capture failed: {dump_exc}"
+        if self.text_diagnostics.enabled:
+            from .text_diagnostics import stop_collectively
+
+            stop_collectively(validation_error)
         times = data["train_timesteps"]
         if times.ndim != 2 or times.shape[0] != len(records) or times.shape[1] == 0:
             raise ValueError("Joint train timesteps must be [batch, nonempty steps]")
@@ -284,6 +378,7 @@ class LTXJointHooks(DiffusionEngineHooks):
             rows = ((params["num_frames"] - 1) // 8 + 1) * (params["height"] // 32) * (params["width"] // 32)
             if rows != data["video_latents_clean"].shape[1]:
                 raise ValueError("Clean video latents do not match the recorded generation geometry")
+        self._validate_text_diagnostic_batches(records, micro_size)
         total, metrics = 0.0, {}
         replay_train, replay_rollout = [], []
         started = perf_counter()
@@ -340,7 +435,12 @@ class LTXJointHooks(DiffusionEngineHooks):
             self._synchronize()
             reference_start = perf_counter()
             with self.policies.use("old"):
-                old_logprobs = self._ar_batch(group).detach().cpu()
+                if self.text_diagnostics.enabled:
+                    text_inputs = self._ar_batch_inputs(group)
+                    old_logprobs = self.module(task="recaption", **text_inputs).detach().cpu()
+                    self._check_text_diagnostic_batch(group, old_logprobs, text_inputs)
+                else:
+                    old_logprobs = self._ar_batch(group).detach().cpu()
                 old_predictions = []
                 for step in range(times.shape[1]):
                     capture = (

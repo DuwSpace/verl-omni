@@ -81,12 +81,18 @@ class OmniRewardLoopWorker(RewardLoopWorker):
                 self.native_reward_executors,
             )
 
-    async def wake_up_reward_model(self, model_name: str) -> None:
+    async def wake_up_reward_model(self, model_name: str, context: dict | None = None) -> None:
         try:
             executor = self.native_reward_executors[model_name]
         except KeyError as exc:
             raise ValueError(f"Worker has no native reward model {model_name!r}") from exc
-        await executor.wake_up()
+        if context is None:
+            await executor.wake_up()
+        else:
+            await executor.wake_up(context=context)
+
+    async def check_reward_model_health(self, model_name: str, stage: str, context: dict | None = None) -> None:
+        await self.native_reward_executors[model_name].check_health(stage, context=context)
 
     async def sleep_reward_model(self, model_name: str) -> None:
         try:
@@ -289,7 +295,11 @@ class OmniRewardLoopManager(RewardLoopManager):
         async with self._score_lock:
             scoring_error = None
             try:
-                await self.multi_reward_model_manager.wake_up()
+                context = getattr(data, "meta_info", {}).get("reward_diagnostics_context")
+                if context is None:
+                    await self.multi_reward_model_manager.wake_up()
+                else:
+                    await self.multi_reward_model_manager.wake_up(context=context)
                 return await self._compute_named_model_scores(data)
             except BaseException as exc:
                 scoring_error = exc

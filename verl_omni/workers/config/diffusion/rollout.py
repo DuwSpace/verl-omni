@@ -45,6 +45,8 @@ class LTXJointRolloutConfig(BaseConfig):
     sync_timeout_seconds: int = 600
     cpu_offload: bool = True
     vae_use_tiling: bool = False
+    # Explicitly transported to the native worker; disabled in normal training.
+    text_diagnostics: dict = field(default_factory=dict)
 
     def __post_init__(self):
         import math

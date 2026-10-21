@@ -214,6 +214,20 @@ class LTXJointPipeline(LTX2Pipeline):
                 max_new_tokens=extra["recaption_max_new_tokens"],
                 duration_seconds=(incoming.sampling_params.num_frames - 1) / incoming.sampling_params.frame_rate,
             )
+            text_diagnostic = None
+            diagnostic = getattr(self, "_joint_text_diagnostics", None)
+            if diagnostic is not None and diagnostic.enabled:
+                # Preserve R/R-prime and buffers before condition encoding, AV, or offload.
+                text_diagnostic = diagnostic.rollout(
+                    self.text_encoder,
+                    prompt_ids,
+                    response_ids,
+                    logprobs,
+                    version=version,
+                    seed=seed,
+                    temperature=temperature,
+                    request_id=incoming.request_id,
+                )
             ended_with_eos = int(response_ids[-1]) in eos
             try:
                 text = direct_recaption(response_text, ended_with_eos=ended_with_eos)
@@ -256,6 +270,7 @@ class LTXJointPipeline(LTX2Pipeline):
                 condition_token_ids=condition_ids[0].cpu(),
                 condition_attention_mask=condition_mask[0].cpu(),
                 policy_version=version,
+                text_diagnostic=text_diagnostic,
                 seed=seed,
                 temperature=temperature,
                 eos_token_ids=eos,

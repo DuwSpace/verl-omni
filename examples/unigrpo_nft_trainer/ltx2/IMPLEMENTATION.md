@@ -33,28 +33,91 @@
 
 `LTXJointRayTrainer` 继承 `BagelJointRayTrainer`，复用分组分发等公共能力，并覆盖 LTX 的更新、验证和产物逻辑。
 
-## 3. 一个训练 step 的数据流
+## 3. 端到端主流程
+
+### 3.1 任务发起与初始化
+
+`run_train.sh` 将数据路径、设备数和用户覆盖参数传给 `verl_omni.trainer.main_diffusion`。Hydra 合并并解析配置，入口完成设备与配置检查，再初始化 Ray，由远程 `TaskRunner.run()` 创建数据集、DataLoader、资源池和 Trainer。
+
+算法名 `ltx2_unigrpo_nft` 使 `_get_trainer_cls()` 选择 `LTXJointRayTrainer`。实际继承链为 `LTXJointRayTrainer → BagelJointRayTrainer → NativeRayDiffusionTrainer → PolicyGradientRayTrainer`，训练主循环来自 `NativeRayDiffusionTrainer.fit()`。配置中的 `direct_preference` 不能直接理解为执行 `DirectPreferenceRayTrainer.fit()`。
+
+`init_workers()` 建立 Actor worker group 和 `OmniRewardLoopManager`；Actor 初始化 FSDP 模型、优化器及成对策略状态。进入 `fit()` 后先恢复 checkpoint，再按配置执行训练前验证。LTX 推理由 hooks 持有的 backend 调度，通用的 `checkpoint_manager` 在这条路径中是 `NoOpCheckpointManager`，不负责推理权重同步。
+
+### 3.2 主流程时序图
+
+图中每个 Actor rank 都有自己的 hooks/backend，推理服务端是独立的 vLLM-Omni diffusion worker。为便于阅读，省略各 rank 的重复调用。
+
+```mermaid
+sequenceDiagram
+    actor User as 用户
+    participant Entry as run_train.sh / main_diffusion
+    participant Task as Ray TaskRunner
+    participant Trainer as LTXJointRayTrainer
+    participant AW as Actor worker / FSDP engine
+    participant Infer as LTX backend / vLLM-Omni worker
+    participant Reward as OmniRewardLoopManager / reward workers
+    User->>Entry: 发起任务，传入配置覆盖项
+    Entry->>Entry: Hydra 解析、配置检查、初始化 Ray
+    Entry->>Task: run(config)
+    Task->>Trainer: 构建数据与资源池，init_workers()
+    Trainer->>AW: 初始化模型、优化器和策略状态
+    Trainer->>Reward: 初始化评分 worker
+    Task->>Trainer: fit()
+    Trainer->>AW: 按配置恢复 checkpoint
+    opt 训练前验证
+        Trainer->>Trainer: 固定验证集推理与评分，不反向传播
+    end
+    loop 每个训练 step
+        Trainer->>Trainer: 读取原始任务，分配 uid，重复 n 个候选
+        Trainer->>AW: generate(batch)，携带 seed 和 policy version
+        AW->>Infer: hooks 导出并加载同版本 old Gemma/DiT LoRA
+        Infer->>Infer: Gemma 改写 → 基础编码 → DiT 去噪 → AV 解码
+        Infer-->>AW: 媒体、token/logprob、clean latents、replay
+        AW-->>Trainer: 合并候选结果并恢复原始样本顺序
+        Trainer->>Reward: 媒体 + 原始评分文本
+        Reward->>Reward: 分发评分任务，收集五路分项
+        Reward-->>Trainer: rm_scores 与分项指标
+        Trainer->>Trainer: 构造模态概率、文本 advantage、训练时间步和噪声
+        Trainer->>AW: update_actor(batch)
+        AW->>AW: 多轮 mini-batch：old/ref 前向、current backward、optimizer step
+        AW-->>Trainer: 完成整轮 Actor 更新，返回指标
+        Trainer->>AW: 按计划将 current EMA 更新至 old
+        opt 达到 checkpoint 或验证频率
+            Trainer->>AW: 保存 checkpoint
+            Trainer->>Trainer: 验证使用更新后的 old，重新同步后推理与评分
+        end
+        Trainer->>Trainer: 汇总日志，推进 global_step
+    end
+    Trainer->>AW: finally 关闭 rollout 资源
+```
+
+checkpoint 和验证各自按频率触发，图中同一可选区域不表示二者必须同时发生。训练样本的媒体与评分来自该步优化之前的 rollout；验证样本来自该步 Actor 更新和 old 刷新之后的策略。样本产物可在准备训练 batch 时落盘，不能通过文件写入时间判断其使用了更新前还是更新后的权重。
+
+### 3.3 一个 step 的数据与阶段边界
 
 ```mermaid
 flowchart TD
-    A[原始提示词及原始评分文本] --> B[按 uid 分组 每条生成 n 个候选]
-    B --> C[导出 old Gemma 与 DiT LoRA]
+    A[原始提示词及原始评分文本] --> B[按 uid 分组，每条生成 n 个候选]
+    B --> C[同步 old Gemma 与 DiT LoRA]
     C --> D[Gemma 自回归改写]
     D --> E[冻结基础 Gemma 编码改写文本]
     E --> F[LTX DiT 生成视频和音频]
     F --> G[五路 reward 按原始任务评分]
     G --> H[模态概率与文本分组 advantage]
     H --> I[old 和 ref 无梯度前向]
-    I --> J[文本 GRPO backward 更新 Gemma 梯度]
-    J --> K[AV NFT backward 更新 DiT 梯度]
-    K --> L[梯度累积后 optimizer step]
-    L --> M[整轮 Actor 更新完成 刷新 old EMA]
+    I --> J[文本 GRPO/GSPO backward，累积 Gemma 梯度]
+    J --> K[AV NFT backward，累积 DiT 梯度]
+    K --> L[梯度累积后 optimizer step，更新 current]
+    L --> M[整轮 Actor 更新完成，刷新 old EMA]
     M --> N[按频率保存 checkpoint 和验证]
+    N --> B
 ```
 
-每个候选都保留原始任务、实际生成 token、生成参数、seed、policy version、干净 AV latents 等 replay 信息。训练使用已采样 token 进行 teacher forcing，不在 Actor 更新时重新采样提示词。
+每个候选都保留原始任务、实际生成 token、生成参数、seed、policy version、干净 AV latents 等 replay 信息。训练使用已采样 token 进行 teacher forcing，不在 Actor 更新时重新采样提示词。原始 `prompt_av` 用于生成任务，数据中的 `prompt_v`、`prompt_a` 用作对应模态的评分目标；改写文本不会替换原始 reward 目标。
 
-原始的 `prompt_av` 用于生成任务，数据中的 `prompt_v`、`prompt_a` 用作对应模态的评分目标。改写文本影响媒体生成，但不会替换原始 reward 目标，避免模型通过改变任务描述获得更容易的评分。
+主循环同步等待生成、评分和训练各阶段完成，下一轮 rollout 不与当前 optimizer update 流水重叠。reward 在完整媒体生成后执行，不在去噪中途评分。`OmniRewardLoopManager` 根据配置选择评分执行路径；命名模型路径会分组提交远程评分任务、等待结果并恢复样本顺序，保留五路分项供训练使用。评分器不参与反向传播。
+
+权重更新分为三个时机：mini-batch 的优化器更新 **current**；整轮 `update_actor()` 返回后，Trainer 按计划刷新 **old**；下一次训练或验证生成开始前，hooks/backend 将成对 **old** 权重同步到推理端。reference 始终保持固定。具体同步协议见 4.4 节。
 
 ## 4. 推理过程与对象关系
 
@@ -336,9 +399,88 @@ OmniNFT 以 current/old 构造正、负预测，转换成 x0 重建项，再由�
 
 重建误差采用实现中的自适应归一化，并加上 current/reference 预测之间的 MSE 正则。默认 `β=1`，video/audio 损失权重均为 1，两个 reference MSE 系数均为 `1e-4`。所谓 AV `ref_kl` 指的是该预测 MSE，并非文本概率分布的 KL。
 
-### 6.4 更新顺序
+### 6.4 训练输入与批次层次
 
-每个内部 micro-batch 先完成 old/ref 的无梯度前向，再构建 current 图。文本 loss backward 后进行各训练时间步的 AV loss backward；按样本数和时间步数缩放，最终由 engine 完成梯度累积和 optimizer step。不能在 current forward 与 backward 之间切换 live policy 参数，否则可能破坏 autograd 保存的张量。
+`_prepare_actor_batch()` 将已评分的 rollout 转为训练输入，检查 replay 完整性、策略版本和分数，再通过 `LTXJointLoss.prepare_actor_batch()` 准备两路目标。
+
+| 输入 | 训练侧用途 |
+|---|---|
+| `ltx_joint_replay` | 重放实际 prompt/response token、mask、采样温度、生成几何与策略版本 |
+| `rm_scores`、`uid` | 按同一原始任务的候选组计算信用分配 |
+| `text_advantages[B]` | 每个改写序列的 GRPO/GSPO advantage |
+| `reward_prob[B,T,2]` | 每个训练时间步的视频/音频 NFT 概率 |
+| `train_timesteps[B,T]` | 模型尺度的训练时间步，要求有限且在 `(0,1000]` |
+| video/audio clean latents 与 forward noise | 构造相同的加噪输入，供 current/old/reference 比较 |
+
+这里 `B` 是候选样本数，`T` 是选取的训练时间步数，不是生成视频帧数，也不是完整 rollout 去噪步数。训练会对 clean latent 重新加噪计算目标，不反传完整生成轨迹。
+
+Trainer 将 batch 转为 TensorDict，并传入 `ppo_epochs`、`ppo_mini_batch_size`、shuffle 与 DataLoader seed。`ppo_mini_batch_size` 按完整的“改写 + 音视频候选”计数，不按原始 prompt 数计数。worker 按数据并行大小划分本地 mini-batch，engine 再调用联合 hooks，hooks 内按 `ppo_micro_batch_size_per_gpu` 拆分。
+
+一次训练 step 可以包含多轮 epoch、多个 optimizer step；每个 micro-batch 内有一次文本 backward 和 `T` 次 AV backward，它们共同累积到当前 mini-batch 的梯度。old/reference 在整轮 Actor 更新期间不随各 mini-batch 改变。
+
+### 6.5 训练侧时序图
+
+```mermaid
+sequenceDiagram
+    participant Trainer as LTXJointRayTrainer
+    participant Worker as Actor worker / train_mini_batch
+    participant Engine as DiffusersFSDPEngine
+    participant Hooks as LTXJointHooks
+    participant Policy as PairedPolicyState
+    participant Model as Gemma / LTX DiT
+    participant Loss as LTXJointLoss
+    Trainer->>Trainer: 准备 replay、advantage、reward_prob、时间步与噪声
+    Trainer->>Worker: update_actor(TensorDict)
+    loop ppo_epochs × mini-batches
+        Worker->>Engine: train_batch(local mini-batch)
+        Engine->>Engine: 清空本次更新的梯度
+        Engine->>Hooks: forward_backward_batch()
+        Hooks->>Hooks: 检查策略版本、形状和有限值
+        loop 内部 micro-batches
+            Hooks->>Policy: use(old)
+            Policy->>Model: 临时安装 old LoRA，无梯度
+            Hooks->>Model: 重算 token logprob 和各时间步 AV 预测
+            Model-->>Hooks: old 结果缓存到 CPU
+            Hooks->>Policy: 退出 old，恢复 current；进入 use(ref)
+            Policy->>Model: 临时安装 reference LoRA，无梯度
+            Hooks->>Model: 计算 reference logprob（启用 KL 时）和 AV 预测
+            Model-->>Hooks: reference 结果缓存到 CPU
+            Hooks->>Policy: 退出 reference，恢复 current
+            Hooks->>Model: current Gemma teacher forcing
+            Model-->>Hooks: current token logprob
+            Hooks->>Loss: text_loss(current, old, advantage, mask, ref)
+            Loss-->>Hooks: 文本策略损失与参考 KL
+            Hooks->>Model: 按样本比例缩放后 backward，累积 Gemma LoRA 梯度
+            loop T 个训练时间步
+                Hooks->>Model: 基础条件编码、构造加噪 latent、current DiT 前向
+                Model-->>Hooks: current AV 预测
+                Hooks->>Loss: av_loss(current, old, ref, x0, xt, sigma, probability)
+                Loss-->>Hooks: 视频/音频 NFT 与参考 MSE
+                Hooks->>Model: 按样本比例及 1/T 缩放后 backward
+            end
+        end
+        Hooks-->>Engine: 累积梯度完成，返回 loss 与诊断指标
+        Engine->>Engine: 梯度裁剪；有限时 optimizer.step 更新 current
+        Engine-->>Worker: 本 mini-batch 指标
+        opt 整轮最后一个 mini-batch
+            Worker->>Engine: lr_scheduler_step()
+        end
+    end
+    Worker-->>Trainer: 整轮训练结果
+    Trainer->>Worker: 按 interval 和 decay 刷新 old EMA
+```
+
+### 6.6 前向、反向与优化器边界
+
+每个内部 micro-batch 必须先完成 old/ref 的无梯度前向，再构建 current 图。old/ref 预测缓存到 CPU，当前损失计算时再移动到对应设备。不能在 current forward 与 backward 之间切换 live policy 参数，否则可能破坏 autograd 保存的张量。
+
+文本分支对实际生成的 response token 做 teacher forcing，以 Actor 重算的 old logprob 为概率比分母，按 response mask 排除 prompt/padding，计算 GRPO/GSPO 和参考 KL。其 backward 只更新 Gemma LoRA 的梯度。
+
+AV 分支对每个训练时间步，以相同 clean latent、噪声和条件分别比较三种策略预测。条件编码始终使用关闭 LoRA 的基础 Gemma，且不建立梯度图；current DiT 的 NFT 与参考 MSE 损失只向 DiT LoRA 反传。reward 数值和离散采样 token 均不参与反向传播。
+
+设本地 mini-batch 有 `M` 个样本，当前 micro-batch 有 `m` 个样本，hooks 将文本 loss 乘以 `m/M`，将每个时间步的 AV loss 乘以 `m/(M×T)` 后 backward。这样 micro-batch 和时间步循环实现平均目标的梯度累积；hooks 自身不调用 optimizer.step。
+
+engine 完成梯度裁剪并取得梯度范数：有限时执行 optimizer.step，非有限时清空梯度并跳过该次参数更新。worker 仅在整轮最后一个 mini-batch 后推进学习率 scheduler；这是当前实现的调度粒度，不是每次 backward 都推进。整轮返回后 Trainer 才执行 old 的 EMA 更新，下一次生成前再同步推理权重。
 
 ## 7. current、old、reference 与权重同步
 

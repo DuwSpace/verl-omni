@@ -50,6 +50,8 @@ class LTXJointReplay:
     response_text: str | None = None
     # Old replay dictionaries default to the historical two-section protocol.
     response_format: str = "planned"
+    # Same-run native text evidence. Optional for historical replay compatibility.
+    text_diagnostic: dict | None = None
 
     def validate(self):
         if not self.original_prompt.strip() or not self.recaption.strip():

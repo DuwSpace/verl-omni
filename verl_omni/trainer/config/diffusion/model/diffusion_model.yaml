@@ -199,6 +199,8 @@ ltx_joint:
   # Tile native VAE decoding to reduce memory.
   vae_use_tiling: ${oc.select:actor_rollout_ref.rollout.ltx_joint.vae_use_tiling,false}
 
+  text_diagnostics: ${actor_rollout_ref.rollout.ltx_joint.text_diagnostics}
+
 # Rollout Algorithm configuration
 algo:
 

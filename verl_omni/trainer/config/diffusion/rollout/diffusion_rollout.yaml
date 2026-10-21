@@ -263,6 +263,14 @@ ltx_joint:
   # Tile native VAE decoding to reduce memory.
   vae_use_tiling: false
 
+  # Same-run text R/R-prime/T capture, including all actor and rollout ranks.
+  text_diagnostics:
+    enabled: false
+    output_dir: ""
+    mean_abs_threshold: 0.001
+    max_abs_threshold: 0.05
+    stop_on_mismatch: true
+
 # Rollout Algorithm configuration
 algo:
 

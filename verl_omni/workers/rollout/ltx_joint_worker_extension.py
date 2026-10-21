@@ -125,7 +125,15 @@ class LTXJointWorkerExtension:
 
         return CustomPipelineWorkerExtension.re_init_pipeline(self, custom_pipeline_args)
 
-    def load_joint_lora_bundle(self, directory):
+    def snapshot_joint_text_failure(self, reason):
+        """Save live native parameters and nonpersistent buffers without reloading."""
+        pipeline = self.model_runner.pipeline
+        diagnostic = getattr(pipeline, "_joint_text_diagnostics", None)
+        if diagnostic is None or not diagnostic.enabled:
+            raise RuntimeError("Native text diagnostics were not enabled")
+        return diagnostic.snapshot(pipeline.text_encoder, reason)
+
+    def load_joint_lora_bundle(self, directory, text_diagnostics=None, source_rank=None):
         from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
         from safetensors.torch import load_file
         from vllm.lora.request import LoRARequest
@@ -155,6 +163,14 @@ class LTXJointWorkerExtension:
         if result.unexpected_keys or any("lora_" in key for key in result.missing_keys):
             raise ValueError("Gemma LoRA did not load exactly")
         pipeline.text_encoder.requires_grad_(False)
+        if text_diagnostics is not None:
+            from verl_omni.pipelines.ltx2_unigrpo_nft.text_diagnostics import TextDiagnostics
+
+            if not hasattr(pipeline, "_joint_text_diagnostics"):
+                pipeline._joint_text_diagnostics = TextDiagnostics(
+                    text_diagnostics, side="rollout", source_rank=source_rank
+                )
+            pipeline._joint_text_diagnostics.policy(pipeline.text_encoder, version, expected=weights)
         request = LoRARequest(
             lora_name=f"ltx-joint-{version}", lora_int_id=version + 1, lora_path=str(directory / "dit")
         )

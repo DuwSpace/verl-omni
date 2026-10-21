@@ -48,6 +48,20 @@ def _config():
     )
 
 
+@pytest.mark.parametrize("evaluating,phase,version", [(False, "train", 27), (True, "validation", 28)])
+def test_reward_health_context_identifies_step_and_phase(monkeypatch, evaluating, phase, version):
+    trainer = object.__new__(LTXJointRayTrainer)
+    trainer.global_steps, trainer._evaluating = 14, evaluating
+    batch = DataProto.from_dict(tensors={"responses": torch.zeros(1, 1)})
+
+    def score(self, data):
+        assert data.meta_info["reward_diagnostics_context"] == {"step": 14, "phase": phase, "policy_version": version}
+        return "scored"
+
+    monkeypatch.setattr(NativeRayDiffusionTrainer, "_compute_reward_colocate", score)
+    assert trainer._compute_reward_colocate(batch) == "scored"
+
+
 def test_ltx_route_and_grouped_dispatch_preserve_seed_and_version(monkeypatch):
     config = _config()
     LTXJointRayTrainer.validate_joint_config(config)

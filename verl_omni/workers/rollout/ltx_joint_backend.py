@@ -37,6 +37,7 @@ class LTXJointVllmBackend:
         sync_timeout_seconds,
         enable_cpu_offload=True,
         vae_use_tiling=False,
+        text_diagnostics=None,
     ):
         from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
         from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -49,6 +50,7 @@ class LTXJointVllmBackend:
         self.lora_request = None
         self._actor_policy_root = None
         self._coordination_group = None
+        self.text_diagnostics = dict(text_diagnostics or {})
         multiprocessing.set_start_method("spawn", force=True)
         with independent_rollout_port():
             config = OmniDiffusionConfig(
@@ -126,7 +128,13 @@ class LTXJointVllmBackend:
         version = manifest["policy_version"]
         # Disable local admission until every native worker acknowledges the pair.
         self.policy_version = None
-        replies = self.engine.collective_rpc("load_joint_lora_bundle", args=(str(directory),), timeout=self.timeout)
+        args = (str(directory),)
+        diagnostics = getattr(self, "text_diagnostics", {})
+        if diagnostics.get("enabled", False):
+            import torch.distributed as dist
+
+            args += (diagnostics, dist.get_rank() if dist.is_initialized() else 0)
+        replies = self.engine.collective_rpc("load_joint_lora_bundle", args=args, timeout=self.timeout)
         if not replies or any(
             reply["policy_version"] != version or reply["components"] != manifest["components"] for reply in replies
         ):

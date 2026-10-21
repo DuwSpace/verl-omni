@@ -38,6 +38,21 @@ reward:
         model: verl_omni.utils.reward_score.hpsv3_reward:HPSv3Model
         kwargs:
           use_sequential_position_ids: true
+          health_check:
+            enabled: false
+            baseline_path: null
+            output_dir: null
+            atol: 0.001
+            rtol: 0.0
+            dump_model_state: false
+            input_stats:
+              enabled: true
+              max_samples: 16
+              max_batches: 2
+              max_bytes: 21474836480
+              max_anomaly_dumps: 2
+              score_drop_threshold: 3.0
+              min_batch_samples: 4
     audiobox:
       backend: native
       offload: true
