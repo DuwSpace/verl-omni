@@ -26,22 +26,17 @@ class Component(torch.nn.Linear):
         return self(value)
 
 
-def test_loaded_components_keep_cpu_masters_without_resetting_new_adapters():
+def test_loaded_components_keep_current_weights_without_cpu_masters():
     from verl_omni.pipelines.ltx2_unigrpo_nft.vllm_omni_rollout_adapter import LTXJointPipeline
-    from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
 
     pipeline = object.__new__(LTXJointPipeline)
     torch.nn.Module.__init__(pipeline)
     for name in JointRolloutOffload.component_names:
         setattr(pipeline, name, Component(2, 2).requires_grad_(False))
-    # Gemma already has its master; other components are captured only after
-    # the native loader has assigned their checkpoint tensors.
-    gemma_master = FrozenCpuWeights(pipeline.text_encoder)
-    pipeline.text_encoder._joint_cpu_weights = gemma_master
     pipeline.transformer.weight = torch.nn.Parameter(torch.full((2, 2), 7.0), requires_grad=False)
     expected = {name: getattr(pipeline, name).weight.detach().clone() for name in JointRolloutOffload.component_names}
     pipeline.enable_omni_model_cpu_offload(device="cpu", pin_memory=False, use_hsdp=False)
-    assert pipeline.text_encoder._joint_cpu_weights is gemma_master
+    assert not hasattr(pipeline.text_encoder, "_joint_cpu_weights")
     controller = pipeline._joint_offload
     for name in JointRolloutOffload.component_names:
         component = getattr(pipeline, name)
@@ -49,12 +44,12 @@ def test_loaded_components_keep_cpu_masters_without_resetting_new_adapters():
         component.register_parameter("policy_adapter", torch.nn.Parameter(torch.ones(2), requires_grad=False))
         component.weight.data = component.weight.detach().clone()
         with torch.no_grad():
-            component.weight.zero_()
+            component.weight.add_(2)
             component.policy_adapter.fill_(3)
     controller.release()
     for name in JointRolloutOffload.component_names:
         component = getattr(pipeline, name)
-        torch.testing.assert_close(component.weight, expected[name], rtol=0, atol=0)
+        torch.testing.assert_close(component.weight, expected[name] + 2, rtol=0, atol=0)
         torch.testing.assert_close(component.policy_adapter, torch.full((2,), 3.0), rtol=0, atol=0)
     pipeline.enable_omni_model_cpu_offload(device="cpu", pin_memory=False, use_hsdp=False)
     assert pipeline._joint_offload is controller
@@ -195,33 +190,6 @@ def test_offload_sidecars_remain_mutable_for_next_policy_rpc():
             tensor[0].copy_(torch.ones(2, 2))
 
 
-def test_versioned_adapters_restore_cpu_slots_and_accept_next_policy():
-    from verl_omni.pipelines.ltx2_unigrpo_nft.offload import AdapterCpuWeights
-
-    module = Component(2, 2)
-    module.register_parameter("lora_weight", torch.nn.Parameter(torch.full((2, 2), 3.0)))
-    module.lora_a_stacked = (torch.full((1, 2, 2), 5.0),)
-    module.lora_b_stacked = (torch.full((1, 2, 2), 7.0),)
-    master = AdapterCpuWeights(module, 1)
-    # Device copies are independent; damage must not overwrite the CPU policy.
-    module.lora_weight.data = torch.zeros_like(module.lora_weight)
-    module.lora_a_stacked = (torch.zeros_like(module.lora_a_stacked[0]),)
-    with pytest.raises(RuntimeError, match="policy=1"):
-        master.check()
-    master.restore_host()
-    torch.testing.assert_close(module.lora_weight, torch.full((2, 2), 3.0), rtol=0, atol=0)
-    torch.testing.assert_close(module.lora_a_stacked[0], torch.full((1, 2, 2), 5.0), rtol=0, atol=0)
-    with pytest.raises(RuntimeError, match="policy=1"):
-        master.check()  # corrupted policy stays failed even after restoring it
-    with torch.no_grad():
-        module.lora_weight.fill_(9)
-    module.lora_a_stacked = (torch.full((1, 4, 2), 11.0),)  # native rank resize
-    newer = AdapterCpuWeights(module, 2)
-    newer.check(master=True)
-    newer.check()
-    assert newer.version == 2
-
-
 def test_policy_commit_is_atomic_and_activation_waits_for_matching_version():
     pipeline = SimpleNamespace(**{name: Component(2, 2) for name in JointRolloutOffload.component_names})
     controller = JointRolloutOffload(pipeline, "cpu")
@@ -230,20 +198,16 @@ def test_policy_commit_is_atomic_and_activation_waits_for_matching_version():
         controller.activate("text_encoder")
     with pytest.raises(ValueError, match="matching"):
         controller.commit_policy_update(4)
-    pipeline.text_encoder.register_parameter("lora_weight", torch.nn.Parameter(torch.ones(2)))
-    pipeline.transformer.lora_a_stacked = (torch.ones(2, device="meta"),)
-    with pytest.raises(ValueError, match="on CPU"):
-        controller.commit_policy_update(3)
     assert controller.policy_version == -1
-    assert not hasattr(pipeline.text_encoder, "_joint_adapter_cpu_weights")
-    pipeline.transformer.lora_a_stacked = (torch.ones(2),)
     controller.commit_policy_update(3)
     controller.activate("text_encoder")
     assert controller.active == "text_encoder"
-    assert pipeline.text_encoder._joint_adapter_cpu_weights.version == 3
+    assert not hasattr(pipeline.text_encoder, "_joint_adapter_cpu_weights")
+    with pytest.raises(ValueError, match="versions must increase"):
+        controller.begin_policy_update(3)
 
 
-def test_failed_device_validation_does_not_activate_component(monkeypatch):
+def test_failed_device_transfer_does_not_activate_component(monkeypatch):
     pipeline = SimpleNamespace(**{name: Component(2, 2) for name in JointRolloutOffload.component_names})
     controller = JointRolloutOffload(pipeline, "cpu")
 
@@ -255,28 +219,3 @@ def test_failed_device_validation_does_not_activate_component(monkeypatch):
     with pytest.raises(RuntimeError, match="integrity failure"):
         controller.activate("text_encoder")
     assert controller.active is None
-
-
-def test_adapter_sidecar_host_storage_is_restored_before_native_setter():
-    from verl_omni.pipelines.ltx2_unigrpo_nft.offload import AdapterCpuWeights
-
-    class NativeLora(Component):
-        def _set_diffusion_lora_buffer_device(self, device):
-            # The setter must already see the saved host values, never the
-            # damaged disposable working copy.
-            torch.testing.assert_close(self.lora_a_stacked[0], torch.full((1, 2, 2), 5.0), rtol=0, atol=0)
-            self.lora_a_stacked = tuple(value.to(device) for value in self.lora_a_stacked)
-            self.lora_b_stacked = tuple(value.to(device) for value in self.lora_b_stacked)
-
-    module = NativeLora(2, 2)
-    module.register_parameter("lora_weight", torch.nn.Parameter(torch.full((2,), 3.0)))
-    module.lora_a_stacked = (torch.full((1, 2, 2), 5.0),)
-    module.lora_b_stacked = (torch.full((1, 2, 2), 7.0),)
-    module._joint_adapter_cpu_weights = AdapterCpuWeights(module, 1)
-    host_ptr = module.lora_a_stacked[0].data_ptr()
-    # Keep registered parameter identity, simulate a different working storage.
-    module.lora_weight.data = torch.zeros_like(module.lora_weight)
-    module.lora_a_stacked = (torch.zeros_like(module.lora_a_stacked[0]),)
-    JointRolloutOffload._move(module, torch.device("cpu"))
-    assert module.lora_a_stacked[0].data_ptr() == host_ptr
-    torch.testing.assert_close(module.lora_weight, torch.full((2,), 3.0), rtol=0, atol=0)

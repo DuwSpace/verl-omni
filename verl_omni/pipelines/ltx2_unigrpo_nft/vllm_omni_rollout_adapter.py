@@ -81,27 +81,13 @@ class LTXJointPipeline(LTX2Pipeline):
             component = getattr(self, name, None)
             if isinstance(component, torch.nn.Module):
                 component.requires_grad_(False)
-        from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
-
-        # Gemma has already loaded its checkpoint; the DiT loader runs later.
-        self.text_encoder._joint_cpu_weights = FrozenCpuWeights(self.text_encoder)
 
     def enable_omni_model_cpu_offload(self, *, device, pin_memory, use_hsdp):
-        from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
-
         from .offload import JointRolloutOffload
 
         if use_hsdp:
             raise ValueError("Joint rollout component offload requires an unsharded worker")
         if getattr(self, "_joint_offload", None) is None:
-            # The native runner calls this AFTER checkpoint loading and BEFORE
-            # creating the LoRA manager. Never capture an uninitialized DiT or
-            # include later-injected mutable policy adapters in its base master.
-            for name in JointRolloutOffload.component_names:
-                component = getattr(self, name)
-                if getattr(component, "_joint_cpu_weights", None) is None:
-                    component.requires_grad_(False)
-                    component._joint_cpu_weights = FrozenCpuWeights(component)
             self._joint_offload = JointRolloutOffload(self, device)
 
     def disable_omni_model_cpu_offload(self):

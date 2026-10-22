@@ -433,7 +433,7 @@ def test_native_sync_verifies_actual_loaded_lora(
             assert worker.snapshot_joint_text_failure("manual test")
         if with_offload:
             assert pipeline._joint_offload.policy_version == 1
-            assert pipeline.text_encoder._joint_adapter_cpu_weights.version == 1
+            assert not hasattr(pipeline.text_encoder, "_joint_adapter_cpu_weights")
 
 
 def test_actor_masks_preserve_variable_length_sample_pairing(model, tmp_path):

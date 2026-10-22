@@ -25,6 +25,8 @@ from PIL import Image
 from transformers import AutoConfig, AutoProcessor, Qwen2VLForConditionalGeneration
 from verl.utils.device import get_device_name
 
+from verl_omni.utils.transfer_sync import move_module
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
@@ -810,9 +812,6 @@ class HPSv3Model:
             use_sequential_position_ids=use_sequential_position_ids,
         )
         self._infer_lock = threading.Lock()
-        from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
-
-        self._cpu_weights = FrozenCpuWeights(self._inferencer.model)
         self.to(device)
 
     def check_health(self, *, stage: str, context: dict) -> None:
@@ -831,16 +830,15 @@ class HPSv3Model:
         return self._health_probe.input_stats if self._health_probe is not None else None
 
     def to(self, device):
-        """Load from CPU masters; discard device weights instead of copying back."""
+        """Move the current model weights with a blocking device transfer."""
         with self._infer_lock:
-            self._cpu_weights.move(self._inferencer.model, device)
+            move_module(self._inferencer.model, device)
             self._inferencer.device = torch.device(device)
         return self
 
     def close(self) -> None:
         """Release the inferencer; reuse requires a new adapter."""
         self._inferencer = None
-        self._cpu_weights = None
 
     @torch.inference_mode()
     def infer(

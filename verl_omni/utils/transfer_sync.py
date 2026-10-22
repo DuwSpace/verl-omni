@@ -42,3 +42,12 @@ def synchronized_device_transfer(*devices):
         finally:
             for device, api in accelerators.items():
                 api.synchronize(device)
+
+
+@torch.inference_mode(False)
+@torch.no_grad()
+def move_module(module, device):
+    """Move current parameters and buffers without retaining a CPU master."""
+    sources = {value.device for value in (*module.parameters(), *module.buffers())}
+    with synchronized_device_transfer(*sorted(sources, key=str), device):
+        return module.to(device, non_blocking=False)
