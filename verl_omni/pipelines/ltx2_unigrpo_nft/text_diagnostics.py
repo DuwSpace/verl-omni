@@ -29,7 +29,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
-from verl_omni.utils.frozen_cpu_weights import tensor_digest
+from verl_omni.utils.weight_integrity import tensor_digest
 
 
 @dataclass(frozen=True)

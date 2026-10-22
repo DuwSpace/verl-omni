@@ -43,14 +43,14 @@
 
 ### 2.1 权重搬运与保留的检查
 
-`offload.py` 集中管理六个 rollout 组件以及 `AdapterCpuWeights`。冻结权重的通用实现位于 [frozen_cpu_weights.py](../../../verl_omni/utils/frozen_cpu_weights.py)，rollout 和 reward 共用；Actor/FSDP 的参数存储仍由训练引擎管理。
+本分支使用 `torch.zeros(shape, dtype, device)` 分配目标存储，再用阻塞 `copy_` 做双向搬运，不保留冻结权重或 LoRA 的 CPU 主副本。`offload.py` 管理六个 rollout 组件；五个 reward 模型通过 `transfer_sync.move_module` 迁移。Actor/FSDP 的参数存储仍由训练引擎管理。
 
-- 冻结参数和持久 buffer 保留 CPU 主副本。激活组件时校验 CPU 哈希、同步搬运，再逐块比较设备权重与 CPU 副本；卸载时恢复 CPU 存储，丢弃设备权重。非持久动态缓存仍走普通迁移。
-- Gemma 与 DiT 的 LoRA 在同一版本全部加载完成后，才发布 CPU 快照；更新未完成时禁止执行 rollout。原生 LoRA sidecar 也由同一驻留控制器管理。
+- 卸载时将当前设备权重 D2H，激活时再 H2D；D2H 的 CPU 目标页先被 zeros 写入，再接收设备数据；H2D 也使用 zeros + copy_。迁移前后同步设备。DTensor 只拷贝 `to_local()` 分片并保留原始 spec，不做重分片。原生 LoRA sidecar 也迁移，且保持可写，供下一次策略加载使用。
+- Gemma 与 DiT 的 LoRA 在同一版本全部加载完成后才发布版本；更新未完成时禁止执行 rollout。
 - 文本检查保留在 `text_diagnostics.py`：R 是生成时记录的 logprob，R′ 是 rollout 同策略重算，T 是 Actor old-policy 重算。对比必须对应相同 token、mask 和 policy version。配置入口仍为 `actor_rollout_ref.rollout.ltx_joint.text_diagnostics`。
 - HPS 健康检查保留，配置入口仍为 `reward.models.hpsv3.executor.kwargs.health_check`；它验证固定样本的评分行为，与文本对拍相互独立。
 
-已删除针对 Gemma 第 47 层的临时 `weight_guard.py`、AV/MSProbe 对拍 RPC、专用启动脚本和配置。旧启动命令需去掉 `text_diagnostics.frozen_weight_guard` 覆盖项；常规文本检查和 HPS 检查参数不变。历史输出与证据不随清理删除。全量权重搬运校验不依赖文本诊断开关，仍保留在组件激活边界；这些校验能够检测差异，不能证明底层传输绝不会出错。
+已删除针对 Gemma 第 47 层的临时 `weight_guard.py`、AV/MSProbe 对拍 RPC、专用启动脚本和配置。旧启动命令需去掉 `text_diagnostics.frozen_weight_guard` 覆盖项；常规文本检查和 HPS 检查参数不变。历史输出与证据不随清理删除。本实验分支取消依赖 CPU 主副本的全量搬运比对；文本对拍和 HPS 固定输入检查仍可开启。这是传输路径对照实验，不代表已消除偶发损坏。
 
 `LTXJointRayTrainer` 继承 `BagelJointRayTrainer`，复用分组分发等公共能力，并覆盖 LTX 的更新、验证和产物逻辑。
 

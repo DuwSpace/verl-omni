@@ -84,7 +84,7 @@ def test_joint_offload_fences_unregistered_sidecars_before_replacement(accelerat
 
     events, _ = accelerator
 
-    class Module:
+    class Module(torch.nn.Module):
         # Even if registered weights are already on CPU, the native sidecar
         # source device must be synchronized before its storage is replaced.
         lora_a_stacked = (SimpleNamespace(device=torch.device("cuda:4")),)
@@ -99,9 +99,9 @@ def test_joint_offload_fences_unregistered_sidecars_before_replacement(accelerat
         def modules(self):
             return iter([self])
 
-        def to(self, device, *, non_blocking):
-            assert non_blocking is False
-            events.append(("copy", str(device)))
+        def _apply(self, fn, recurse=True):
+            events.append(("copy", "cpu"))
+            return super()._apply(fn, recurse=recurse)
 
     JointRolloutOffload._move(Module(), torch.device("cpu"))
     assert events == [

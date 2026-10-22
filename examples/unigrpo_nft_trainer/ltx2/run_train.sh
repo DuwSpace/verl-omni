@@ -35,7 +35,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     reward.num_workers="$ltx_devices" \
     actor_rollout_ref.rollout.ltx_joint.cpu_offload=true \
     reward.models.hpsv3.executor.kwargs.health_check.enabled=true \
-    reward.models.hpsv3.executor.kwargs.health_check.baseline_path=/repo/outputs/hps-health-check-20261021/reference.pt \
+    reward.models.hpsv3.executor.kwargs.health_check.baseline_path=/repo/outputs/hps-health-check-20261022-deterministic/reference.pt \
     reward.models.hpsv3.executor.kwargs.health_check.output_dir=/repo/outputs/ltx-joint-20261019-084556/hps_health \
     "${memory_overrides[@]}" \
     "$@" 2>&1 | tee "$LTX_OUTPUT_DIR/train.log"

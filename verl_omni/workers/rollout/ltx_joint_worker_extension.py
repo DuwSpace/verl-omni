@@ -151,7 +151,7 @@ class LTXJointWorkerExtension:
     def _verify_gemma_adapter(self, weights, version):
         """Compare actual loaded Gemma LoRA against the bundle before publication."""
         pipeline = self.model_runner.pipeline
-        from verl_omni.utils.frozen_cpu_weights import first_different_byte_block
+        from verl_omni.utils.weight_integrity import first_different_byte_block
 
         # This is part of policy publication, independent of optional text
         # diagnostics. Compare the loaded CPU adapter against the bundle.
