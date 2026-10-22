@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One differentiable Gemma/connector/DiT module for joint LoRA training."""
+"""Actor model: Gemma text policy, frozen AV conditioning, and trainable DiT LoRA."""
 
 import math
+from contextlib import contextmanager
 
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -79,8 +80,7 @@ class LTXJointModel(NonDiffusersModelBase):
     _keep_in_fp32_modules = ["gemma"]
 
     def __init__(self, gemma, transformer, connectors):
-        from .connector_attention import install_native_connector_attention
-        from .dit_attention import install_native_dit_attention
+        from .attention import install_native_connector_attention, install_native_dit_attention
 
         super().__init__()
         self.gemma = gemma
@@ -103,8 +103,11 @@ class LTXJointModel(NonDiffusersModelBase):
         from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
         from transformers import Gemma3ForConditionalGeneration
 
+        gemma_kwargs = dict(kwargs)
+        # Match the rollout's explicit Transformers SDPA backend.
+        gemma_kwargs.setdefault("attn_implementation", "sdpa")
         gemma = Gemma3ForConditionalGeneration.from_pretrained(
-            model_path, subfolder="text_encoder", torch_dtype=torch.float32, **kwargs
+            model_path, subfolder="text_encoder", torch_dtype=torch.float32, **gemma_kwargs
         )
         transformer = LTX2VideoTransformer3DModel.from_pretrained(
             model_path, subfolder="transformer", torch_dtype=torch_dtype, **kwargs
@@ -152,8 +155,6 @@ class LTXJointModel(NonDiffusersModelBase):
     @torch.no_grad()
     def encode_condition(self, input_ids, attention_mask):
         """Match LTX's stack-all-Gemma-layers layout without computing vocabulary logits."""
-        from .adapters import base_encoder
-
         with base_encoder(self.gemma):
             output = self.gemma.model.language_model(
                 input_ids=input_ids,
@@ -222,3 +223,26 @@ class LTXJointModel(NonDiffusersModelBase):
             audio_encoder_attention_mask=mask,
             return_dict=False,
         )
+
+
+@contextmanager
+def base_encoder(model):
+    """Use unmerged base weights without changing FSDP's trainable parameter set.
+
+    PEFT enable_adapters(False) also changes requires_grad. Only scope its
+    forward flag here: planning may already have a live autograd graph, and
+    the optimizer must continue owning the same LoRA parameters.
+    """
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
+    layers = [layer for layer in model.modules() if isinstance(layer, BaseTunerLayer)]
+    if any(layer.merged for layer in layers):
+        raise RuntimeError("Frozen Gemma encoding requires unmerged LoRA weights")
+    states = [layer.disable_adapters for layer in layers]
+    try:
+        for layer in layers:
+            layer._disable_adapters = True
+        yield
+    finally:
+        for layer, disabled in zip(layers, states, strict=True):
+            layer._disable_adapters = disabled

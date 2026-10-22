@@ -423,12 +423,15 @@ async def test_new_audio_scorers_do_not_inherit_clap_rate_default(scorer):
     [videoalign.VideoAlignModel, hpsv3_reward.HPSv3Model, audiobox.AudioBoxModel, clap.CLAPModel, desync.DeSyncModel],
 )
 def test_native_model_device_transfer_keeps_weights_and_preprocessing(cls):
+    from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
+
     wrapper = object.__new__(cls)
     wrapper._infer_lock = threading.Lock()
     module = torch.nn.Linear(2, 2).to(torch.bfloat16)
     module.register_buffer("statistics", torch.ones(2, dtype=torch.float32))
     weights = module.weight.detach().clone()
     processor = object()
+    wrapper._cpu_weights = FrozenCpuWeights(module.requires_grad_(False))
     if cls is hpsv3_reward.HPSv3Model:
         wrapper._inferencer = SimpleNamespace(model=module, processor=processor, device="cpu")
         owner = wrapper._inferencer
@@ -439,6 +442,7 @@ def test_native_model_device_transfer_keeps_weights_and_preprocessing(cls):
         owner = wrapper
     if cls is desync.DeSyncModel:
         wrapper.mel = torch.nn.Linear(2, 2)
+        wrapper._mel_cpu_weights = FrozenCpuWeights(wrapper.mel.requires_grad_(False))
     for device in ("cpu", torch.device("cpu", 0)):
         assert wrapper.to(device) is wrapper
         assert owner.device == torch.device(device)
@@ -447,3 +451,45 @@ def test_native_model_device_transfer_keeps_weights_and_preprocessing(cls):
         assert module.statistics.dtype == torch.float32
     if cls is desync.DeSyncModel:
         assert next(wrapper.mel.parameters()).device.type == "cpu"
+
+
+@pytest.mark.parametrize("kind", ["videoalign", "audiobox", "clap", "desync"])
+def test_reward_constructors_retain_frozen_cpu_weights_and_close_releases_them(monkeypatch, kind):
+    model = torch.nn.Linear(2, 2).to(torch.bfloat16)
+    model.register_buffer("cache", torch.ones(2))
+    processor = object()
+    original = model.weight.detach().clone()
+    if kind == "videoalign":
+        monkeypatch.setattr(videoalign, "_load_components", lambda *args: (model, processor))
+        wrapper = videoalign.VideoAlignModel("fake", "cpu", "fake-base")
+    elif kind == "audiobox":
+        model.target_transform = {axis: {"mean": 0, "std": 1} for axis in audiobox._AXES}
+        monkeypatch.setattr(audiobox, "_load_model", lambda *args: model)
+        wrapper = audiobox.AudioBoxModel("fake", "cpu")
+    elif kind == "clap":
+        from transformers import AutoProcessor, ClapModel
+
+        monkeypatch.setattr(ClapModel, "from_pretrained", lambda *args, **kwargs: model)
+        monkeypatch.setattr(AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
+        wrapper = clap.CLAPModel("fake", "cpu")
+    else:
+        mel = torch.nn.Linear(2, 2)
+        mel_original = mel.weight.detach().clone()
+        monkeypatch.setattr(desync, "_load_components", lambda *args: (model, mel))
+        wrapper = desync.DeSyncModel("fake", "cpu", "fake-source")
+        mel.weight.data = torch.zeros_like(mel.weight)
+    assert not model.training and all(not parameter.requires_grad for parameter in model.parameters())
+    for _ in range(3):
+        model.weight.data = torch.zeros_like(model.weight)
+        # Dynamic buffers retain their most recent contents, not startup values.
+        model.cache.add_(1)
+        with torch.inference_mode():
+            wrapper.to("cpu")
+        torch.testing.assert_close(model.weight, original, rtol=0, atol=0)
+    torch.testing.assert_close(model.cache, torch.full((2,), 4.0), rtol=0, atol=0)
+    if kind == "desync":
+        torch.testing.assert_close(mel.weight, mel_original, rtol=0, atol=0)
+    wrapper.close()
+    assert wrapper.model is None and wrapper._cpu_weights is None
+    if kind == "desync":
+        assert wrapper.mel is None and wrapper._mel_cpu_weights is None

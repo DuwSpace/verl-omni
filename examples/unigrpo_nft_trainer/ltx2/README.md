@@ -324,23 +324,17 @@ the earlier arithmetic, not a stable performance distribution for final code.
 HPSv3 wake-up is a large cost because the source scorer initializes its backbone
 before loading its checkpoint.
 
-## Consistency collection
+## Consistency diagnostics and historical evidence
 
-Use an unused shared dump directory and the desired global step:
+Current text logprob diagnostics are configured through
+`actor_rollout_ref.rollout.ltx_joint.text_diagnostics`; HPS health checks remain
+under `reward.models.hpsv3.executor.kwargs.health_check`.
+See [IMPLEMENTATION.md](IMPLEMENTATION.md#21-权重搬运与保留的检查) for the reading guide,
+CPU master lifecycle, and R/R′/T comparisons.
 
-```bash
-export DUMP_PATH=/path/to/new-probe
-export MSPROBE_DUMP_GLOBAL_STEP=1
-bash examples/unigrpo_nft_trainer/ltx2/run_consistency_npu.sh
-```
-
-This selects a real old-policy actor AV forward and replays its exact inputs in
-the native worker. It saves MSProbe L0 dumps, boundary tensors, token replay and
-correlation metadata under `actor/` and `generate/`. A run can consume over
-120 GB of diagnostic storage. The wrapper defaults to one training prompt and
-disables evaluation; explicit trailing overrides can change these settings.
-Use the documented MSProbe and root-cause-analysis workflow for dump mapping and
-analysis. See [IMPLEMENTATION.md](IMPLEMENTATION.md) for the current inference and gradient boundaries.
+The temporary AV/MSProbe collector, its RPC and `run_consistency_npu.sh` have
+been removed. The following results describe earlier experiments; their saved
+evidence is retained, but the old collection command is no longer available.
 
 Run `010` used the same old policy and 235 valid recaption tokens: mean absolute
 logprob error 4.21e-6, p99 4.28e-5, maximum ratio deviation from one 4.77e-5,

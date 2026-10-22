@@ -24,6 +24,8 @@ from typing import Any
 import torch
 from verl.utils.device import get_device_id, get_device_name
 
+from verl_omni.utils.determinism import configure_worker_determinism, deterministic_call
+from verl_omni.utils.transfer_sync import synchronized_device_transfer
 from verl_omni.workers.config.reward import RewardModelSpec, is_engine_backend
 
 __all__ = [
@@ -90,7 +92,7 @@ class NativeRewardExecutor:
         check = getattr(self._model, "check_health", None)
         if check is not None:
             try:
-                await asyncio.to_thread(check, stage=stage, context=dict(self._health_context))
+                await asyncio.to_thread(deterministic_call, check, stage=stage, context=dict(self._health_context))
             except Exception as exc:
                 self._health_error = exc
                 self._awake = False
@@ -121,7 +123,7 @@ class NativeRewardExecutor:
             if self._awake:
                 return
             if self._model is not None:
-                await asyncio.to_thread(self._model.to, self._device)
+                await asyncio.to_thread(self._move_model, self._device)
                 await self._check_health("after_wake")
                 self._awake = True
                 return
@@ -134,12 +136,21 @@ class NativeRewardExecutor:
             if "device" not in kwargs:
                 kwargs["device"] = torch.device(get_device_name(), get_device_id())
             self._device = torch.device(kwargs["device"])
-            self._model = model_cls(**kwargs)
+            configure_worker_determinism()
+            with synchronized_device_transfer(self._device):
+                self._model = model_cls(**kwargs)
             await self._check_health("after_load")
             self._awake = True
 
     def reward_kwargs(self) -> dict[str, Any]:
         return {"reward_model": self}
+
+    def _move_model(self, destination) -> None:
+        # Called under the lifecycle lock with no inference in flight. Python
+        # task completion alone does not establish accelerator stream ordering.
+        configure_worker_determinism()
+        with synchronized_device_transfer(self._device):
+            self._model.to(destination)
 
     @property
     def reward_diagnostics(self):
@@ -159,9 +170,10 @@ class NativeRewardExecutor:
             if infer_fn is None:
                 raise TypeError(f"Native reward model {type(self._model).__name__!r} must define infer()")
             if inspect.iscoroutinefunction(infer_fn):
+                configure_worker_determinism()
                 result = await infer_fn(*args, **kwargs)
             else:
-                result = await asyncio.to_thread(infer_fn, *args, **kwargs)
+                result = await asyncio.to_thread(deterministic_call, infer_fn, *args, **kwargs)
             return await result if inspect.isawaitable(result) else result
         finally:
             async with self._lock:
@@ -187,7 +199,7 @@ class NativeRewardExecutor:
                     await self._check_health("before_sleep")
                 self._awake = False
                 if not release and self._model is not None:
-                    await asyncio.to_thread(self._model.to, torch.device("cpu"))
+                    await asyncio.to_thread(self._move_model, torch.device("cpu"))
                     _empty_accelerator_cache()
                     return
                 model, self._model = self._model, None

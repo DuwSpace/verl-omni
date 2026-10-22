@@ -20,6 +20,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
+
 from .reward_utils import audio_info_from_batch, get_audio, resample_audio
 
 _AUDIOBOX_SAMPLE_RATE = 16_000
@@ -140,20 +142,22 @@ class AudioBoxModel:
             axis: (float(self.model.target_transform[axis]["mean"]), float(self.model.target_transform[axis]["std"]))
             for axis in _AXES
         }
-        self.device = torch.device(device)
-        self.model.to(self.device).eval()
+        self.model.eval().requires_grad_(False)
+        self._cpu_weights = FrozenCpuWeights(self.model)
         self._infer_lock = threading.Lock()
+        self.to(device)
 
     def to(self, device):
-        """Move inference state without reloading weights or changing dtype."""
+        """Copy CPU masters to the device; discard device parameters on sleep."""
         with self._infer_lock:
-            self.model.to(device)
+            self._cpu_weights.move(self.model, device)
             self.device = torch.device(device)
         return self
 
     def close(self) -> None:
         """Drop model/transform references; further inference requires a new adapter."""
         self.model = None
+        self._cpu_weights = None
         self.target_transform = {}
         self.device = None
 

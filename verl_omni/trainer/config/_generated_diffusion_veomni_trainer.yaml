@@ -336,6 +336,7 @@ actor_rollout_ref:
         mean_abs_threshold: 0.001
         max_abs_threshold: 0.05
         stop_on_mismatch: true
+        capture_step: 0
     algo:
       _target_: verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig
       noise_level: 1.0

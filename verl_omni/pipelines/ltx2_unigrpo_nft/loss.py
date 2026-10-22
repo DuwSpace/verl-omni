@@ -95,7 +95,13 @@ class LTXJointLoss(OmniNFTLoss):
             raise ValueError("Joint actor preparation requires finite component reward scores")
         # Preserve the source normalization, routing, probability map and timestep selection.
         batch = OmniNFTLoss.prepare_actor_batch(batch, reward_tensor, config)
-        loss_config = config.actor_rollout_ref.actor.diffusion_loss
+        cls._prepare_text_credit(batch, config.actor_rollout_ref.actor.diffusion_loss)
+        cls._prepare_forward_noise(batch, records)
+        return batch
+
+    @staticmethod
+    def _prepare_text_credit(batch, loss_config):
+        """Derive one grouped text advantage per sample from the configured reward source."""
         if loss_config.text_probability_reduction != "mean":
             raise ValueError("Unsupported scalar text probability reduction")
         probabilities = batch.batch["reward_prob"][:, 0].mean(dim=-1)
@@ -121,6 +127,10 @@ class LTXJointLoss(OmniNFTLoss):
         batch.batch["text_reward"] = scalar_reward
         batch.meta_info["text_reward_source"] = source
         batch.meta_info["text_reward_metrics"] = metrics
+
+    @staticmethod
+    def _prepare_forward_noise(batch, records):
+        """Seed video/audio noise from replay identity, independent of rank and batch order."""
         steps = batch.batch["train_timesteps"].shape[1]
         for modality, salt in (("video", 0x564944), ("audio", 0x415544)):
             clean = batch.batch[f"{modality}_latents_clean"]
@@ -139,4 +149,3 @@ class LTXJointLoss(OmniNFTLoss):
                     )
                 )
             batch.batch[f"{modality}_forward_noise"] = torch.stack(noise)
-        return batch

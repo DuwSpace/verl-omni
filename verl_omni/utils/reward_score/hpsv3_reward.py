@@ -381,7 +381,7 @@ class _HPSv3Inferencer:
         for param in model.parameters():
             param.requires_grad = False
 
-        model.to(device)
+        model.to(device, non_blocking=False)
         self.model = model
         self.processor = processor
         self.device = device
@@ -806,10 +806,14 @@ class HPSv3Model:
         self._inferencer = _HPSv3Inferencer(
             checkpoint_path=model_path,
             base_config=base_model_path,
-            device=device,
+            device="cpu",
             use_sequential_position_ids=use_sequential_position_ids,
         )
         self._infer_lock = threading.Lock()
+        from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
+
+        self._cpu_weights = FrozenCpuWeights(self._inferencer.model)
+        self.to(device)
 
     def check_health(self, *, stage: str, context: dict) -> None:
         if self._health_probe is not None:
@@ -827,15 +831,16 @@ class HPSv3Model:
         return self._health_probe.input_stats if self._health_probe is not None else None
 
     def to(self, device):
-        """Move inference state without reloading weights or changing dtype."""
+        """Load from CPU masters; discard device weights instead of copying back."""
         with self._infer_lock:
-            self._inferencer.model.to(device)
+            self._cpu_weights.move(self._inferencer.model, device)
             self._inferencer.device = torch.device(device)
         return self
 
     def close(self) -> None:
         """Release the inferencer; reuse requires a new adapter."""
         self._inferencer = None
+        self._cpu_weights = None
 
     @torch.inference_mode()
     def infer(

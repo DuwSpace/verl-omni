@@ -237,6 +237,7 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
         # ppo_mini_batch_size counts complete recaption+AV samples, not prompts.
         tu.assign_non_tensor(
             data,
+            text_diagnostic_step=self.global_steps,
             global_batch_size=actor.ppo_mini_batch_size,
             mini_batch_size=actor.ppo_mini_batch_size,
             epochs=actor.ppo_epochs,
@@ -253,6 +254,13 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
         metrics["train/total_time"] = finished - started
         if hasattr(self, "_joint_reward_time"):
             metrics["reward/total_time"] = self._joint_reward_time
+        metrics.update(self._rollout_timing_metrics(batch, finished))
+        self._save_update_metrics(metrics)
+        return DataProto.from_single_dict(data={}, meta_info={"metrics": metrics})
+
+    def _rollout_timing_metrics(self, batch, finished):
+        """Aggregate concurrent replica timings without summing overlapping wall time."""
+        metrics = {}
         timings = batch.non_tensor_batch.get("ltx_rollout_metrics")
         if timings is not None:
             # All actors are on one host: perf_counter shares its monotonic
@@ -277,6 +285,10 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
                 metrics[key] = max(per_rank.values())
             tokens = sum(record.response_token_ids.numel() for record in batch.non_tensor_batch["ltx_joint_replay"])
             metrics["rollout/recaption_tokens_per_second"] = tokens / metrics["rollout/recaption_time"]
+        return metrics
+
+    def _save_update_metrics(self, metrics):
+        """Persist completed-update evidence before checkpointing and validation."""
         # The parent logs only after checkpointing and evaluation. Persist the
         # completed update independently so a later failure cannot erase its
         # timing and gradient evidence. This is not a resumable checkpoint.
@@ -296,4 +308,3 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
                 temporary,
             )
             temporary.replace(destination)
-        return DataProto.from_single_dict(data={}, meta_info={"metrics": metrics})

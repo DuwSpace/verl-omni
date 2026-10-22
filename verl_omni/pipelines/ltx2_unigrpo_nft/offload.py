@@ -8,11 +8,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Request-local, mutually exclusive component residency for joint LTX rollout."""
+"""Rollout residency: keep CPU weights, load one component onto the device.
+
+Load:    CPU master -> device copy -> verify -> run.
+Release: wait for compute -> reuse CPU storage -> discard device copy.
+
+The CPU master stays alive throughout. Release does not copy managed weights
+back from the device. Actor/FSDP parameters are outside this controller.
+"""
 
 from functools import wraps
 
 import torch
+
+from verl_omni.utils.frozen_cpu_weights import first_different_byte_block, tensor_digest
+from verl_omni.utils.transfer_sync import synchronized_device_transfer
 
 
 class JointRolloutOffload:
@@ -29,6 +39,9 @@ class JointRolloutOffload:
         self.device = torch.device(device)
         self.components = {name: getattr(pipeline, name) for name in self.component_names}
         self.active = None
+        self.policy_version = -1
+        self.policy_update_in_progress = False
+        self.pending_policy_version = None
         self.handles = []
         self.methods = []
         self.release()
@@ -37,6 +50,104 @@ class JointRolloutOffload:
         self._wrap("text_encoder", "generate")
         self._wrap("vae", "decode")
         self._wrap("audio_vae", "decode")
+
+    def activate(self, name):
+        """Release other components, then load and verify the requested one."""
+        if self.policy_update_in_progress:
+            raise RuntimeError("Cannot activate rollout components during an incomplete policy update")
+        if self.active == name:
+            return
+        self.active = None
+        for other, module in self.components.items():
+            if other != name:
+                self._move(module, torch.device("cpu"))
+        self._flush()
+        self._move(self.components[name], self.device)
+        self.active = name
+
+    def release(self):
+        """Restore every component's CPU storage; keep masters and hooks alive."""
+        self.active = None
+        for module in self.components.values():
+            self._move(module, torch.device("cpu"))
+        self._flush()
+
+    def begin_policy_update(self, version):
+        if self.policy_update_in_progress or version <= self.policy_version:
+            raise ValueError("Rollout adapter policy update must be complete and versions must increase")
+        self.policy_update_in_progress = True
+        self.pending_policy_version = version
+        self.release()
+
+    def commit_policy_update(self, version):
+        if not self.policy_update_in_progress or version != self.pending_policy_version:
+            raise ValueError("No matching rollout adapter policy update")
+        # Construct both snapshots before publishing either. Failure leaves
+        # activation blocked, including when one adapter has already loaded.
+        snapshots = {
+            name: AdapterCpuWeights(self.components[name], version) for name in ("text_encoder", "transformer")
+        }
+        for name, snapshot in snapshots.items():
+            self.components[name]._joint_adapter_cpu_weights = snapshot
+        self.policy_version = version
+        self.pending_policy_version = None
+        self.policy_update_in_progress = False
+
+    @staticmethod
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def _move(module, device):
+        """Restore CPU storage on release; copy and verify weights on device load."""
+        device = torch.device(device)
+        frozen_weights = getattr(module, "_joint_cpu_weights", None)
+        lora_weights = getattr(module, "_joint_adapter_cpu_weights", None)
+        # Wait before replacing storage, and finish transfers before returning.
+        # Keep new tensors mutable so the next policy update can write LoRA slots.
+        with synchronized_device_transfer(*component_devices(module), device):
+            if device.type == "cpu":
+                # Rebind parameters to existing CPU storage. No weight D2H.
+                if frozen_weights is not None:
+                    frozen_weights.restore_host()
+                if lora_weights is not None:
+                    lora_weights.check(master=True)
+                    lora_weights.restore_host()
+                # Managed weights are already on CPU. Move only remaining state
+                # (e.g. dynamic caches), including unregistered native LoRA slots.
+                move_native_lora_sidecars(module, device)
+                module.to(device, non_blocking=False)
+                return
+
+            # Load: check the CPU source, copy to the device, then check the copy.
+            if frozen_weights is not None:
+                frozen_weights.check("before_transfer_cpu_master", master=True)
+            if lora_weights is not None:
+                lora_weights.check(master=True)
+            move_native_lora_sidecars(module, device)
+            module.to(device, non_blocking=False)
+            if frozen_weights is not None:
+                frozen_weights.check(f"after_transfer:{device}")
+            if lora_weights is not None:
+                lora_weights.check()
+
+    def disable(self):
+        """Release device copies and remove automatic activation hooks."""
+        self.release()
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+        for module, method, previous in reversed(self.methods):
+            if previous is None:
+                delattr(module, method)
+            else:
+                setattr(module, method, previous)
+        self.methods.clear()
+
+    def _flush(self):
+        if self.device.type != "cpu":
+            api = torch.get_device_module(self.device)
+            with api.device(self.device):
+                api.synchronize(self.device)
+                api.empty_cache()
 
     def _pre_forward(self, name):
         def activate(module, args):
@@ -57,61 +168,101 @@ class JointRolloutOffload:
         self.methods.append((module, method, previous))
         setattr(module, method, resident_call)
 
-    @staticmethod
+
+class AdapterCpuWeights:
+    """Capture after a complete policy load on CPU, never from an actor/FSDP.
+
+    Native sidecars are tuples outside Module buffers. Keep their CPU storage
+    and restore the tuple before the native setter runs, avoiding D2H on sleep.
+    The next policy load may mutate/resize slots; replace this snapshot only
+    after both Gemma and DiT have finished loading that policy.
+    """
+
     @torch.inference_mode(False)
     @torch.no_grad()
-    def _move(module, device):
-        # Native execution enters inference_mode, but the next policy RPC
-        # mutates LoRA buffers outside it. Persistent transfers must therefore
-        # create normal tensors. Repair previously materialized sidecars too.
-        # Native diffusion LoRA stores sidecars in tuples, not registered
-        # buffers. Set their target BEFORE Module.to(), whose _apply otherwise
-        # restores these tensors to the previously fixed accelerator device.
-        for child in module.modules():
-            setter = getattr(child, "_set_diffusion_lora_buffer_device", None)
-            if setter is not None:
-                for name in ("lora_a_stacked", "lora_b_stacked"):
-                    values = getattr(child, name, None)
-                    if values is not None:
-                        setattr(
-                            child,
-                            name,
-                            tuple(value.clone() if torch.is_inference(value) else value for value in values),
-                        )
-                setter(device)
-        module.to(device)
+    def __init__(self, module, version):
+        self.version = version
+        self.parameters = {}
+        self.sidecars = {}
+        self.failure = None
+        for name, parameter in module.named_parameters():
+            if "lora_" in name:
+                self._require_cpu(name, parameter)
+                # detach() shares CPU storage; it does not allocate a backup.
+                # This reference keeps that storage alive after module.to(device).
+                self.parameters[name] = (parameter, parameter.detach())
+        for name, child in module.named_modules():
+            for attribute in ("lora_a_stacked", "lora_b_stacked"):
+                values = getattr(child, attribute, None)
+                if values is None:
+                    continue
+                hosts = []
+                for index, value in enumerate(values):
+                    self._require_cpu(f"{name}.{attribute}[{index}]", value)
+                    hosts.append(value.clone() if torch.is_inference(value) else value.detach())
+                self.sidecars[f"{name}.{attribute}"] = (child, attribute, tuple(hosts))
+        self.expected = {name: tensor_digest(host) for name, _, host in self._values()}
 
-    def _flush(self):
-        if self.device.type != "cpu":
-            api = torch.get_device_module(self.device)
-            api.synchronize()
-            api.empty_cache()
+    @staticmethod
+    def _require_cpu(name, value):
+        if value.device.type != "cpu":
+            raise ValueError(f"Load rollout adapters on CPU before capturing policy: {name}")
 
-    def activate(self, name):
-        if self.active == name:
-            return
-        self.active = None
-        for other, module in self.components.items():
-            if other != name:
-                self._move(module, torch.device("cpu"))
-        self._flush()
-        self._move(self.components[name], self.device)
-        self.active = name
+    def _values(self):
+        for name, (parameter, host) in self.parameters.items():
+            yield name, parameter, host
+        for name, (child, attribute, hosts) in self.sidecars.items():
+            values = getattr(child, attribute)
+            if len(values) != len(hosts):
+                raise RuntimeError(f"LoRA layout changed without a policy commit: {name}")
+            for index, (value, host) in enumerate(zip(values, hosts, strict=True)):
+                yield f"{name}[{index}]", value, host
 
-    def release(self):
-        self.active = None
-        for module in self.components.values():
-            self._move(module, torch.device("cpu"))
-        self._flush()
-
-    def disable(self):
-        self.release()
-        for handle in self.handles:
-            handle.remove()
-        self.handles.clear()
-        for module, method, previous in reversed(self.methods):
-            if previous is None:
-                delattr(module, method)
+    def check(self, *, master=False):
+        """Check CPU hashes (master=True), or compare working tensors to CPU values."""
+        if self.failure is not None:
+            raise RuntimeError(self.failure)
+        for name, value, host in self._values():
+            if master:
+                mismatch = tensor_digest(host) != self.expected[name]
             else:
-                setattr(module, method, previous)
-        self.methods.clear()
+                mismatch = first_different_byte_block(value, host) is not None
+            if mismatch:
+                self.failure = f"LoRA integrity failure: policy={self.version} tensor={name} master={master}"
+                raise RuntimeError(self.failure)
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def restore_host(self):
+        """Reuse saved CPU storage instead of copying the device values back."""
+        for parameter, cpu_tensor in self.parameters.values():
+            parameter.data = cpu_tensor  # Keep Parameter identity; replace its storage.
+        for child, attribute, hosts in self.sidecars.values():
+            setattr(child, attribute, hosts)
+
+
+def component_devices(module):
+    """Include native LoRA sidecars, which Module.parameters/buffers do not see."""
+    devices = {value.device for value in (*module.parameters(), *module.buffers())}
+    for child in module.modules():
+        for name in ("lora_a_stacked", "lora_b_stacked"):
+            devices.update(value.device for value in getattr(child, name, ()) or ())
+    return sorted(devices, key=str)
+
+
+def move_native_lora_sidecars(module, device):
+    """Set residency before Module.to and keep slots writable by the next policy RPC.
+
+    Call under inference_mode(False) and the component's transfer fence, after
+    restoring adapter CPU masters on offload. The native setter moves the tuples.
+    """
+    for child in module.modules():
+        setter = getattr(child, "_set_diffusion_lora_buffer_device", None)
+        if setter is None:
+            continue
+        for name in ("lora_a_stacked", "lora_b_stacked"):
+            values = getattr(child, name, None)
+            if values is not None:
+                mutable_values = tuple(value.clone() if torch.is_inference(value) else value for value in values)
+                setattr(child, name, mutable_values)
+        setter(device)

@@ -46,56 +46,6 @@ class LTXJointWorkerExtension:
             report[name] = {"sha256": digest.hexdigest(), "parameter_elements": elements}
         return report
 
-    def collect_joint_av_probe(self, record_data, inputs, identity):
-        """Replay an actor forward-process sample through the committed native pair."""
-        import torch
-        from vllm_omni.diffusion.forward_context import set_forward_context
-
-        from verl_omni.pipelines.ltx2_unigrpo_nft.consistency_probe import capture_forward, probe_selected
-        from verl_omni.pipelines.ltx2_unigrpo_nft.replay import LTXJointReplay
-
-        record = LTXJointReplay(**record_data)
-        record.validate()
-        pipeline = self.model_runner.pipeline
-        if not probe_selected(record.policy_version) or pipeline._joint_policy_version != record.policy_version:
-            raise RuntimeError("Native probe window or paired policy does not match actor old")
-        models = torch.nn.ModuleDict(
-            {"gemma": pipeline.text_encoder, "connectors": pipeline.connectors, "transformer": pipeline.transformer}
-        )
-        device = pipeline.device
-        try:
-            with (
-                torch.no_grad(),
-                set_forward_context(
-                    vllm_config=self.model_runner.vllm_config, omni_diffusion_config=pipeline.od_config
-                ),
-                capture_forward(models, side="generate", identity=identity),
-            ):
-                embeddings, ids, mask = pipeline._condition(record.recaption, record.condition_token_ids.numel())
-                if not torch.equal(ids.cpu()[0], record.condition_token_ids) or not torch.equal(
-                    mask.cpu()[0], record.condition_attention_mask.bool()
-                ):
-                    raise RuntimeError("Native diagnostic condition tokens differ from actor replay")
-                video, audio, attention = pipeline.connectors(embeddings, mask, padding_side="left")
-                kwargs = {
-                    key: value.to(device) if isinstance(value, torch.Tensor) else value
-                    for key, value in inputs.items()
-                    if key not in ("input_ids", "attention_mask")
-                }
-                predictions = pipeline.predict_noise(
-                    **kwargs,
-                    encoder_hidden_states=video,
-                    audio_encoder_hidden_states=audio,
-                    encoder_attention_mask=attention,
-                    audio_encoder_attention_mask=attention,
-                    return_dict=False,
-                )
-                if not all(torch.isfinite(value).all() for value in predictions):
-                    raise RuntimeError("Nonfinite native diagnostic prediction")
-        finally:
-            self.release_joint_device_memory()
-        return {"policy_version": record.policy_version, "sample_id": identity["sample_id"]}
-
     def release_joint_device_memory(self):
         """Release managed model residency before colocated reward/training.
 
@@ -125,20 +75,20 @@ class LTXJointWorkerExtension:
 
         return CustomPipelineWorkerExtension.re_init_pipeline(self, custom_pipeline_args)
 
-    def snapshot_joint_text_failure(self, reason):
+    def snapshot_joint_text_failure(self, reason, force=False):
         """Save live native parameters and nonpersistent buffers without reloading."""
         pipeline = self.model_runner.pipeline
         diagnostic = getattr(pipeline, "_joint_text_diagnostics", None)
         if diagnostic is None or not diagnostic.enabled:
             raise RuntimeError("Native text diagnostics were not enabled")
-        return diagnostic.snapshot(pipeline.text_encoder, reason)
+        return diagnostic.snapshot(pipeline.text_encoder, reason, force=force)
 
     def load_joint_lora_bundle(self, directory, text_diagnostics=None, source_rank=None):
-        from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
-        from safetensors.torch import load_file
-        from vllm.lora.request import LoRARequest
-        from vllm_omni.diffusion.lora.layers.base_linear import DiffusionBaseLinearLayerWithLoRA
+        """Validate → park → load Gemma/DiT → commit one paired policy version.
 
+        An exception deliberately leaves synchronization in progress: a partially
+        loaded policy must never become eligible for rollout.
+        """
         pipeline = self.model_runner.pipeline
         manifest = validate_joint_lora_bundle(directory)
         base_model = manifest.get("base_model")
@@ -148,7 +98,28 @@ class LTXJointWorkerExtension:
         if version <= getattr(pipeline, "_joint_policy_version", -1):
             raise ValueError("Joint rollout policy versions must increase")
         pipeline._joint_sync_in_progress = True
+        controller = getattr(pipeline, "_joint_offload", None)
+        if controller is not None:
+            controller.begin_policy_update(version)
         directory = Path(directory)
+        weights = self._load_gemma_adapter(directory)
+        self._record_text_policy(weights, version, text_diagnostics, source_rank)
+        if controller is not None:
+            self._verify_gemma_adapter(weights, version)
+        request = self._load_dit_adapter(directory, version, controller)
+        if controller is not None:
+            controller.commit_policy_update(version)
+        pipeline._joint_lora_request = request
+        pipeline._joint_policy_version = version
+        pipeline._joint_sync_in_progress = False
+        return {"policy_version": version, "components": manifest["components"]}
+
+    def _load_gemma_adapter(self, directory):
+        """Load the PEFT adapter on the parked model and return the transport tensors."""
+        from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
+        from safetensors.torch import load_file
+
+        pipeline = self.model_runner.pipeline
         gemma_config = LoraConfig.from_pretrained(directory / "gemma")
         # PEFT may compress target_modules in place during injection. Compare
         # future bundles with the original transport config, not that rewrite.
@@ -163,6 +134,11 @@ class LTXJointWorkerExtension:
         if result.unexpected_keys or any("lora_" in key for key in result.missing_keys):
             raise ValueError("Gemma LoRA did not load exactly")
         pipeline.text_encoder.requires_grad_(False)
+        return weights
+
+    def _record_text_policy(self, weights, version, text_diagnostics, source_rank):
+        """Keep optional text evidence separate from mandatory policy verification."""
+        pipeline = self.model_runner.pipeline
         if text_diagnostics is not None:
             from verl_omni.pipelines.ltx2_unigrpo_nft.text_diagnostics import TextDiagnostics
 
@@ -171,18 +147,37 @@ class LTXJointWorkerExtension:
                     text_diagnostics, side="rollout", source_rank=source_rank
                 )
             pipeline._joint_text_diagnostics.policy(pipeline.text_encoder, version, expected=weights)
+
+    def _verify_gemma_adapter(self, weights, version):
+        """Compare actual loaded Gemma LoRA against the bundle before publication."""
+        pipeline = self.model_runner.pipeline
+        from verl_omni.utils.frozen_cpu_weights import first_different_byte_block
+
+        # This is part of policy publication, independent of optional text
+        # diagnostics. Compare the loaded CPU adapter against the bundle.
+        parameters = dict(pipeline.text_encoder.named_parameters())
+        for name, expected in weights.items():
+            key = name.replace(".lora_A.weight", ".lora_A.joint.weight").replace(
+                ".lora_B.weight", ".lora_B.joint.weight"
+            )
+            actual = parameters.get(key)
+            if actual is None or first_different_byte_block(actual, expected) is not None:
+                raise RuntimeError(f"Actual native Gemma LoRA differs from policy {version}: {name}")
+
+    def _load_dit_adapter(self, directory, version, controller):
+        """Load native DiT slots and leave them on CPU when component offload owns residency."""
+        from vllm.lora.request import LoRARequest
+        from vllm_omni.diffusion.lora.layers.base_linear import DiffusionBaseLinearLayerWithLoRA
+
+        pipeline = self.model_runner.pipeline
         request = LoRARequest(
             lora_name=f"ltx-joint-{version}", lora_int_id=version + 1, lora_path=str(directory / "dit")
         )
         self.lora_manager.set_active_adapter(request, 1.0)
         # Native LoRA sidecars are tuples rather than registered buffers. The
         # joint controller owns their residency too, including rank resizing.
-        controller = getattr(pipeline, "_joint_offload", None)
         sidecar_device = "cpu" if controller is not None else pipeline.device
         for module in pipeline.transformer.modules():
             if isinstance(module, DiffusionBaseLinearLayerWithLoRA):
                 module._set_diffusion_lora_buffer_device(sidecar_device)
-        pipeline._joint_lora_request = request
-        pipeline._joint_policy_version = version
-        pipeline._joint_sync_in_progress = False
-        return {"policy_version": version, "components": manifest["components"]}
+        return request

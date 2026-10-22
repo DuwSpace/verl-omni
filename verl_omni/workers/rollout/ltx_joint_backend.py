@@ -65,6 +65,18 @@ class LTXJointVllmBackend:
                 worker_extension_cls="verl_omni.workers.rollout.ltx_joint_worker_extension.LTXJointWorkerExtension",
                 diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
                 enforce_eager=True,
+                # Disable Ascend NZ conversion for the repeatedly updated RL policy.
+                additional_config={
+                    "weight_nz_mode": 0,
+                    "rl_config": {
+                        "enabled": True,
+                        # Keep the native PyTorch kernels shared with the training actor.
+                        "enable_batch_invariant": False,
+                        # Gemma uses Transformers SDPA; this worker has no AR sleep lifecycle.
+                        "enable_training_consistency": False,
+                        "sleep_mode_extra_cleanup": False,
+                    },
+                },
                 enable_cpu_offload=enable_cpu_offload,
                 vae_use_tiling=vae_use_tiling,
                 # LTX reads extras during construction; pass a concrete mapping
@@ -146,60 +158,69 @@ class LTXJointVllmBackend:
         return manifest
 
     def generate(self, prompts, seeds, *, version, sampling_params=None):
-        from vllm_omni.diffusion.request import OmniDiffusionRequest
-        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
+        """Generate sequential requests, then release device memory before reward/actor work."""
         if self.policy_version is None or version != self.policy_version:
             raise RuntimeError("Load the complete paired policy before rollout")
         results = []
         for index, (prompt, seed) in enumerate(zip(prompts, seeds, strict=True)):
-            params = dict(self.geometry if sampling_params is None else sampling_params)
-            extra = dict(params.pop("extra_args", {}))
-            extra.update(
-                policy_version=version,
-                recaption_temperature=self.temperature,
-                recaption_max_new_tokens=self.max_new_tokens,
-            )
-            request = OmniDiffusionRequest(
-                prompt={"prompt": prompt, "modalities": ["video", "audio"]},
-                sampling_params=OmniDiffusionSamplingParams(
-                    **params, seed=int(seed), lora_request=self.lora_request, extra_args=extra
-                ),
-                request_id=f"ltx-joint-{version}-{index}",
-            )
+            request = self._make_request(prompt, seed, version, index, sampling_params)
             output = self.engine.add_req_and_wait_for_response(request)
-            if output.error is not None:
-                raise RuntimeError(f"Native joint LTX rollout failed: {output.error}")
-            envelope = output.output
-            if not isinstance(envelope, dict) or "metadata" not in envelope or "payload" not in envelope:
-                raise RuntimeError("Native joint LTX worker lost the replay/media envelope")
-            metadata = envelope["metadata"]["rl"]
-            record = LTXJointReplay(**metadata["ltx_joint_replay"])
-            record.validate()
-            if record.policy_version != version or record.original_prompt != prompt or record.seed != int(seed):
-                raise RuntimeError("Native worker returned stale or mismatched replay")
-            video, audio = envelope["payload"]["video"]
-            if audio.ndim == 3 and audio.shape[0] == 1:
-                audio = audio[0]
-            if audio.ndim != 2:
-                raise RuntimeError("Native joint LTX audio must have channels/time layout")
-            results.append(
-                {
-                    "video": video,
-                    "audio": audio,
-                    "replay": record,
-                    "video_latents_clean": metadata["video_latents_clean"],
-                    "audio_latents_clean": metadata["audio_latents_clean"],
-                    "train_timesteps": metadata["train_timesteps"],
-                    "recaption_time": metadata["recaption_time"],
-                    "generation_time": metadata["generation_time"],
-                    "memory_metrics": metadata.get("memory_metrics", {}),
-                    "fps": float(metadata["fps"].item()),
-                    "audio_sample_rate": int(metadata["audio_sample_rate"].item()),
-                }
-            )
+            results.append(self._read_response(output, prompt, seed, version))
         self.engine.collective_rpc("release_joint_device_memory", timeout=self.timeout)
         return results
+
+    def _make_request(self, prompt, seed, version, index, sampling_params):
+        """Attach the committed adapter and exact sampling metadata to a native request."""
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        params = dict(self.geometry if sampling_params is None else sampling_params)
+        extra = dict(params.pop("extra_args", {}))
+        extra.update(
+            policy_version=version,
+            recaption_temperature=self.temperature,
+            recaption_max_new_tokens=self.max_new_tokens,
+        )
+        request = OmniDiffusionRequest(
+            prompt={"prompt": prompt, "modalities": ["video", "audio"]},
+            sampling_params=OmniDiffusionSamplingParams(
+                **params, seed=int(seed), lora_request=self.lora_request, extra_args=extra
+            ),
+            request_id=f"ltx-joint-{version}-{index}",
+        )
+        return request
+
+    @staticmethod
+    def _read_response(output, prompt, seed, version):
+        """Reject stale replay identities and normalize the returned media layout."""
+        if output.error is not None:
+            raise RuntimeError(f"Native joint LTX rollout failed: {output.error}")
+        envelope = output.output
+        if not isinstance(envelope, dict) or "metadata" not in envelope or "payload" not in envelope:
+            raise RuntimeError("Native joint LTX worker lost the replay/media envelope")
+        metadata = envelope["metadata"]["rl"]
+        record = LTXJointReplay(**metadata["ltx_joint_replay"])
+        record.validate()
+        if record.policy_version != version or record.original_prompt != prompt or record.seed != int(seed):
+            raise RuntimeError("Native worker returned stale or mismatched replay")
+        video, audio = envelope["payload"]["video"]
+        if audio.ndim == 3 and audio.shape[0] == 1:
+            audio = audio[0]
+        if audio.ndim != 2:
+            raise RuntimeError("Native joint LTX audio must have channels/time layout")
+        return {
+            "video": video,
+            "audio": audio,
+            "replay": record,
+            "video_latents_clean": metadata["video_latents_clean"],
+            "audio_latents_clean": metadata["audio_latents_clean"],
+            "train_timesteps": metadata["train_timesteps"],
+            "recaption_time": metadata["recaption_time"],
+            "generation_time": metadata["generation_time"],
+            "memory_metrics": metadata.get("memory_metrics", {}),
+            "fps": float(metadata["fps"].item()),
+            "audio_sample_rate": int(metadata["audio_sample_rate"].item()),
+        }
 
     def close(self):
         try:

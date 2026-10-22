@@ -42,7 +42,13 @@ def _config():
                     "data_loader_seed": 7,
                     "shuffle": False,
                 },
-                "rollout": {"name": "vllm_omni", "tensor_model_parallel_size": 1, "n": 2, "seed": 42},
+                "rollout": {
+                    "name": "vllm_omni",
+                    "tensor_model_parallel_size": 1,
+                    "n": 2,
+                    "seed": 42,
+                    "ltx_joint": {"text_diagnostics": {}},
+                },
             },
         }
     )
@@ -51,6 +57,7 @@ def _config():
 @pytest.mark.parametrize("evaluating,phase,version", [(False, "train", 27), (True, "validation", 28)])
 def test_reward_health_context_identifies_step_and_phase(monkeypatch, evaluating, phase, version):
     trainer = object.__new__(LTXJointRayTrainer)
+    trainer.config = _config()
     trainer.global_steps, trainer._evaluating = 14, evaluating
     batch = DataProto.from_dict(tensors={"responses": torch.zeros(1, 1)})
 

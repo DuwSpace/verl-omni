@@ -297,21 +297,25 @@ class VideoAlignModel:
     """Raw VideoAlign inference adapter owned by a native reward executor."""
 
     def __init__(self, model_path: str, device, base_model_path: str) -> None:
+        from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
+
         self.model, self.processor = _load_components(model_path, base_model_path)
-        self.device = torch.device(device)
-        self.model.to(self.device).eval()
+        self.model.eval().requires_grad_(False)
+        self._cpu_weights = FrozenCpuWeights(self.model)
         self._infer_lock = threading.Lock()
+        self.to(device)
 
     def to(self, device):
-        """Move inference state without reloading weights or changing dtype."""
+        """Copy CPU masters to the device; discard device parameters on sleep."""
         with self._infer_lock:
-            self.model.to(device)
+            self._cpu_weights.move(self.model, device)
             self.device = torch.device(device)
         return self
 
     def close(self) -> None:
         """Drop model/processor references; reuse requires constructing a new adapter."""
         self.model = None
+        self._cpu_weights = None
         self.processor = None
         self.device = None
 

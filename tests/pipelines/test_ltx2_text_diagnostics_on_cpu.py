@@ -9,6 +9,7 @@
 # limitations under the License.
 
 import json
+from dataclasses import replace
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -86,6 +87,9 @@ def test_disabled_capture_does_not_touch_model_or_disk(tmp_path):
         {"mean_abs_threshold": 0},
         {"max_abs_threshold": float("nan")},
         {"enabled": "false"},
+        {"capture_step": -1},
+        {"capture_step": True},
+        {"capture_step": 2},
     ],
 )
 def test_invalid_configuration_fails_explicitly(options):
@@ -199,6 +203,55 @@ def test_actor_mismatch_stops_before_backward_and_preserves_old_snapshot(model, 
     for name, tensor in hooks.policies.old.items():
         if name.startswith("gemma."):
             torch.testing.assert_close(captured["parameters"][name.removeprefix("gemma.")], tensor, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("damage", [False, True])
+def test_scheduled_step_captures_all_text_and_both_weights_before_backward(model, tmp_path, monkeypatch, damage):
+    from verl.utils import tensordict_utils as tu
+
+    data, records = _joint_batch(model)
+    native = _native_evidence(model, records, tmp_path)
+    hooks = _hooks(model, tmp_path)
+    hooks.text_diagnostics.config = replace(hooks.text_diagnostics.config, capture_step=2)
+    tu.assign_non_tensor(data, text_diagnostic_step=2)
+    with torch.no_grad():
+        if damage:
+            model.gemma.lm_head.weight.zero_()
+        for name, parameter in model.named_parameters():
+            if "lora_B" in name:
+                parameter.add_(0.4)
+    current = {n: p.detach().clone() for n, p in model.named_parameters()}
+    calls = []
+
+    def rpc(method, *, args, timeout):
+        calls.append((method, args))
+        return [native.snapshot(model.gemma, args[0], force=args[1])]
+
+    hooks._rollout_backend = SimpleNamespace(engine=SimpleNamespace(collective_rpc=rpc), timeout=10)
+    monkeypatch.setattr(hooks, "_av_batch", lambda *a, **kw: pytest.fail("Capture must not run AV training"))
+    cfg = SimpleNamespace(diffusion_loss=LTXJointLossConfig(), ppo_micro_batch_size_per_gpu=1)
+    with pytest.raises(RuntimeError, match="Text capture complete at step 2"):
+        hooks.forward_backward_batch(data, partial(LTXJointLoss(), config=cfg))
+    assert all(p.grad is None for p in model.parameters())
+    assert len(list(hooks.text_diagnostics.directory.glob("sample-*.json"))) == len(records)
+    report = json.loads((hooks.text_diagnostics.directory / "capture-step-2.json").read_text())
+    assert report["step"] == 2 and report["policy_version"] == hooks.policies.version
+    assert Path(report["actor_snapshot"]).exists()
+    assert all(Path(path).exists() for path in report["rollout_snapshots"])
+    captured = torch.load(report["actor_snapshot"], weights_only=True)
+    for name, tensor in hooks.policies.old.items():
+        if name.startswith("gemma."):
+            torch.testing.assert_close(captured["parameters"][name.removeprefix("gemma.")], tensor, atol=0, rtol=0)
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(parameter, current[name], atol=0, rtol=0)
+    assert calls[0][0] == "snapshot_joint_text_failure" and calls[0][1][1] is True
+
+
+def test_forced_snapshot_does_not_reuse_an_earlier_failure(model, tmp_path):
+    diagnostic = TextDiagnostics(_options(tmp_path), side="rollout")
+    first = diagnostic.snapshot(model.gemma, "step-1")
+    second = diagnostic.snapshot(model.gemma, "step-2", force=True)
+    assert first != second and Path(first).exists() and Path(second).exists()
 
 
 def test_buffer_hashes_do_not_depend_on_registration_order():
@@ -317,7 +370,10 @@ def test_config_composition_carries_diagnostics_to_actor_settings(tmp_path):
 
 
 @pytest.mark.parametrize("corrupt_load", [False, True])
-def test_native_sync_verifies_actual_loaded_lora(model, tmp_path, monkeypatch, corrupt_load):
+@pytest.mark.parametrize("with_offload,diagnostics_enabled", [(False, True), (True, True), (True, False)])
+def test_native_sync_verifies_actual_loaded_lora(
+    model, tmp_path, monkeypatch, corrupt_load, with_offload, diagnostics_enabled
+):
     import peft
     from test_ltx2_joint_model_on_cpu import _rollout_gemma
 
@@ -334,6 +390,18 @@ def test_native_sync_verifies_actual_loaded_lora(model, tmp_path, monkeypatch, c
         device=torch.device("cpu"),
         od_config=SimpleNamespace(model="/model"),
     )
+    if with_offload:
+        from verl_omni.pipelines.ltx2_unigrpo_nft.offload import JointRolloutOffload
+
+        class Codec(torch.nn.Linear):
+            def decode(self, value):
+                return self(value)
+
+        for name in ("connectors", "vae", "audio_vae", "vocoder"):
+            setattr(pipeline, name, Codec(2, 2))
+        pipeline._joint_offload = JointRolloutOffload(pipeline, "cpu")
+    options = _options(tmp_path)
+    options["enabled"] = diagnostics_enabled
     worker = LTXJointWorkerExtension()
     worker.model_runner = SimpleNamespace(pipeline=pipeline)
     worker.lora_manager = SimpleNamespace(set_active_adapter=lambda *args: None)
@@ -348,16 +416,24 @@ def test_native_sync_verifies_actual_loaded_lora(model, tmp_path, monkeypatch, c
 
         monkeypatch.setattr(peft, "set_peft_model_state_dict", corrupted)
         with pytest.raises(RuntimeError, match="Actual native Gemma LoRA differs"):
-            worker.load_joint_lora_bundle(str(bundle), _options(tmp_path), 5)
+            worker.load_joint_lora_bundle(str(bundle), options, 5)
         assert pipeline._joint_sync_in_progress
         assert not hasattr(pipeline, "_joint_policy_version")
-        assert list(pipeline._joint_text_diagnostics.directory.glob("failure-*.pt"))
+        if diagnostics_enabled:
+            assert list(pipeline._joint_text_diagnostics.directory.glob("failure-*.pt"))
+        if with_offload:
+            with pytest.raises(RuntimeError, match="incomplete policy update"):
+                pipeline._joint_offload.activate("text_encoder")
     else:
-        worker.load_joint_lora_bundle(str(bundle), _options(tmp_path), 5)
-        meta = json.loads((pipeline._joint_text_diagnostics.directory / "policy-1.json").read_text())
-        assert meta["source_rank"] == 5 and meta["policy_version"] == 1 and meta["complete"]
-        assert meta["parameters"] and meta["buffers"]
-        assert worker.snapshot_joint_text_failure("manual test")
+        worker.load_joint_lora_bundle(str(bundle), options, 5)
+        if diagnostics_enabled:
+            meta = json.loads((pipeline._joint_text_diagnostics.directory / "policy-1.json").read_text())
+            assert meta["source_rank"] == 5 and meta["policy_version"] == 1 and meta["complete"]
+            assert meta["parameters"] and meta["buffers"]
+            assert worker.snapshot_joint_text_failure("manual test")
+        if with_offload:
+            assert pipeline._joint_offload.policy_version == 1
+            assert pipeline.text_encoder._joint_adapter_cpu_weights.version == 1
 
 
 def test_actor_masks_preserve_variable_length_sample_pairing(model, tmp_path):

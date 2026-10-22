@@ -800,7 +800,7 @@ def test_nonaffine_norm_replacement_preserves_reference_values_gradients_and_par
 def test_native_connector_attention_preserves_frozen_parameter_input_gradients():
     from diffusers.models.transformers.transformer_ltx2 import LTX2Attention
 
-    from verl_omni.pipelines.ltx2_unigrpo_nft.connector_attention import NativeConnectorAttnProcessor
+    from verl_omni.pipelines.ltx2_unigrpo_nft.attention import NativeConnectorAttnProcessor
 
     torch.manual_seed(71)
     attention = LTX2Attention(
@@ -817,7 +817,7 @@ def test_native_connector_attention_preserves_frozen_parameter_input_gradients()
 
 
 def test_native_connector_split_rope_gradient():
-    from verl_omni.pipelines.ltx2_unigrpo_nft.connector_attention import native_connector_rope
+    from verl_omni.pipelines.ltx2_unigrpo_nft.attention import native_connector_rope
 
     torch.manual_seed(72)
     x = torch.randn(1, 3, 8, dtype=torch.float64, requires_grad=True)
@@ -830,7 +830,7 @@ def test_native_connector_split_rope_gradient():
 def test_native_dit_projection_updates_fp32_lora_masters_through_bf16_compute():
     from peft import inject_adapter_in_model
 
-    from verl_omni.pipelines.ltx2_unigrpo_nft.dit_attention import native_fused_qkv
+    from verl_omni.pipelines.ltx2_unigrpo_nft.attention import native_fused_qkv
 
     torch.manual_seed(83)
     layers = torch.nn.ModuleDict({key: torch.nn.Linear(8, 8).to(torch.bfloat16) for key in ("q", "k", "v")})
@@ -887,7 +887,7 @@ def test_native_dit_attention_backpropagates_to_all_lora_and_condition_inputs():
     from diffusers.models.transformers.transformer_ltx2 import LTX2Attention
     from peft import inject_adapter_in_model
 
-    from verl_omni.pipelines.ltx2_unigrpo_nft.dit_attention import NativeDiTAttnProcessor
+    from verl_omni.pipelines.ltx2_unigrpo_nft.attention import NativeDiTAttnProcessor
 
     torch.manual_seed(84)
     attention = LTX2Attention(
@@ -917,7 +917,7 @@ def test_native_dit_attention_backpropagates_to_all_lora_and_condition_inputs():
 
 
 def test_encoding_ignores_nonzero_planning_lora_and_restores_state(model):
-    from verl_omni.pipelines.ltx2_unigrpo_nft.adapters import base_encoder
+    from verl_omni.pipelines.ltx2_unigrpo_nft.model import base_encoder
 
     ids = torch.tensor([[2, 3, 4, 1]])
     mask = torch.ones_like(ids)
@@ -961,7 +961,7 @@ def test_rollout_positive_negative_encoding_disable_planning_adapter(model, monk
     layer = model.gemma.model.language_model.layers[0].self_attn.q_proj
     with torch.no_grad():
         layer.lora_B["default"].weight.normal_()
-    from verl_omni.pipelines.ltx2_unigrpo_nft.adapters import base_encoder
+    from verl_omni.pipelines.ltx2_unigrpo_nft.model import base_encoder
 
     with torch.no_grad(), base_encoder(model.gemma):
         hidden = model.gemma(input_ids=ids, attention_mask=mask.bool(), output_hidden_states=True).hidden_states

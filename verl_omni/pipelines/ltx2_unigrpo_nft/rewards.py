@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Synchronous native scoring of joint rollout, retaining source reward components."""
+"""Media conversion shared with training, plus a sequential scorer for offline replay.
+
+Training dispatches through OmniRewardLoopManager. LTXJointRewardRunner is used
+by score_rollout.py to reproduce the same configured scorers outside training.
+"""
 
 from copy import deepcopy
 from time import perf_counter
@@ -91,26 +95,7 @@ class LTXJointRewardRunner:
         columns = []
         metrics = {}
         for name in names:
-            config = deepcopy(self.config)
-            term = config.reward.reward_functions[name]
-            config.reward.reward_functions = {name: OmegaConf.to_container(term, resolve=True)}
-            model_name = term.model
-            model = config.reward.models[model_name]
-            if model.backend != "native":
-                raise ValueError("Initial synchronous LTX reward runner requires native models")
-            if model_name not in self._executors:
-                self._executors[model_name] = NativeRewardExecutor(
-                    RewardModelSpec(
-                        name=model_name,
-                        backend="native",
-                        model_path=model.model_path,
-                        executor_config=OmegaConf.to_container(model.executor, resolve=True),
-                        cpu_offload=model.get("cpu_offload", False),
-                    )
-                )
-            executor = self._executors[model_name]
-            manager = MultiVisualRewardManager(config, tokenizer=None, compute_score=None)
-            manager.set_reward_executors({}, {model_name: executor})
+            manager, executor = self._scorer_for_term(name)
             load_start = perf_counter()
             try:
                 await executor.wake_up()
@@ -132,6 +117,30 @@ class LTXJointRewardRunner:
             raise ValueError("All five required reward components must be finite")
         metrics["reward/total_time"] = perf_counter() - started
         return scores, names, infos, metrics
+
+    def _scorer_for_term(self, name):
+        """Reuse the CPU-resident executor and route exactly one configured reward term."""
+        config = deepcopy(self.config)
+        term = config.reward.reward_functions[name]
+        config.reward.reward_functions = {name: OmegaConf.to_container(term, resolve=True)}
+        model_name = term.model
+        model = config.reward.models[model_name]
+        if model.backend != "native":
+            raise ValueError("Initial synchronous LTX reward runner requires native models")
+        if model_name not in self._executors:
+            self._executors[model_name] = NativeRewardExecutor(
+                RewardModelSpec(
+                    name=model_name,
+                    backend="native",
+                    model_path=model.model_path,
+                    executor_config=OmegaConf.to_container(model.executor, resolve=True),
+                    cpu_offload=model.get("cpu_offload", False),
+                )
+            )
+        executor = self._executors[model_name]
+        manager = MultiVisualRewardManager(config, tokenizer=None, compute_score=None)
+        manager.set_reward_executors({}, {model_name: executor})
+        return manager, executor
 
     async def close(self):
         """Release cached executors, including weights retained in CPU memory."""

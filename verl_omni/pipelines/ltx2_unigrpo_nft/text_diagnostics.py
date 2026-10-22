@@ -29,6 +29,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
+from verl_omni.utils.frozen_cpu_weights import tensor_digest
+
 
 @dataclass(frozen=True)
 class TextDiagnosticConfig:
@@ -39,10 +41,15 @@ class TextDiagnosticConfig:
     mean_abs_threshold: float = 1e-3
     max_abs_threshold: float = 0.05
     stop_on_mismatch: bool = True
+    capture_step: int = 0
 
     def __post_init__(self):
-        if type(self.enabled) is not bool or type(self.stop_on_mismatch) is not bool:
+        if any(type(value) is not bool for value in (self.enabled, self.stop_on_mismatch)):
             raise ValueError("Text diagnostic switches must be booleans")
+        if type(self.capture_step) is not int or self.capture_step < 0:
+            raise ValueError("Text diagnostic capture_step must be a nonnegative integer")
+        if self.capture_step and not self.enabled:
+            raise ValueError("Text diagnostic capture_step requires text diagnostics")
         if self.enabled and (not self.output_dir or not Path(self.output_dir).is_absolute()):
             raise ValueError("Enabled text diagnostics require an absolute output_dir")
         for value in (self.mean_abs_threshold, self.max_abs_threshold):
@@ -59,10 +66,7 @@ def local_cpu(value):
 
 def tensor_hash(value):
     """Hash shape, dtype and exact local bytes, including nonpersistent buffers."""
-    value = local_cpu(value)
-    digest = hashlib.sha256(f"{value.dtype}:{tuple(value.shape)}".encode())
-    digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
+    return tensor_digest(local_cpu(value))
 
 
 def input_identity(prompt, response, *, version, seed, temperature):
@@ -241,9 +245,9 @@ class TextDiagnostics:
             self.save(f"policy-{version}", {**self.location(model), "policy_version": version, **evidence}, values)
             self._policies.add(version)
 
-    def snapshot(self, model, reason):
+    def snapshot(self, model, reason, *, force=False):
         """Capture before restoration/offload. Caller ensures FSDP shards are materialized locally."""
-        if self._failure_snapshot is not None:
+        if self._failure_snapshot is not None and not force:
             return self._failure_snapshot
         evidence = model_evidence(model, include_base=True, tensors=True)
         values = evidence.pop("tensor_values")

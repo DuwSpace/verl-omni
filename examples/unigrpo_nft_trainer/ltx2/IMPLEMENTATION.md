@@ -1,6 +1,6 @@
 # LTX UniGRPO/NFT Trainer 实现说明
 
-本文根据 2026-10-20 工作区代码整理。参数以 [`joint_train.yaml`](joint_train.yaml) 和实际运行生成的 Hydra 配置为准；文中的默认值不是历史实验结果或性能承诺。
+本文根据 2026-10-22 工作区代码整理。参数以 [`joint_train.yaml`](joint_train.yaml) 和实际运行生成的 Hydra 配置为准；文中的默认值不是历史实验结果或性能承诺。
 
 ## 1. 实现目标与边界
 
@@ -8,7 +8,7 @@
 
 注册的算法名是 `ltx2_unigrpo_nft`，当前文本损失默认采用 GRPO，可选择 GSPO；音视频损失复用 `OmniNFTLoss`。配置中的 `trainer_type: direct_preference` 与 `sample_source: online` 选择在线生成的 diffusion trainer 路径，不表示读取离线偏好对，也不表示训练 critic。
 
-当前配方面向单节点 Ascend NPU，Actor 使用 FSDP2，rollout 使用多个独立单卡 worker，每个 worker 的 TP=1。启动脚本不依赖 Docker，也不包含固定容器名或挂载路径。
+当前配方面向单节点 Ascend NPU，Actor 使用 FSDP2，rollout 使用多个独立单卡 worker，每个 worker 的 TP=1。启动脚本可直接执行，也可在 Docker 内执行；运行前检查模型、数据及健康检查路径是否适用于当前环境。
 
 ## 2. 代码职责
 
@@ -21,15 +21,36 @@
 | `verl_omni/trainer/main_diffusion.py` | Hydra/Ray 入口与训练任务初始化 |
 | `verl_omni/trainer/diffusion/ltx_joint_ray_trainer.py` | 联合训练调度、固定验证、策略版本、EMA 与样本保存 |
 | `verl_omni/pipelines/ltx2_unigrpo_nft/hooks.py` | rollout、old/ref/current 前向、文本及 AV 分支 backward |
-| `verl_omni/pipelines/ltx2_unigrpo_nft/model.py` | Gemma、connector、DiT 的训练侧组合与条件编码 |
-| `verl_omni/pipelines/ltx2_unigrpo_nft/adapters.py` | 临时关闭 Gemma LoRA 的基础模型编码上下文 |
+| `verl_omni/pipelines/ltx2_unigrpo_nft/model.py` | Gemma、connector、DiT 的训练侧组合、条件编码与 `base_encoder` 上下文 |
+| `verl_omni/pipelines/ltx2_unigrpo_nft/attention.py` | Connector 与 DiT 的原生推理算术对齐及可微 LoRA 投影 |
 | `verl_omni/pipelines/ltx2_unigrpo_nft/loss.py` | 文本信用分配、训练噪声、文本/AV 损失组合 |
 | `verl_omni/trainer/diffusion/recaption_grpo.py` | 分组 advantage、GRPO/GSPO、文本参考 KL 与一致性指标 |
 | `verl_omni/trainer/diffusion/diffusion_algos.py` | OmniNFT reward 归一化、模态路由和 NFT 目标 |
 | `verl_omni/workers/rollout/ltx_joint_backend.py` | 原生 DiffusionEngine、逐样本推理和成对权重同步 |
 | `verl_omni/pipelines/ltx2_unigrpo_nft/vllm_omni_rollout_adapter.py` | Gemma 改写与原生 LTX 音视频生成、replay 返回 |
 | `verl_omni/pipelines/ltx2_unigrpo_nft/policy_state.py`、`weight_sync.py` | 成对策略快照、版本校验、LoRA 导出 |
-| `verl_omni/pipelines/ltx2_unigrpo_nft/replay.py`、`artifacts.py` | 精确生成记录、媒体与提示词/reward 落盘 |
+| `verl_omni/pipelines/ltx2_unigrpo_nft/replay.py`、`artifacts.py` | 改写指令、精确生成记录、媒体与提示词/reward 落盘 |
+
+建议按以下顺序阅读，不必逐个打开所有模块：
+
+1. [run_train.sh](run_train.sh) 与 [joint_train.yaml](joint_train.yaml)：启动入口和参数。
+2. [ltx_joint_ray_trainer.py](../../../verl_omni/trainer/diffusion/ltx_joint_ray_trainer.py) 与 [hooks.py](../../../verl_omni/pipelines/ltx2_unigrpo_nft/hooks.py)：训练调度、old/ref/current 前向、两路 backward。
+3. [vllm_omni_rollout_adapter.py](../../../verl_omni/pipelines/ltx2_unigrpo_nft/vllm_omni_rollout_adapter.py)：按“改写文本 → 条件编码 → 音视频生成 → replay”阅读。
+4. [model.py](../../../verl_omni/pipelines/ltx2_unigrpo_nft/model.py)、[attention.py](../../../verl_omni/pipelines/ltx2_unigrpo_nft/attention.py) 与 [loss.py](../../../verl_omni/pipelines/ltx2_unigrpo_nft/loss.py)：模型、精度对齐和训练目标。
+5. [offload.py](../../../verl_omni/pipelines/ltx2_unigrpo_nft/offload.py)、[policy_state.py](../../../verl_omni/pipelines/ltx2_unigrpo_nft/policy_state.py) 与 [weight_sync.py](../../../verl_omni/pipelines/ltx2_unigrpo_nft/weight_sync.py)：组件驻留、策略快照和成对 LoRA 同步。
+
+其余模块按需查阅：`config.py` 定义模型配置；`diffusers_training_adapter.py` 接入训练引擎；`replay.py` 定义改写与回放协议；`rewards.py` 转换评分输入并提供离线评分入口；`artifacts.py` 保存样本；`text_diagnostics.py` 负责文本对拍。目录保留 15 个 Python 文件（含 `__init__.py`），原有模型与 replay 类路径不变。
+
+### 2.1 权重搬运与保留的检查
+
+`offload.py` 集中管理六个 rollout 组件以及 `AdapterCpuWeights`。冻结权重的通用实现位于 [frozen_cpu_weights.py](../../../verl_omni/utils/frozen_cpu_weights.py)，rollout 和 reward 共用；Actor/FSDP 的参数存储仍由训练引擎管理。
+
+- 冻结参数和持久 buffer 保留 CPU 主副本。激活组件时校验 CPU 哈希、同步搬运，再逐块比较设备权重与 CPU 副本；卸载时恢复 CPU 存储，丢弃设备权重。非持久动态缓存仍走普通迁移。
+- Gemma 与 DiT 的 LoRA 在同一版本全部加载完成后，才发布 CPU 快照；更新未完成时禁止执行 rollout。原生 LoRA sidecar 也由同一驻留控制器管理。
+- 文本检查保留在 `text_diagnostics.py`：R 是生成时记录的 logprob，R′ 是 rollout 同策略重算，T 是 Actor old-policy 重算。对比必须对应相同 token、mask 和 policy version。配置入口仍为 `actor_rollout_ref.rollout.ltx_joint.text_diagnostics`。
+- HPS 健康检查保留，配置入口仍为 `reward.models.hpsv3.executor.kwargs.health_check`；它验证固定样本的评分行为，与文本对拍相互独立。
+
+已删除针对 Gemma 第 47 层的临时 `weight_guard.py`、AV/MSProbe 对拍 RPC、专用启动脚本和配置。旧启动命令需去掉 `text_diagnostics.frozen_weight_guard` 覆盖项；常规文本检查和 HPS 检查参数不变。历史输出与证据不随清理删除。全量权重搬运校验不依赖文本诊断开关，仍保留在组件激活边界；这些校验能够检测差异，不能证明底层传输绝不会出错。
 
 `LTXJointRayTrainer` 继承 `BagelJointRayTrainer`，复用分组分发等公共能力，并覆盖 LTX 的更新、验证和产物逻辑。
 
@@ -508,4 +529,4 @@ old/reference 是每个 rank 的 CPU 参数快照，不是额外 PEFT adapter �
 
 相关自动化测试位于 `tests/pipelines/test_ltx2_joint_*_on_cpu.py`、`tests/trainer/diffusion/test_ltx_joint_trainer_on_cpu.py`、`test_recaption_grpo_on_cpu.py` 和 checkpoint/reward 测试中。它们覆盖协议、梯度边界、分组目标、产物与恢复状态等行为。
 
-CPU 测试不等于真实 NPU 全流程验收，历史实验结果也不能替代当前配置的性能或质量评估。本文仅整理代码和配置，本次编写没有启动训练或重新执行完整测试套件。
+CPU 测试不等于真实 NPU 全流程验收，历史实验结果也不能替代当前配置的性能或质量评估。本次整理的 376 项相关 CPU 回归测试通过；Ruff 检查通过。NPU 7 上以小张量验证了 FP32/BF16 六组件切换、两次 LoRA 版本更新、reward 往返搬运及设备损坏注入拦截。没有启动完整模型训练，也未据此宣称偶现传输故障已被排除。

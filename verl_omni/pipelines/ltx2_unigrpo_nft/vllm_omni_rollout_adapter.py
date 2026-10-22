@@ -29,10 +29,9 @@ from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 
-from .adapters import base_encoder
 from .config import GUIDANCE_DEFAULTS
-from .planning import direct_recaption, planning_instruction
-from .replay import LTXJointReplay
+from .model import base_encoder
+from .replay import LTXJointReplay, direct_recaption, planning_instruction
 
 
 @VllmOmniPipelineBase.register("LTX2Pipeline", algorithm="ltx2_unigrpo_nft")
@@ -49,6 +48,16 @@ class LTXJointPipeline(LTX2Pipeline):
     diffusion_io_spec = DiffusionIOSpec(primary=MediaSpec("video"), auxiliary=(MediaSpec("audio", sample_rate=24000),))
 
     def __init__(self, *, od_config, prefix=""):
+        from vllm_omni.platforms import current_omni_platform
+
+        from verl_omni.utils.determinism import configure_worker_determinism
+
+        # Omni's set_device() enables private formats. Override it before the
+        # base constructor allocates or loads model tensors, matching the actor.
+        if current_omni_platform.device_type == "npu":
+            torch.npu.config.allow_internal_format = False
+            print("LTX_NPU_FORMAT side=rollout allow_internal_format=False", flush=True)
+        configure_worker_determinism()
         super().__init__(od_config=od_config, prefix=prefix)
         if os.environ.get("LTX_DISABLE_PROGRESS_BAR", "0") == "1":
             self.set_progress_bar_config(disable=True)
@@ -72,13 +81,27 @@ class LTXJointPipeline(LTX2Pipeline):
             component = getattr(self, name, None)
             if isinstance(component, torch.nn.Module):
                 component.requires_grad_(False)
+        from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
+
+        # Gemma has already loaded its checkpoint; the DiT loader runs later.
+        self.text_encoder._joint_cpu_weights = FrozenCpuWeights(self.text_encoder)
 
     def enable_omni_model_cpu_offload(self, *, device, pin_memory, use_hsdp):
+        from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
+
         from .offload import JointRolloutOffload
 
         if use_hsdp:
             raise ValueError("Joint rollout component offload requires an unsharded worker")
         if getattr(self, "_joint_offload", None) is None:
+            # The native runner calls this AFTER checkpoint loading and BEFORE
+            # creating the LoRA manager. Never capture an uninitialized DiT or
+            # include later-injected mutable policy adapters in its base master.
+            for name in JointRolloutOffload.component_names:
+                component = getattr(self, name)
+                if getattr(component, "_joint_cpu_weights", None) is None:
+                    component.requires_grad_(False)
+                    component._joint_cpu_weights = FrozenCpuWeights(component)
             self._joint_offload = JointRolloutOffload(self, device)
 
     def disable_omni_model_cpu_offload(self):
@@ -180,6 +203,10 @@ class LTXJointPipeline(LTX2Pipeline):
 
     @torch.no_grad()
     def forward(self, req):
+        """Run one committed policy request and release residency on every exit."""
+        from verl_omni.utils.determinism import configure_worker_determinism
+
+        configure_worker_determinism()
         if len(req.requests) != 1:
             raise ValueError("Initial LTX joint rollout admits exactly one request per worker")
         incoming = req.requests[0]
@@ -188,136 +215,157 @@ class LTXJointPipeline(LTX2Pipeline):
         try:
             if dummy:
                 return super().forward(req)
-            extra = incoming.sampling_params.extra_args or {}
-            version = extra.get("policy_version")
-            if getattr(self, "_joint_sync_in_progress", True) or version != getattr(
-                self, "_joint_policy_version", None
-            ):
-                raise RuntimeError("Joint policy pair is not committed for this rollout version")
-            request_lora = incoming.sampling_params.lora_request
-            if request_lora is None or request_lora.lora_int_id != self._joint_lora_request.lora_int_id:
-                raise RuntimeError("Request DiT LoRA does not match the committed Gemma/DiT pair")
-            original = incoming.prompt.get("prompt")
-            if not isinstance(original, str) or not original.strip():
-                raise ValueError("Joint rollout requires the original user prompt text")
-            seed = int(incoming.sampling_params.seed)
-            temperature = float(extra["recaption_temperature"])
+            original, version, extra = self._validate_joint_request(incoming)
             device = torch.device(self.device)
             device_api = torch.get_device_module(device) if device.type != "cpu" else None
             if device_api is not None:
                 device_api.reset_peak_memory_stats()
-            started = perf_counter()
-            response_text, prompt_ids, response_ids, logprobs, eos = self._recaption(
-                original,
-                seed=seed,
-                temperature=temperature,
-                max_new_tokens=extra["recaption_max_new_tokens"],
-                duration_seconds=(incoming.sampling_params.num_frames - 1) / incoming.sampling_params.frame_rate,
-            )
-            text_diagnostic = None
-            diagnostic = getattr(self, "_joint_text_diagnostics", None)
-            if diagnostic is not None and diagnostic.enabled:
-                # Preserve R/R-prime and buffers before condition encoding, AV, or offload.
-                text_diagnostic = diagnostic.rollout(
-                    self.text_encoder,
-                    prompt_ids,
-                    response_ids,
-                    logprobs,
-                    version=version,
-                    seed=seed,
-                    temperature=temperature,
-                    request_id=incoming.request_id,
-                )
-            ended_with_eos = int(response_ids[-1]) in eos
-            try:
-                text = direct_recaption(response_text, ended_with_eos=ended_with_eos)
-            except ValueError as error:
-                # Keep the sampled text in the RPC error: failed requests never
-                # reach periodic sample saving, making the old error unactionable.
-                raise ValueError(
-                    f"{error}; policy_version={version}, seed={seed}, "
-                    f"response_tokens={response_ids.numel()}, "
-                    f"max_new_tokens={extra['recaption_max_new_tokens']}, "
-                    f"ended_with_eos={ended_with_eos}, response_text={response_text!r}"
-                ) from error
-            recaption_time = perf_counter() - started
-            generation_start = perf_counter()
-            maximum = incoming.sampling_params.max_sequence_length or self.tokenizer_max_length
-            embeddings, condition_ids, condition_mask = self._condition(text, maximum)
-            request = copy(incoming)
-            request.prompt = {
-                "prompt": text,
-                "prompt_embeds": embeddings[0],
-                "prompt_attention_mask": condition_mask[0],
-            }
-            request.sampling_params = copy(incoming.sampling_params)
-            request.sampling_params.output_type = "pt"
-            output = super().forward(DiffusionRequestBatch(requests=[request]))
-            if self._joint_clean is None or self._joint_forward_context is None:
-                raise RuntimeError("Native LTX did not expose final clean latents")
-            video_clean, audio_clean = self._joint_clean
-            context = self._joint_forward_context
-            geometry = context.request_inputs
-            record = LTXJointReplay(
-                original_prompt=original,
-                recaption=text,
-                planning=None,
-                response_format="caption",
-                response_text=response_text,
-                prompt_token_ids=prompt_ids,
-                response_token_ids=response_ids,
-                rollout_logprobs=logprobs,
-                condition_token_ids=condition_ids[0].cpu(),
-                condition_attention_mask=condition_mask[0].cpu(),
-                policy_version=version,
-                text_diagnostic=text_diagnostic,
-                seed=seed,
-                temperature=temperature,
-                eos_token_ids=eos,
-                generation_params={
-                    "height": geometry.height,
-                    "width": geometry.width,
-                    "num_frames": geometry.num_frames,
-                    "frame_rate": geometry.frame_rate,
-                    "num_inference_steps": geometry.num_inference_steps,
-                    "gemma_dtype": str(self.text_encoder.dtype),
-                    "max_sequence_length": maximum,
-                    **{key: extra.get(key, default) for key, default in GUIDANCE_DEFAULTS.items()},
-                },
-            )
-            record.validate()
-            video, audio = output.output
-            if video.ndim == 5:
-                video = video[0]
-            # Materialize outputs before ending the stage's wall-clock measurement.
-            video_clean, audio_clean = video_clean.float().cpu(), audio_clean.float().cpu()
-            return with_rollout_data(
-                replace(output, output=(video, audio)),
-                media_key="video",
-                to_cpu=True,
-                rl={
-                    "ltx_joint_replay": asdict(record),
-                    "video_latents_clean": video_clean,
-                    "audio_latents_clean": audio_clean,
-                    "audio": audio,
-                    "train_timesteps": context.timesteps.float().cpu().unsqueeze(0),
-                    "fps": torch.tensor([geometry.frame_rate]),
-                    "audio_sample_rate": torch.tensor([self.vocoder.config.output_sampling_rate]),
-                    "recaption_time": recaption_time,
-                    "generation_time": perf_counter() - generation_start,
-                    "memory_metrics": {
-                        "rollout/max_memory_allocated_gib": device_api.max_memory_allocated() / 1024**3,
-                        "rollout/max_memory_reserved_gib": device_api.max_memory_reserved() / 1024**3,
-                    }
-                    if device_api is not None
-                    else {},
-                },
-            )
+            text_record, recaption_time = self._recaption_request(incoming, original, version, extra)
+            return self._generate_av_request(incoming, text_record, recaption_time, device_api)
         finally:
             self._joint_clean = self._joint_forward_context = None
             controller = getattr(self, "_joint_offload", None)
             if controller is not None:
                 controller.release()
+
+    def _validate_joint_request(self, incoming):
+        """Require the committed Gemma/DiT pair and an original user prompt."""
+        extra = incoming.sampling_params.extra_args or {}
+        version = extra.get("policy_version")
+        if getattr(self, "_joint_sync_in_progress", True) or version != getattr(self, "_joint_policy_version", None):
+            raise RuntimeError("Joint policy pair is not committed for this rollout version")
+        request_lora = incoming.sampling_params.lora_request
+        if request_lora is None or request_lora.lora_int_id != self._joint_lora_request.lora_int_id:
+            raise RuntimeError("Request DiT LoRA does not match the committed Gemma/DiT pair")
+        original = incoming.prompt.get("prompt")
+        if not isinstance(original, str) or not original.strip():
+            raise ValueError("Joint rollout requires the original user prompt text")
+        return original, version, extra
+
+    def _recaption_request(self, incoming, original, version, extra):
+        """Sample text, capture R/R-prime immediately, then parse the AV caption."""
+        seed = int(incoming.sampling_params.seed)
+        temperature = float(extra["recaption_temperature"])
+        started = perf_counter()
+        response_text, prompt_ids, response_ids, logprobs, eos = self._recaption(
+            original,
+            seed=seed,
+            temperature=temperature,
+            max_new_tokens=extra["recaption_max_new_tokens"],
+            duration_seconds=(incoming.sampling_params.num_frames - 1) / incoming.sampling_params.frame_rate,
+        )
+        text_diagnostic = None
+        diagnostic = getattr(self, "_joint_text_diagnostics", None)
+        if diagnostic is not None and diagnostic.enabled:
+            # Preserve R/R-prime and buffers before condition encoding, AV, or offload.
+            text_diagnostic = diagnostic.rollout(
+                self.text_encoder,
+                prompt_ids,
+                response_ids,
+                logprobs,
+                version=version,
+                seed=seed,
+                temperature=temperature,
+                request_id=incoming.request_id,
+            )
+        ended_with_eos = int(response_ids[-1]) in eos
+        try:
+            text = direct_recaption(response_text, ended_with_eos=ended_with_eos)
+        except ValueError as error:
+            # Keep the sampled text in the RPC error: failed requests never
+            # reach periodic sample saving, making the old error unactionable.
+            raise ValueError(
+                f"{error}; policy_version={version}, seed={seed}, "
+                f"response_tokens={response_ids.numel()}, "
+                f"max_new_tokens={extra['recaption_max_new_tokens']}, "
+                f"ended_with_eos={ended_with_eos}, response_text={response_text!r}"
+            ) from error
+        recaption_time = perf_counter() - started
+        return dict(
+            original_prompt=original,
+            recaption=text,
+            planning=None,
+            response_format="caption",
+            response_text=response_text,
+            prompt_token_ids=prompt_ids,
+            response_token_ids=response_ids,
+            rollout_logprobs=logprobs,
+            policy_version=version,
+            text_diagnostic=text_diagnostic,
+            seed=seed,
+            temperature=temperature,
+            eos_token_ids=eos,
+        ), recaption_time
+
+    def _generate_av_request(self, incoming, text_record, recaption_time, device_api):
+        """Encode the caption, run native AV generation, and attach exact replay geometry."""
+        text = text_record["recaption"]
+        extra = incoming.sampling_params.extra_args or {}
+        generation_start = perf_counter()
+        maximum = incoming.sampling_params.max_sequence_length or self.tokenizer_max_length
+        embeddings, condition_ids, condition_mask = self._condition(text, maximum)
+        request = copy(incoming)
+        request.prompt = {
+            "prompt": text,
+            "prompt_embeds": embeddings[0],
+            "prompt_attention_mask": condition_mask[0],
+        }
+        request.sampling_params = copy(incoming.sampling_params)
+        request.sampling_params.output_type = "pt"
+        output = super().forward(DiffusionRequestBatch(requests=[request]))
+        if self._joint_clean is None or self._joint_forward_context is None:
+            raise RuntimeError("Native LTX did not expose final clean latents")
+        context = self._joint_forward_context
+        geometry = context.request_inputs
+        record = LTXJointReplay(
+            **text_record,
+            condition_token_ids=condition_ids[0].cpu(),
+            condition_attention_mask=condition_mask[0].cpu(),
+            generation_params={
+                "height": geometry.height,
+                "width": geometry.width,
+                "num_frames": geometry.num_frames,
+                "frame_rate": geometry.frame_rate,
+                "num_inference_steps": geometry.num_inference_steps,
+                "gemma_dtype": str(self.text_encoder.dtype),
+                "max_sequence_length": maximum,
+                **{key: extra.get(key, default) for key, default in GUIDANCE_DEFAULTS.items()},
+            },
+        )
+        record.validate()
+        return self._pack_av_result(output, record, context, recaption_time, generation_start, device_api)
+
+    def _pack_av_result(self, output, record, context, recaption_time, generation_start, device_api):
+        """Materialize media and clean latents before recording generation wall time."""
+        video_clean, audio_clean = self._joint_clean
+        geometry = context.request_inputs
+        video, audio = output.output
+        if video.ndim == 5:
+            video = video[0]
+        # Materialize outputs before ending the stage's wall-clock measurement.
+        video_clean, audio_clean = video_clean.float().cpu(), audio_clean.float().cpu()
+        return with_rollout_data(
+            replace(output, output=(video, audio)),
+            media_key="video",
+            to_cpu=True,
+            rl={
+                "ltx_joint_replay": asdict(record),
+                "video_latents_clean": video_clean,
+                "audio_latents_clean": audio_clean,
+                "audio": audio,
+                "train_timesteps": context.timesteps.float().cpu().unsqueeze(0),
+                "fps": torch.tensor([geometry.frame_rate]),
+                "audio_sample_rate": torch.tensor([self.vocoder.config.output_sampling_rate]),
+                "recaption_time": recaption_time,
+                "generation_time": perf_counter() - generation_start,
+                "memory_metrics": {
+                    "rollout/max_memory_allocated_gib": device_api.max_memory_allocated() / 1024**3,
+                    "rollout/max_memory_reserved_gib": device_api.max_memory_reserved() / 1024**3,
+                }
+                if device_api is not None
+                else {},
+            },
+        )
 
 
 __all__ = ["LTXJointPipeline"]

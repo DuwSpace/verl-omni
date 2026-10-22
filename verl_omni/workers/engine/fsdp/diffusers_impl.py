@@ -148,6 +148,11 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             # Seed LoRA/model initialization without requiring deterministic kernels.
             set_seed(self.engine_config.seed)
 
+        from verl_omni.utils.determinism import configure_worker_determinism
+
+        # Override upstream's warn_only=True for full-path diagnostic runs.
+        configure_worker_determinism()
+
         # set FSDP offload params
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload

@@ -16,8 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl_omni.pipelines.ltx2_unigrpo_nft.planning import parse_planned_recaption, planning_instruction
-from verl_omni.pipelines.ltx2_unigrpo_nft.replay import LTXJointReplay
+from verl_omni.pipelines.ltx2_unigrpo_nft.replay import LTXJointReplay, parse_planned_recaption, planning_instruction
 
 PLAN = "Show the bell before the strike. Synchronize its motion with one chime."
 CAPTION = "A brass bell swings once with a clear chime, filmed in a steady close-up."

@@ -84,6 +84,24 @@ def _export_full_determinism_env(config) -> None:
     os.environ["PYTHONHASHSEED"] = str(config.reward.reward_model.rollout.get("seed", 42))
 
 
+def _training_determinism_env(config) -> dict[str, str]:
+    """Settings inherited by Ray workers and their native rollout children."""
+    enabled = OmegaConf.select(config, "actor_rollout_ref.actor.fsdp_config.full_determinism", default=False)
+    enabled = enabled or OmegaConf.select(config, "actor_rollout_ref.rollout.full_determinism", default=False)
+    if not enabled:
+        return {}
+    return {
+        "VERL_OMNI_FULL_DETERMINISM": "1",
+        "HCCL_DETERMINISTIC": "strict",
+        "LCCL_DETERMINISTIC": "1",
+        "CLOSE_MATMUL_K_SHIFT": "1",
+        "CUBLAS_WORKSPACE_CONFIG": ":16:8",
+        "FLASH_ATTENTION_DETERMINISTIC": "1",
+        "VERL_DISABLE_FLASH_ATTN_CE": "1",
+        "PYTHONHASHSEED": str(OmegaConf.select(config, "actor_rollout_ref.actor.fsdp_config.seed", default=42)),
+    }
+
+
 def _validate_grm_reward_function(config) -> None:
     """Require an explicit reward function when the RM is enabled."""
     rm_cfg = config.reward.reward_model
@@ -113,6 +131,8 @@ def run_diffusion(config, task_runner_class=None) -> None:
     # Before ray.init() so actors inherit these via runtime_env.
     if _determinism_requested(config):
         _export_full_determinism_env(config)
+    determinism_env = _training_determinism_env(config)
+    os.environ.update(determinism_env)
 
     # Check if Ray is not initialized
     if not ray.is_initialized():
@@ -125,6 +145,8 @@ def run_diffusion(config, task_runner_class=None) -> None:
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
+        if determinism_env:
+            runtime_env = OmegaConf.merge(runtime_env, {"env_vars": determinism_env})
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
