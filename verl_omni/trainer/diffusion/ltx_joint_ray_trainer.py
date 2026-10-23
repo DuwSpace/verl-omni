@@ -192,11 +192,6 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
         return batch
 
     def _compute_reward_colocate(self, batch):
-        batch.meta_info["reward_diagnostics_context"] = {
-            "step": self.global_steps,
-            "phase": "validation" if getattr(self, "_evaluating", False) else "train",
-            "policy_version": self._rollout_version(),
-        }
         started = perf_counter()
         result = super()._compute_reward_colocate(batch)
         self._joint_reward_time = perf_counter() - started

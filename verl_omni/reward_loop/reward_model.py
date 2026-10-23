@@ -100,16 +100,9 @@ class MultiRewardModelManager:
             raise ValueError(f"Reward model {name!r} is not a native model")
         model.bind_workers(workers)
 
-    async def wake_up(self, context: dict | None = None) -> None:
+    async def wake_up(self) -> None:
         """Wake independent reward models concurrently."""
-        await asyncio.gather(
-            *(
-                model.wake_up(context=context)
-                if context is not None and isinstance(model, NativeManagedRewardModel)
-                else model.wake_up()
-                for model in self.models.values()
-            )
-        )
+        await asyncio.gather(*(model.wake_up() for model in self.models.values()))
 
     async def sleep(self) -> None:
         """Attempt to sleep every model and report the first lifecycle error."""
@@ -275,24 +268,14 @@ class NativeManagedRewardModel(ManagedRewardModel):
         refs = [getattr(worker, method).remote(self.name, *args, **kwargs) for worker in self._workers]
         await asyncio.gather(*refs)
 
-    @property
-    def _health_check_enabled(self) -> bool:
-        diagnostics = self.spec.executor_config.get("kwargs", {}).get("health_check") or {}
-        return bool(diagnostics.get("enabled", False))
-
-    async def wake_up(self, context: dict | None = None) -> None:
+    async def wake_up(self) -> None:
         if not self.offload and self._resident:
-            if self._health_check_enabled:
-                await self._run_worker_lifecycle("check_reward_model_health", "before_batch", context=context)
             return
-        kwargs = {"context": context} if context is not None else {}
-        await self._run_worker_lifecycle("wake_up_reward_model", **kwargs)
+        await self._run_worker_lifecycle("wake_up_reward_model")
         self._resident = True
 
     async def sleep(self) -> None:
         if not self.offload:
-            if self._health_check_enabled and self._resident:
-                await self._run_worker_lifecycle("check_reward_model_health", "after_batch")
             return
         await self._run_worker_lifecycle("sleep_reward_model")
         self._resident = False

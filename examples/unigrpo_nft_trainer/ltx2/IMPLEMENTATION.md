@@ -48,9 +48,9 @@
 - 卸载时将当前设备权重 D2H，激活时再 H2D；D2H 的 CPU 目标页先被 zeros 写入，再接收设备数据；H2D 也使用 zeros + copy_。迁移前后同步设备。DTensor 只拷贝 `to_local()` 分片并保留原始 spec，不做重分片。原生 LoRA sidecar 也迁移，且保持可写，供下一次策略加载使用。
 - Gemma 与 DiT 的 LoRA 在同一版本全部加载完成后才发布版本；更新未完成时禁止执行 rollout。
 - 文本检查保留在 `text_diagnostics.py`：R 是生成时记录的 logprob，R′ 是 rollout 同策略重算，T 是 Actor old-policy 重算。对比必须对应相同 token、mask 和 policy version。配置入口仍为 `actor_rollout_ref.rollout.ltx_joint.text_diagnostics`。
-- HPS 健康检查保留，配置入口仍为 `reward.models.hpsv3.executor.kwargs.health_check`；它验证固定样本的评分行为，与文本对拍相互独立。
+- 已移除 HPS 固定输入健康检查和取证缓存；五个 Reward 正常打分不变，无需准备 HPS 基准。
 
-已删除针对 Gemma 第 47 层的临时 `weight_guard.py`、AV/MSProbe 对拍 RPC、专用启动脚本和配置。旧启动命令需去掉 `text_diagnostics.frozen_weight_guard` 覆盖项；常规文本检查和 HPS 检查参数不变。历史输出与证据不随清理删除。本实验分支取消依赖 CPU 主副本的全量搬运比对；文本对拍和 HPS 固定输入检查仍可开启。这是传输路径对照实验，不代表已消除偶发损坏。
+已删除针对 Gemma 第 47 层的临时 `weight_guard.py`、AV/MSProbe 对拍 RPC、专用启动脚本和配置。旧启动命令需去掉 `text_diagnostics.frozen_weight_guard` 覆盖项；常规文本检查保留；旧命令中的 `health_check.*` 参数需删除。历史输出与证据不随清理删除。本实验分支取消依赖 CPU 主副本的全量搬运比对；文本对拍和 HPS 固定输入检查仍可开启。这是传输路径对照实验，不代表已消除偶发损坏。
 
 `LTXJointRayTrainer` 继承 `BagelJointRayTrainer`，复用分组分发等公共能力，并覆盖 LTX 的更新、验证和产物逻辑。
 
