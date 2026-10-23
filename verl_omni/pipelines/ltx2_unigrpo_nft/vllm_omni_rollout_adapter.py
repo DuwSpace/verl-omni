@@ -18,6 +18,7 @@ import os
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import asdict, replace
+from pathlib import Path
 from time import perf_counter
 
 import torch
@@ -58,6 +59,7 @@ class LTXJointPipeline(LTX2Pipeline):
             torch.npu.config.allow_internal_format = False
             print("LTX_NPU_FORMAT side=rollout allow_internal_format=False", flush=True)
         configure_worker_determinism()
+        self._shared_cpu_weights_dir = (od_config.extras or {}).get("ltx_shared_cpu_weights_dir")
         super().__init__(od_config=od_config, prefix=prefix)
         if os.environ.get("LTX_DISABLE_PROGRESS_BAR", "0") == "1":
             self.set_progress_bar_config(disable=True)
@@ -84,7 +86,13 @@ class LTXJointPipeline(LTX2Pipeline):
         from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
 
         # Gemma has already loaded its checkpoint; the DiT loader runs later.
-        self.text_encoder._joint_cpu_weights = FrozenCpuWeights(self.text_encoder)
+        self.text_encoder._joint_cpu_weights = FrozenCpuWeights(
+            self.text_encoder, shared_path=self._shared_weight_path("text_encoder")
+        )
+
+    def _shared_weight_path(self, name):
+        directory = getattr(self, "_shared_cpu_weights_dir", None)
+        return Path(directory) / f"{name}.pt" if directory else None
 
     def enable_omni_model_cpu_offload(self, *, device, pin_memory, use_hsdp):
         from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
@@ -101,7 +109,9 @@ class LTXJointPipeline(LTX2Pipeline):
                 component = getattr(self, name)
                 if getattr(component, "_joint_cpu_weights", None) is None:
                     component.requires_grad_(False)
-                    component._joint_cpu_weights = FrozenCpuWeights(component)
+                    component._joint_cpu_weights = FrozenCpuWeights(
+                        component, shared_path=self._shared_weight_path(name)
+                    )
             self._joint_offload = JointRolloutOffload(self, device)
 
     def disable_omni_model_cpu_offload(self):

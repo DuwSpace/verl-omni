@@ -103,6 +103,7 @@ class LTXJointHooks(DiffusionEngineHooks):
                 recaption_max_new_tokens=settings.max_new_tokens,
                 sync_timeout_seconds=settings.sync_timeout_seconds,
                 enable_cpu_offload=settings.cpu_offload,
+                shared_cpu_weights_dir=getattr(settings, "shared_cpu_weights_dir", None),
                 vae_use_tiling=settings.vae_use_tiling,
                 text_diagnostics=getattr(settings, "text_diagnostics", None),
             )

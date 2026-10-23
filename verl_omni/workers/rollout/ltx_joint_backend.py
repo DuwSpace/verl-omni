@@ -16,7 +16,9 @@
 
 import multiprocessing
 import shutil
+import socket
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 
 from verl_omni.pipelines.ltx2_unigrpo_nft.replay import LTXJointReplay
@@ -36,11 +38,22 @@ class LTXJointVllmBackend:
         recaption_max_new_tokens,
         sync_timeout_seconds,
         enable_cpu_offload=True,
+        shared_cpu_weights_dir=None,
         vae_use_tiling=False,
         text_diagnostics=None,
     ):
         from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
         from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+        from verl_omni.utils.frozen_cpu_weights import serialized_cpu_weight_loading
+
+        shared_directory = None
+        if shared_cpu_weights_dir is not None:
+            if not enable_cpu_offload or not Path(shared_cpu_weights_dir).is_absolute():
+                raise ValueError("Shared CPU weights require cpu_offload and an absolute local directory")
+            # Even when output paths are shared across hosts, their loading
+            # locks and mappings must be independent per node.
+            shared_directory = str(Path(shared_cpu_weights_dir) / socket.gethostname())
 
         self.geometry = dict(geometry)
         self.temperature = recaption_temperature
@@ -81,9 +94,11 @@ class LTXJointVllmBackend:
                 vae_use_tiling=vae_use_tiling,
                 # LTX reads extras during construction; pass a concrete mapping
                 # even on backends whose dataclass default is a Pydantic Field.
-                extras={},
+                extras={"ltx_shared_cpu_weights_dir": shared_directory} if shared_directory else {},
             )
-        self.engine = DiffusionEngine(config)
+        loading = serialized_cpu_weight_loading(shared_directory) if shared_directory else nullcontext()
+        with loading:
+            self.engine = DiffusionEngine(config)
 
     def load_actor_policy(self, module, *, version):
         """Collectively export paired actor LoRA, then commit it on every worker."""

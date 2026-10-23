@@ -700,3 +700,47 @@ execution differences. Compare tensor hashes **by name**, and compare actor shar
 by their recorded layout, not by rank-level aggregate hashes. These captures
 support a subsequent paired module/MSProbe investigation; they do not themselves
 prove a hardware fault or SDC, and this mode does not collect MSProbe layer dumps.
+
+### Sharing frozen CPU weights between rollout processes
+
+The joint recipe enables a file-backed CPU master shared by rollout processes on
+one host:
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    ltx_joint:
+      cpu_offload: true
+      shared_cpu_weights_dir: ${oc.env:LTX_OUTPUT_DIR}/shared_cpu_weights
+```
+
+Use a **local filesystem** for this directory. Set `shared_cpu_weights_dir: null`
+to retain independent per-process masters. The dataclass default remains disabled
+for other recipes. Existing training jobs are unaffected by editing the YAML.
+
+The first initializer atomically publishes one mapped file per component, under a
+hostname subdirectory. Other workers validate the loaded checkpoint values and
+reuse these files. Clean file-backed pages are physically shared; private
+copy-on-write mappings prevent accidental CPU writes from altering other workers
+or the cache. Existing integrity checks still reject altered weights. NPU copies,
+LoRA adapters, and nonpersistent buffers remain private. Actor/FSDP and reward
+weight management are unchanged.
+
+Initialization is serialized on each host, from native engine creation until its
+worker reports ready. Each replica still uses the original checkpoint loader,
+then replaces frozen CPU storage with mapped storage. This limits simultaneous
+loading copies but does not eliminate repeated checkpoint reads; cold startup is
+slower. Physical sharing depends on resident pages and is best measured using
+`Pss` / `Shared_Clean` / `Shared_Dirty` in `/proc/<pid>/smaps`, not summed RSS.
+
+Allow approximately **90 GiB of local disk space per run per host**, plus room for
+checkpoints and samples. This is a capacity estimate, not a measured whole-job RAM
+peak. A tmpfs path such as `/dev/shm/ltx-<unique-run-name>` is also supported but
+consumes host RAM and needs enough capacity alongside Ray; the old 16 GiB Docker
+shared-memory mount is insufficient. Do not reuse one directory across concurrent
+jobs or models. Files are retained for the run and can be deleted **after all its
+workers have exited**. A partial write is never published; mismatched or corrupted
+cache contents raise an error instead of silently replacing a live mapping.
+
+This reduces replicated frozen CPU storage. It does not fix defective memory or
+prove that an NPU transfer path is reliable.

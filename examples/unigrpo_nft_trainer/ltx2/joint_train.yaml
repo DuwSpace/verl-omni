@@ -92,6 +92,9 @@ actor_rollout_ref:
     name: vllm_omni
     ltx_joint:
       cpu_offload: true
+      # Share frozen CPU pages across local rollout processes; null disables.
+      # Requires ~90 GiB of local disk space. Do not put this directory on NFS.
+      shared_cpu_weights_dir: ${oc.env:LTX_OUTPUT_DIR}/shared_cpu_weights
       # Final audiovisual prompt response ceiling; normal generation ends at EOS.
       max_new_tokens: 4096
       temperature: 1.0

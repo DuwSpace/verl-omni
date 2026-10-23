@@ -26,21 +26,24 @@ class Component(torch.nn.Linear):
         return self(value)
 
 
-def test_loaded_components_keep_cpu_masters_without_resetting_new_adapters():
+@pytest.mark.parametrize("shared", [False, True])
+def test_loaded_components_keep_cpu_masters_without_resetting_new_adapters(tmp_path, shared):
     from verl_omni.pipelines.ltx2_unigrpo_nft.vllm_omni_rollout_adapter import LTXJointPipeline
     from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
 
     pipeline = object.__new__(LTXJointPipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline._shared_cpu_weights_dir = str(tmp_path) if shared else None
     for name in JointRolloutOffload.component_names:
         setattr(pipeline, name, Component(2, 2).requires_grad_(False))
     # Gemma already has its master; other components are captured only after
     # the native loader has assigned their checkpoint tensors.
-    gemma_master = FrozenCpuWeights(pipeline.text_encoder)
+    gemma_master = FrozenCpuWeights(pipeline.text_encoder, shared_path=pipeline._shared_weight_path("text_encoder"))
     pipeline.text_encoder._joint_cpu_weights = gemma_master
     pipeline.transformer.weight = torch.nn.Parameter(torch.full((2, 2), 7.0), requires_grad=False)
     expected = {name: getattr(pipeline, name).weight.detach().clone() for name in JointRolloutOffload.component_names}
     pipeline.enable_omni_model_cpu_offload(device="cpu", pin_memory=False, use_hsdp=False)
+    assert len(list(tmp_path.glob("*.pt"))) == (6 if shared else 0)
     assert pipeline.text_encoder._joint_cpu_weights is gemma_master
     controller = pipeline._joint_offload
     for name in JointRolloutOffload.component_names:
@@ -280,3 +283,74 @@ def test_adapter_sidecar_host_storage_is_restored_before_native_setter():
     JointRolloutOffload._move(module, torch.device("cpu"))
     assert module.lora_a_stacked[0].data_ptr() == host_ptr
     torch.testing.assert_close(module.lora_weight, torch.full((2,), 3.0), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_native_engine_receives_shared_path_and_holds_loading_lock(tmp_path, monkeypatch, fail):
+    import fcntl
+    import socket
+    from pathlib import Path
+
+    from vllm_omni.diffusion import data, diffusion_engine
+
+    from verl_omni.workers.rollout.ltx_joint_backend import LTXJointVllmBackend
+
+    directory = tmp_path / socket.gethostname()
+    monkeypatch.setattr(data, "OmniDiffusionConfig", lambda **kwargs: SimpleNamespace(**kwargs))
+
+    def engine(config):
+        assert config.extras["ltx_shared_cpu_weights_dir"] == str(directory)
+        # This lock spans the constructor, not just cache publication.
+        with (directory / "initialization.lock").open("a+b") as lock:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if fail:
+            raise RuntimeError("native loader failed")
+        return SimpleNamespace(od_config=config)
+
+    monkeypatch.setattr(diffusion_engine, "DiffusionEngine", engine)
+    kwargs = dict(
+        model_path="fixture",
+        geometry={},
+        recaption_temperature=1,
+        recaption_max_new_tokens=16,
+        sync_timeout_seconds=60,
+        shared_cpu_weights_dir=str(tmp_path),
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="native loader failed"):
+            LTXJointVllmBackend(**kwargs)
+    else:
+        backend = LTXJointVllmBackend(**kwargs)
+        assert Path(backend.engine.od_config.extras["ltx_shared_cpu_weights_dir"]) == directory
+    with (directory / "initialization.lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_shared_cpu_config_requires_offload_and_absolute_path(tmp_path):
+    from verl_omni.workers.config.diffusion import LTXJointRolloutConfig
+
+    assert LTXJointRolloutConfig().shared_cpu_weights_dir is None
+    config = LTXJointRolloutConfig(shared_cpu_weights_dir=str(tmp_path))
+    assert config.cpu_offload
+    with pytest.raises(ValueError, match="Shared CPU weights"):
+        LTXJointRolloutConfig(shared_cpu_weights_dir="relative")
+    with pytest.raises(ValueError, match="Shared CPU weights"):
+        LTXJointRolloutConfig(shared_cpu_weights_dir=str(tmp_path), cpu_offload=False)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_joint_recipe_passes_shared_cpu_directory_to_actor_settings(tmp_path, monkeypatch, enabled):
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+    from hydra.utils import instantiate
+
+    recipe_dir = Path(__file__).resolve().parents[2] / "examples/unigrpo_nft_trainer/ltx2"
+    monkeypatch.setenv("LTX_OUTPUT_DIR", str(tmp_path))
+    overrides = [] if enabled else ["actor_rollout_ref.rollout.ltx_joint.shared_cpu_weights_dir=null"]
+    with initialize_config_dir(config_dir=str(recipe_dir), version_base=None):
+        config = compose(config_name="joint_train", overrides=overrides)
+    # Hooks read actor model settings, not the rollout config directly.
+    settings = instantiate(config.actor_rollout_ref.model.ltx_joint)
+    assert settings.shared_cpu_weights_dir == (str(tmp_path / "shared_cpu_weights") if enabled else None)

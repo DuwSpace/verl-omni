@@ -196,10 +196,13 @@ ltx_joint:
   # Sequential native model offload.
   cpu_offload: ${oc.select:actor_rollout_ref.rollout.ltx_joint.cpu_offload,true}
 
+  # Shared frozen CPU masters for native rollout processes on this host.
+  shared_cpu_weights_dir: ${oc.select:actor_rollout_ref.rollout.ltx_joint.shared_cpu_weights_dir,null}
+
   # Tile native VAE decoding to reduce memory.
   vae_use_tiling: ${oc.select:actor_rollout_ref.rollout.ltx_joint.vae_use_tiling,false}
 
-  text_diagnostics: ${actor_rollout_ref.rollout.ltx_joint.text_diagnostics}
+  text_diagnostics: ${oc.select:actor_rollout_ref.rollout.ltx_joint.text_diagnostics,null}
 
 # Rollout Algorithm configuration
 algo:

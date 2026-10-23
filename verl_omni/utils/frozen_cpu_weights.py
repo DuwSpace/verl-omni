@@ -10,15 +10,92 @@
 
 """CPU masters for frozen, unsharded inference parameters (never actor/FSDP)."""
 
+import fcntl
 import hashlib
 import json
+import mmap
 import os
+import shutil
+import tempfile
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 
 from .transfer_sync import synchronized_device_transfer
+
+
+@contextmanager
+def serialized_cpu_weight_loading(directory):
+    """Bound cold-load peak memory to one native rollout initializer per node.
+
+    Hold this lock in the parent for the entire DiffusionEngine construction,
+    including the spawned worker's checkpoint load and CPU-master capture.
+    Process exit also releases the lock. No accelerator collective runs here.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "initialization.lock").open("a+b") as lock:
+        print(f"LTX_SHARED_CPU waiting for initialization lock: {directory}", flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _storage_layout(values):
+    """Record views and aliases as well as shapes; pointer values are process-local."""
+    groups = {}
+    layout = {}
+    for name, value in values.items():
+        storage = value.untyped_storage()
+        group = groups.setdefault(storage._cdata, len(groups))
+        layout[name] = (str(value.dtype), tuple(value.shape), tuple(value.stride()), value.storage_offset(), group)
+    return layout
+
+
+def _map_cpu_weights(path, values, expected):
+    """Publish once, then mmap the same inode in all local rollout processes.
+
+    MAP_PRIVATE shares clean file-backed pages, but isolates accidental CPU
+    writes with copy-on-write. The existing integrity guard detects such writes.
+    torch.save/load preserve storage aliases and strides. Files are scoped to
+    the run and retained until the user removes its cache after workers exit.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    layout = _storage_layout(values)
+    with path.with_suffix(".lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not path.exists():
+            storages = {v.untyped_storage()._cdata: v.untyped_storage().nbytes() for v in values.values()}
+            required = sum(storages.values()) + 16 * 1024**2
+            if shutil.disk_usage(path.parent).free < required:
+                raise RuntimeError(f"Insufficient space for shared CPU weights: {path}; need about {required} bytes")
+            fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    torch.save({"version": 1, "layout": layout, "digests": expected, "tensors": values}, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        with torch.serialization.set_default_mmap_options(mmap.MAP_PRIVATE):
+            payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        if payload["version"] != 1 or payload["layout"] != layout or payload["digests"] != expected:
+            raise RuntimeError(f"Shared CPU weight cache does not match the loaded model: {path}")
+        mapped = payload["tensors"]
+        if mapped.keys() != values.keys() or _storage_layout(mapped) != layout:
+            raise RuntimeError(f"Invalid shared CPU weight layout: {path}")
+        for name, value in mapped.items():
+            if tensor_digest(value) != expected[name]:
+                raise RuntimeError(f"Corrupt shared CPU weight cache: {path}: {name}")
+    print(f"LTX_SHARED_CPU mapped {path} ({path.stat().st_size / 1024**3:.2f} GiB), pid={os.getpid()}", flush=True)
+    return mapped
 
 
 def tensor_digest(value):
@@ -68,7 +145,7 @@ class FrozenCpuWeights:
 
     @torch.inference_mode(False)
     @torch.no_grad()
-    def __init__(self, module, *, failure_dir="outputs/weight_integrity"):
+    def __init__(self, module, *, failure_dir="outputs/weight_integrity", shared_path=None):
         self.parameters = {}
         self.buffers = {}
         for name, parameter in module.named_parameters():
@@ -88,6 +165,13 @@ class FrozenCpuWeights:
         self.expected = {name: tensor_digest(host) for name, _, host in self._values()}
         self.failure_dir = Path(failure_dir)
         self.failure = None
+        if shared_path is not None:
+            mapped = _map_cpu_weights(shared_path, {name: host for name, _, host in self._values()}, self.expected)
+            self.parameters = {name: (parameter, mapped[name]) for name, (parameter, _) in self.parameters.items()}
+            self.buffers = {
+                name: (child, attribute, mapped[name]) for name, (child, attribute, _) in self.buffers.items()
+            }
+            self.restore_host()
 
     def _values(self):
         for name, (parameter, host) in self.parameters.items():

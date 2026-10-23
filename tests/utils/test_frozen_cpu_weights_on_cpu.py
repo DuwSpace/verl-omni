@@ -168,3 +168,160 @@ def test_hps_captures_before_device_transfer_and_discards_working_copy(monkeypat
     torch.testing.assert_close(model.weight, expected, rtol=0, atol=0)
     wrapper.close()
     assert wrapper._cpu_weights is None and wrapper._inferencer is None
+
+
+def _mapped_test_model():
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.full((1024, 1024), 2.0), requires_grad=False)
+    model.tied = model.weight
+    model.register_buffer("view", model.weight.detach().t(), persistent=True)
+    model.register_buffer("cache", torch.ones(2), persistent=False)
+    return model
+
+
+def _mapped_child(path, pipe):
+    # Spawn a truly independent process: no inherited Python tensors or mapping.
+    from pathlib import Path
+
+    torch.set_num_threads(1)
+    model = _mapped_test_model()
+    master = FrozenCpuWeights(model, shared_path=path)
+    mapped = str(Path(path).resolve())
+    maps = [line for line in Path("/proc/self/maps").read_text().splitlines() if mapped in line]
+    pipe.send((float(model.weight.sum()), maps))
+    assert pipe.recv() == "change"
+    # A CPU write is private to this process, while unmodified pages are shared.
+    with torch.no_grad():
+        model.weight[0, 0] = 17
+    assert model.view[0, 0].item() == 17
+    assert model.weight is model.tied
+    pipe.send(model.weight[0, 0].item())
+    assert pipe.recv() == "close"
+    del master, model
+    pipe.close()
+
+
+def test_independent_processes_map_same_inode_and_isolate_writes(tmp_path):
+    import multiprocessing
+    from pathlib import Path
+
+    torch.set_num_threads(1)
+    path = tmp_path / "gemma.pt"
+    model = _mapped_test_model()
+    master = FrozenCpuWeights(model, shared_path=path)
+    ctx = multiprocessing.get_context("spawn")
+    parent, child = ctx.Pipe()
+    worker = ctx.Process(target=_mapped_child, args=(str(path), child))
+    worker.start()
+    child.close()
+    try:
+        assert parent.poll(60), "Shared-weight child did not initialize"
+        total, mappings = parent.recv()
+        assert total == 2 * 1024 * 1024
+        inode = str(path.stat().st_ino)
+        assert mappings and all(line.split()[4] == inode for line in mappings)
+        own_maps = [line for line in Path("/proc/self/maps").read_text().splitlines() if str(path) in line]
+        assert own_maps and all(line.split()[4] == inode for line in own_maps)
+        # Both processes have read the same file-backed pages. Linux reports
+        # physical sharing (whether the pages are currently clean or dirty).
+        smaps = Path("/proc/self/smaps").read_text().splitlines()
+        active = False
+        shared_kib = 0
+        for line in smaps:
+            if "-" in line.split()[0]:
+                active = str(path) in line
+            elif active and line.startswith(("Shared_Clean:", "Shared_Dirty:")):
+                shared_kib += int(line.split()[1])
+        assert shared_kib >= 1024
+        parent.send("change")
+        assert parent.poll(30)
+        assert parent.recv() == 17
+        assert model.weight[0, 0].item() == 2
+        master.check("other_process_write", master=True)
+        parent.send("close")
+        worker.join(30)
+        assert worker.exitcode == 0
+    finally:
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(10)
+        parent.close()
+
+
+def test_shared_cache_preserves_aliases_and_leaves_adapter_private(tmp_path):
+    from peft import LoraConfig, inject_adapter_in_model
+
+    path = tmp_path / "base.pt"
+    model = torch.nn.Sequential(torch.nn.Linear(3, 2, bias=False)).requires_grad_(False)
+    model[0].weight.data.fill_(2)
+    original = model[0].weight
+    master = FrozenCpuWeights(model, shared_path=path)
+    inject_adapter_in_model(LoraConfig(r=1, target_modules=["0"]), model, adapter_name="joint")
+    adapter = model[0].lora_B["joint"].weight
+    with torch.no_grad():
+        adapter.fill_(9)
+    original.data = torch.zeros_like(original)
+    master.restore_host()
+    assert model[0].base_layer.weight is original
+    torch.testing.assert_close(original, torch.full_like(original, 2), rtol=0, atol=0)
+    torch.testing.assert_close(adapter, torch.full_like(adapter, 9), rtol=0, atol=0)
+    assert set(master.parameters) == {"0.weight"}
+    # Same run/model opens the cache without writing another copy.
+    second = torch.nn.Sequential(torch.nn.Linear(3, 2, bias=False)).requires_grad_(False)
+    second[0].weight.data.fill_(2)
+    modified = path.stat().st_mtime_ns
+    FrozenCpuWeights(second, shared_path=path)
+    assert path.stat().st_mtime_ns == modified
+
+
+def test_mapped_views_dynamic_buffers_and_offload_restore(tmp_path):
+    model = _mapped_test_model()
+    with torch.inference_mode():
+        master = FrozenCpuWeights(model, shared_path=tmp_path / "base.pt")
+    assert model.weight is model.tied
+    assert model.weight.untyped_storage().data_ptr() == model.view.untyped_storage().data_ptr()
+    assert model.view.stride() == (1, 1024)
+    model.cache = torch.ones(7)
+    model.weight.data = model.weight.detach().clone().zero_()
+    master.restore_host()
+    assert model.cache.shape == (7,)
+    assert model.weight.untyped_storage().data_ptr() == model.view.untyped_storage().data_ptr()
+    master.check("restored", master=True)
+
+
+def test_shared_cache_rejects_another_checkpoint_and_corruption(tmp_path):
+    path = tmp_path / "base.pt"
+    model = torch.nn.Linear(3, 2, bias=False).requires_grad_(False)
+    model.weight.data.fill_(2)
+    FrozenCpuWeights(model, shared_path=path)
+    other = torch.nn.Linear(3, 2, bias=False).requires_grad_(False)
+    other.weight.data.fill_(3)
+    with pytest.raises(RuntimeError, match="does not match"):
+        FrozenCpuWeights(other, shared_path=path)
+    # Keep the metadata intact but corrupt the actual serialized payload.
+    payload = torch.load(path, weights_only=True)
+    payload["tensors"]["weight"].zero_()
+    path.unlink()
+    torch.save(payload, path)
+    other.weight.data.fill_(2)
+    with pytest.raises(RuntimeError, match="Corrupt shared"):
+        FrozenCpuWeights(other, shared_path=path)
+
+
+def test_partial_shared_cache_is_not_published_and_can_retry(tmp_path, monkeypatch):
+    path = tmp_path / "base.pt"
+    model = torch.nn.Linear(3, 2, bias=False).requires_grad_(False)
+    save = torch.save
+
+    def fail_save(payload, stream):
+        stream.write(b"partial")
+        raise OSError("injected write failure")
+
+    monkeypatch.setattr(torch, "save", fail_save)
+    with pytest.raises(OSError, match="injected"):
+        FrozenCpuWeights(model, shared_path=path)
+    assert not path.exists()
+    assert not list(tmp_path.glob(".base.pt.*"))
+    monkeypatch.setattr(torch, "save", save)
+    master = FrozenCpuWeights(model, shared_path=path)
+    master.check("retry", master=True)

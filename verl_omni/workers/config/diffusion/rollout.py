@@ -44,6 +44,8 @@ class LTXJointRolloutConfig(BaseConfig):
     temperature: float = 1.0
     sync_timeout_seconds: int = 600
     cpu_offload: bool = True
+    # None keeps per-process masters. Use a run-specific local path or /dev/shm.
+    shared_cpu_weights_dir: Optional[str] = None
     vae_use_tiling: bool = False
     # Explicitly transported to the native worker; disabled in normal training.
     text_diagnostics: dict = field(default_factory=dict)
@@ -55,6 +57,11 @@ class LTXJointRolloutConfig(BaseConfig):
             raise ValueError("LTX recaption token limit and sync timeout must be positive")
         if not math.isfinite(self.temperature) or self.temperature <= 0:
             raise ValueError("LTX recaption temperature must be finite and positive")
+        if self.shared_cpu_weights_dir is not None:
+            from pathlib import Path
+
+            if not self.cpu_offload or not Path(self.shared_cpu_weights_dir).is_absolute():
+                raise ValueError("Shared CPU weights require cpu_offload and an absolute local directory")
 
 
 @dataclass
