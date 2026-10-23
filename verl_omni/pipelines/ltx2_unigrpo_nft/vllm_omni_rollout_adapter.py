@@ -49,6 +49,12 @@ class LTXJointPipeline(LTX2Pipeline):
     diffusion_io_spec = DiffusionIOSpec(primary=MediaSpec("video"), auxiliary=(MediaSpec("audio", sample_rate=24000),))
 
     def __init__(self, *, od_config, prefix=""):
+        from vllm_omni.platforms import current_omni_platform
+
+        # Override the worker's private-format default before model allocation.
+        if current_omni_platform.device_type == "npu":
+            torch.npu.config.allow_internal_format = False
+            print("LTX_NPU_FORMAT side=rollout allow_internal_format=False", flush=True)
         super().__init__(od_config=od_config, prefix=prefix)
         if os.environ.get("LTX_DISABLE_PROGRESS_BAR", "0") == "1":
             self.set_progress_bar_config(disable=True)

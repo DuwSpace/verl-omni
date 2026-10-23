@@ -10,6 +10,29 @@ Both stages reuse the same Gemma base weights; encoding runs without gradients.
 
 Historical results below predate frozen base encoding and do not validate the new gradient contract.
 
+## Driver-upgrade comparison branch
+
+`experiment/ltx-original-rl-mode` starts from `cf596b6`, the diagnostic
+baseline before the CPU-master and offload refactor. Its only runtime changes
+are:
+
+- Native rollout `additional_config.rl_config.enabled=true` and
+  `additional_config.weight_nz_mode=0`.
+- `torch.npu.config.allow_internal_format=False` before both actor and
+  rollout model construction.
+
+The RL configuration matches the later native-LTX setup: batch-invariant
+custom operators, AR training-consistency hooks and extra sleep cleanup are
+explicitly disabled. Gemma continues using Transformers SDPA.
+
+The original rollout and five reward-model `.to(cpu/device)` paths are kept,
+including their original synchronization behavior. This branch does not add
+CPU masters, zero-initialized copy destinations, or the later transfer fences
+and full-determinism plumbing. Text diagnostics and HPS health checks remain
+as implemented in `cf596b6`. Recipe defaults and its HPS baseline path are
+unchanged so the driver comparison starts from that historical configuration.
+
+
 ## Direct audiovisual prompt rewriting
 
 Gemma now returns only the final audiovisual generation prompt, without tags,

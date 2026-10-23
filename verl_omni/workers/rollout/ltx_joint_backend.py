@@ -65,6 +65,18 @@ class LTXJointVllmBackend:
                 worker_extension_cls="verl_omni.workers.rollout.ltx_joint_worker_extension.LTXJointWorkerExtension",
                 diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
                 enforce_eager=True,
+                # Disable Ascend NZ conversion for the repeatedly updated RL policy.
+                additional_config={
+                    "weight_nz_mode": 0,
+                    "rl_config": {
+                        "enabled": True,
+                        # Keep the native PyTorch kernels shared with the training actor.
+                        "enable_batch_invariant": False,
+                        # Gemma uses Transformers SDPA; this worker has no AR sleep lifecycle.
+                        "enable_training_consistency": False,
+                        "sleep_mode_extra_cleanup": False,
+                    },
+                },
                 enable_cpu_offload=enable_cpu_offload,
                 vae_use_tiling=vae_use_tiling,
                 # LTX reads extras during construction; pass a concrete mapping

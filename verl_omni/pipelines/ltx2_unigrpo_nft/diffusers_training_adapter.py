@@ -31,9 +31,15 @@ class LTXJointTrainingAdapter(LTX23FlowGRPO):
 
     @classmethod
     def build_module(cls, model_config, torch_dtype):
+        import torch
+        from verl.utils.device import get_device_name
+
         from .model import LTXJointModel
 
         cls.validate_lora_config(model_config)
+        if get_device_name() == "npu":
+            torch.npu.config.allow_internal_format = False
+            print("LTX_NPU_FORMAT side=actor allow_internal_format=False", flush=True)
         return LTXJointModel.from_pretrained(model_config.local_path, torch_dtype=torch_dtype)
 
     @classmethod
