@@ -45,7 +45,9 @@ of code changed afterward.
 
 The default dataset uses the complete pinned
 [OmniNFT VGGSound recipe](https://github.com/DuwSpace/verl-omni/tree/98dc6a06ccef1b701b2a917bf4f02a3f4d6c373b/examples/omninft_trainer):
-19,487 training records and 16 validation records. Prepare both full splits:
+19,487 training records and 16 validation records. Both prepared Parquet splits
+are included under `data/omninft/vggsound/ltx_joint_full`; cloning this branch
+is sufficient. To regenerate them from the pinned source:
 
 ```bash
 python examples/unigrpo_nft_trainer/ltx2/prepare_omninft_data.py
