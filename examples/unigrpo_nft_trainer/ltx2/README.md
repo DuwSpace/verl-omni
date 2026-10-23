@@ -719,18 +719,22 @@ to retain independent per-process masters. The dataclass default remains disable
 for other recipes. Existing training jobs are unaffected by editing the YAML.
 
 The first initializer atomically publishes one mapped file per component, under a
-hostname subdirectory. Other workers validate the loaded checkpoint values and
-reuse these files. Clean file-backed pages are physically shared; private
+hostname subdirectory. After its engine initializes successfully, it atomically
+publishes `ready.json`. Other workers validate checkpoint/cache file identities
+and bind empty model parameters directly to these files. Clean file-backed pages are physically shared; private
 copy-on-write mappings prevent accidental CPU writes from altering other workers
 or the cache. Existing integrity checks still reject altered weights. NPU copies,
 LoRA adapters, and nonpersistent buffers remain private. Actor/FSDP and reward
 weight management are unchanged.
 
-Initialization is serialized on each host, from native engine creation until its
-worker reports ready. Each replica still uses the original checkpoint loader,
-then replaces frozen CPU storage with mapped storage. This limits simultaneous
-loading copies but does not eliminate repeated checkpoint reads; cold startup is
-slower. Physical sharing depends on resident pages and is best measured using
+Only the first initializer holds the per-host lock while loading checkpoints and
+creating the cache. Once ready, followers release the lock before engine creation
+and initialize concurrently. They read model configuration, tokenizer and scheduler
+files, but skip checkpoint tensor loading and initial full-weight hash scans.
+Gemma loads directly in FP32, without first constructing a BF16 checkpoint copy.
+CPU-master and device-byte integrity checks still run at component activation.
+The first run still pays the cost of writing approximately 90 GiB; this is not a
+zero-cost startup. Physical sharing depends on resident pages and is best measured using
 `Pss` / `Shared_Clean` / `Shared_Dirty` in `/proc/<pid>/smaps`, not summed RSS.
 
 Allow approximately **90 GiB of local disk space per run per host**, plus room for

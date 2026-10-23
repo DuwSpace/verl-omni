@@ -300,12 +300,19 @@ def test_native_engine_receives_shared_path_and_holds_loading_lock(tmp_path, mon
 
     def engine(config):
         assert config.extras["ltx_shared_cpu_weights_dir"] == str(directory)
-        # This lock spans the constructor, not just cache publication.
+        ready = config.extras["ltx_shared_cpu_weights_ready"]
+        # Only the publisher holds the lock through engine construction.
         with (directory / "initialization.lock").open("a+b") as lock:
-            with pytest.raises(BlockingIOError):
+            if ready:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if fail:
             raise RuntimeError("native loader failed")
+        if not ready:
+            for name in JointRolloutOffload.component_names:
+                (directory / f"{name}.pt").write_bytes(b"fixture cache")
         return SimpleNamespace(od_config=config)
 
     monkeypatch.setattr(diffusion_engine, "DiffusionEngine", engine)
@@ -323,6 +330,9 @@ def test_native_engine_receives_shared_path_and_holds_loading_lock(tmp_path, mon
     else:
         backend = LTXJointVllmBackend(**kwargs)
         assert Path(backend.engine.od_config.extras["ltx_shared_cpu_weights_dir"]) == directory
+        assert not backend.engine.od_config.extras["ltx_shared_cpu_weights_ready"]
+        follower = LTXJointVllmBackend(**kwargs)
+        assert follower.engine.od_config.extras["ltx_shared_cpu_weights_ready"]
     with (directory / "initialization.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 

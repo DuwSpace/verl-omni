@@ -45,7 +45,8 @@ class LTXJointVllmBackend:
         from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
         from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
-        from verl_omni.utils.frozen_cpu_weights import serialized_cpu_weight_loading
+        from verl_omni.pipelines.ltx2_unigrpo_nft.offload import JointRolloutOffload
+        from verl_omni.utils.frozen_cpu_weights import shared_cpu_weight_loading
 
         shared_directory = None
         if shared_cpu_weights_dir is not None:
@@ -96,8 +97,16 @@ class LTXJointVllmBackend:
                 # even on backends whose dataclass default is a Pydantic Field.
                 extras={"ltx_shared_cpu_weights_dir": shared_directory} if shared_directory else {},
             )
-        loading = serialized_cpu_weight_loading(shared_directory) if shared_directory else nullcontext()
-        with loading:
+        loading = (
+            shared_cpu_weight_loading(
+                shared_directory, model_path=model_path, component_names=JointRolloutOffload.component_names
+            )
+            if shared_directory
+            else nullcontext(False)
+        )
+        with loading as ready:
+            if shared_directory:
+                config.extras["ltx_shared_cpu_weights_ready"] = ready
             self.engine = DiffusionEngine(config)
 
     def load_actor_policy(self, module, *, version):

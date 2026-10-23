@@ -325,3 +325,57 @@ def test_partial_shared_cache_is_not_published_and_can_retry(tmp_path, monkeypat
     monkeypatch.setattr(torch, "save", save)
     master = FrozenCpuWeights(model, shared_path=path)
     master.check("retry", master=True)
+
+
+def test_ready_cache_binds_meta_parameters_without_checkpoint_or_hash_scan(tmp_path, monkeypatch):
+    from verl_omni.pipelines.ltx2_unigrpo_nft.shared_weights import _empty_parameters
+    from verl_omni.utils import frozen_cpu_weights as storage
+
+    class TaggedParameter(torch.nn.Parameter):
+        def __init__(self, data, *, tag):
+            self.tag = tag
+
+    def component():
+        model = torch.nn.Module()
+        model.weight = TaggedParameter(torch.full((2, 3), 4.0), tag="keep-loader-metadata")
+        model.tied = model.weight
+        model.register_buffer("cache", torch.ones(2), persistent=False)
+        return model.requires_grad_(False)
+
+    path = tmp_path / "base.pt"
+    with storage.shared_cpu_weight_loading(tmp_path, model_path="fixture", component_names=("base",)) as ready:
+        assert not ready
+        FrozenCpuWeights(component(), shared_path=path)
+    with storage.shared_cpu_weight_loading(tmp_path, model_path="fixture", component_names=("base",)) as ready:
+        assert ready
+        with _empty_parameters():
+            model = component()
+        parameter = model.weight
+        assert parameter.is_meta and model.cache.device.type == "cpu"
+
+        def unexpected_scan(value):
+            raise AssertionError("Follower must not scan whole tensors during initialization")
+
+        monkeypatch.setattr(storage, "tensor_digest", unexpected_scan)
+        master = FrozenCpuWeights.from_shared(model, path)
+    assert model.weight is parameter and model.tied is parameter
+    assert isinstance(parameter, TaggedParameter) and parameter.tag == "keep-loader-metadata"
+    assert model.cache.device.type == "cpu"
+    torch.testing.assert_close(parameter, torch.full((2, 3), 4.0), rtol=0, atol=0)
+    assert master.parameters["weight"][1].data_ptr() == parameter.data_ptr()
+
+
+def test_ready_marker_rejects_changed_files_and_is_not_published_on_failure(tmp_path):
+    from verl_omni.utils.frozen_cpu_weights import shared_cpu_weight_loading
+
+    kwargs = dict(model_path="fixture", component_names=("base",))
+    with pytest.raises(RuntimeError, match="loader failed"):
+        with shared_cpu_weight_loading(tmp_path, **kwargs):
+            raise RuntimeError("loader failed")
+    assert not (tmp_path / "ready.json").exists()
+    with shared_cpu_weight_loading(tmp_path, **kwargs):
+        (tmp_path / "base.pt").write_bytes(b"published")
+    (tmp_path / "base.pt").write_bytes(b"changed")
+    with pytest.raises(RuntimeError, match="changed after publication"):
+        with shared_cpu_weight_loading(tmp_path, **kwargs):
+            pytest.fail("Changed cache must not become ready")

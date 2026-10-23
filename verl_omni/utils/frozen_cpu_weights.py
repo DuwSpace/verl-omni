@@ -26,21 +26,69 @@ import torch
 from .transfer_sync import synchronized_device_transfer
 
 
-@contextmanager
-def serialized_cpu_weight_loading(directory):
-    """Bound cold-load peak memory to one native rollout initializer per node.
+def _file_identity(path):
+    stat = Path(path).stat()
+    return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
 
-    Hold this lock in the parent for the entire DiffusionEngine construction,
-    including the spawned worker's checkpoint load and CPU-master capture.
-    Process exit also releases the lock. No accelerator collective runs here.
+
+def _checkpoint_identity(model_path):
+    path = Path(model_path)
+    files = {}
+    if path.is_dir():
+        for entry in sorted(path.rglob("*")):
+            if entry.is_file() and entry.suffix in (".json", ".safetensors", ".bin", ".pt"):
+                files[str(entry.relative_to(path))] = _file_identity(entry)
+    return {"model": str(path.resolve()) if path.exists() else str(model_path), "files": files}
+
+
+@contextmanager
+def shared_cpu_weight_loading(directory, *, model_path, component_names):
+    """Load once under a lock; release followers to build from the ready cache.
+
+    Only a successfully initialized publisher writes ready.json. Followers
+    check checkpoint/file identities, then release the lock BEFORE constructing
+    their engines. They never reload checkpoint tensors or repeat initial hashes.
+    Activation-time CPU and device integrity checks remain enabled.
     """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    ready = directory / "ready.json"
+    identity = _checkpoint_identity(model_path)
     with (directory / "initialization.lock").open("a+b") as lock:
         print(f"LTX_SHARED_CPU waiting for initialization lock: {directory}", flush=True)
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            yield
+            if ready.exists():
+                manifest = json.loads(ready.read_text())
+                if manifest.get("version") != 1 or manifest.get("checkpoint") != identity:
+                    raise RuntimeError(f"Shared CPU cache belongs to a different checkpoint: {directory}")
+                expected = {f"{name}.pt" for name in component_names}
+                if set(manifest["files"]) != expected:
+                    raise RuntimeError(f"Incomplete shared CPU cache: {directory}")
+                for name, fingerprint in manifest["files"].items():
+                    if _file_identity(directory / name) != fingerprint:
+                        raise RuntimeError(f"Shared CPU cache changed after publication: {directory / name}")
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                yield True
+                return
+
+            yield False
+            if _checkpoint_identity(model_path) != identity:
+                raise RuntimeError("Checkpoint files changed while creating the shared CPU cache")
+            manifest = {
+                "version": 1,
+                "checkpoint": identity,
+                "files": {f"{name}.pt": _file_identity(directory / f"{name}.pt") for name in component_names},
+            }
+            temporary = directory / f".ready-{uuid.uuid4().hex}.json"
+            try:
+                with temporary.open("w") as stream:
+                    json.dump(manifest, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, ready)
+            finally:
+                temporary.unlink(missing_ok=True)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
@@ -172,6 +220,59 @@ class FrozenCpuWeights:
                 name: (child, attribute, mapped[name]) for name, (child, attribute, _) in self.buffers.items()
             }
             self.restore_host()
+
+    @classmethod
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def from_shared(cls, module, shared_path, *, failure_dir="outputs/weight_integrity"):
+        """Bind an empty component to a publisher-validated cache, without scans.
+
+        Keep parameter identities and vLLM parameter subclasses/loader metadata
+        when replacing meta storage. Nonpersistent buffers are constructed on
+        CPU by the normal model constructor and deliberately stay private.
+        """
+        path = Path(shared_path)
+        manifest = json.loads((path.parent / "ready.json").read_text())
+        expected_file = manifest["files"][path.name]
+        if _file_identity(path) != expected_file:
+            raise RuntimeError(f"Shared CPU cache changed after publication: {path}")
+        with torch.serialization.set_default_mmap_options(mmap.MAP_PRIVATE):
+            payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        values = payload["tensors"]
+        if payload["version"] != 1 or _storage_layout(values) != payload["layout"]:
+            raise RuntimeError(f"Invalid shared CPU weight layout: {path}")
+        result = cls.__new__(cls)
+        result.parameters = {}
+        result.buffers = {}
+        for name, parameter in module.named_parameters():
+            result.parameters[name] = (parameter, values[name])
+        for prefix, child in module.named_modules():
+            for name, value in child.named_buffers(recurse=False):
+                if name not in child._non_persistent_buffers_set:
+                    key = f"buffer:{prefix}.{name}"
+                    result.buffers[key] = (child, name, values[key])
+        if set(values) != set(result.parameters) | set(result.buffers) or set(values) != set(payload["digests"]):
+            raise RuntimeError(f"Shared CPU cache does not match component parameters: {path}")
+        for name, parameter, host in result._values():
+            if parameter.shape != host.shape or parameter.dtype != host.dtype:
+                raise RuntimeError(f"Shared CPU cache shape/dtype mismatch: {path}: {name}")
+        for parameter, host in result.parameters.values():
+            if parameter.is_meta:
+                replacement = torch.Tensor._make_subclass(type(parameter), host, False)
+                replacement.__dict__.update(parameter.__dict__)
+                torch.utils.swap_tensors(parameter, replacement)
+            else:
+                parameter.data = host
+                parameter.requires_grad_(False)
+        for child, name, host in result.buffers.values():
+            setattr(child, name, host)
+        if _file_identity(path) != expected_file:
+            raise RuntimeError(f"Shared CPU cache changed during mapping: {path}")
+        result.expected = payload["digests"]
+        result.failure_dir = Path(failure_dir)
+        result.failure = None
+        print(f"LTX_SHARED_CPU attached {path} without checkpoint loading, pid={os.getpid()}", flush=True)
+        return result
 
     def _values(self):
         for name, (parameter, host) in self.parameters.items():

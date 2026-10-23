@@ -60,23 +60,30 @@ class LTXJointPipeline(LTX2Pipeline):
             print("LTX_NPU_FORMAT side=rollout allow_internal_format=False", flush=True)
         configure_worker_determinism()
         self._shared_cpu_weights_dir = (od_config.extras or {}).get("ltx_shared_cpu_weights_dir")
-        super().__init__(od_config=od_config, prefix=prefix)
+        self._shared_cpu_weights_ready = bool((od_config.extras or {}).get("ltx_shared_cpu_weights_ready", False))
+        if self._shared_cpu_weights_dir:
+            from .shared_weights import shared_component_loading
+
+            with shared_component_loading(self._shared_cpu_weights_dir, ready=self._shared_cpu_weights_ready):
+                super().__init__(od_config=od_config, prefix=prefix)
+        else:
+            super().__init__(od_config=od_config, prefix=prefix)
         if os.environ.get("LTX_DISABLE_PROGRESS_BAR", "0") == "1":
             self.set_progress_bar_config(disable=True)
         from transformers import Gemma3ForConditionalGeneration
 
-        # The native loader currently applies one dtype to every component.
-        # Reload the original Gemma weights: upcasting the already-BF16 model
-        # cannot recover checkpoint values rounded during that initial load.
-        # This happens before worker offload hooks and paired LoRA injection.
-        del self.text_encoder
-        self.text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
-            od_config.model,
-            subfolder="text_encoder",
-            torch_dtype=torch.float32,
-            revision=getattr(od_config, "revision", None),
-            attn_implementation="sdpa",
-        )
+        # Shared construction already creates FP32 Gemma. The ordinary native
+        # path applies one dtype to every component, so it still needs a reload:
+        # upcasting BF16 cannot recover the original FP32 checkpoint values.
+        if not self._shared_cpu_weights_dir:
+            del self.text_encoder
+            self.text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
+                od_config.model,
+                subfolder="text_encoder",
+                torch_dtype=torch.float32,
+                revision=getattr(od_config, "revision", None),
+                attn_implementation="sdpa",
+            )
         # Native workers only execute rollout; none of their base/codec
         # parameters participate in the actor optimizer or require gradients.
         for name in ("text_encoder", "transformer", "connectors", "vae", "audio_vae", "vocoder"):
@@ -86,9 +93,18 @@ class LTXJointPipeline(LTX2Pipeline):
         from verl_omni.utils.frozen_cpu_weights import FrozenCpuWeights
 
         # Gemma has already loaded its checkpoint; the DiT loader runs later.
-        self.text_encoder._joint_cpu_weights = FrozenCpuWeights(
-            self.text_encoder, shared_path=self._shared_weight_path("text_encoder")
-        )
+        if not self._shared_cpu_weights_ready:
+            self.text_encoder._joint_cpu_weights = FrozenCpuWeights(
+                self.text_encoder, shared_path=self._shared_weight_path("text_encoder")
+            )
+
+    def load_weights(self, weights):
+        """Load checkpoint tensors only for the publisher or unshared workers."""
+        if not self._shared_cpu_weights_ready:
+            return super().load_weights(weights)
+        # Every component was bound during construction. Do not consume the
+        # native loader's lazy checkpoint iterator or overwrite mapped storage.
+        return {name for name, _ in self.named_parameters()}
 
     def _shared_weight_path(self, name):
         directory = getattr(self, "_shared_cpu_weights_dir", None)
