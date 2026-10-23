@@ -78,53 +78,13 @@ class NativeRewardExecutor:
         self._idle = asyncio.Event()
         self._idle.set()
         self._lock = asyncio.Lock()
-        self._health_error: Exception | None = None
-        self._health_context: dict[str, Any] = {}
 
-    def _raise_if_unhealthy(self) -> None:
-        if self._health_error is not None:
-            raise RuntimeError(
-                f"Native reward model {self.spec.name!r} failed its health check"
-            ) from self._health_error
-
-    async def _check_health(self, stage: str) -> None:
-        """Called under the lifecycle lock, with no inference in flight."""
-        check = getattr(self._model, "check_health", None)
-        if check is not None:
-            try:
-                await asyncio.to_thread(deterministic_call, check, stage=stage, context=dict(self._health_context))
-            except Exception as exc:
-                self._health_error = exc
-                self._awake = False
-                raise
-
-    async def check_health(self, stage: str, context: dict | None = None) -> None:
-        """Check resident models at batch boundaries without offloading them."""
-        while True:
-            await self._idle.wait()
-            async with self._lock:
-                if self._inflight:
-                    continue
-                self._raise_if_unhealthy()
-                if self._model is None or not self._awake:
-                    raise RuntimeError(f"Native reward model {self.spec.name!r} is not awake")
-                if context is not None:
-                    self._health_context = dict(context)
-                await self._check_health(stage)
-                return
-
-    async def wake_up(self, context: dict | None = None) -> None:
+    async def wake_up(self) -> None:
         async with self._lock:
-            self._raise_if_unhealthy()
-            if context is not None:
-                if self._inflight:
-                    raise RuntimeError("Cannot change reward health context during inference")
-                self._health_context = dict(context)
             if self._awake:
                 return
             if self._model is not None:
                 await asyncio.to_thread(self._move_model, self._device)
-                await self._check_health("after_wake")
                 self._awake = True
                 return
             model_cls = _load_native_model(self.spec.executor_config["model"])
@@ -139,7 +99,6 @@ class NativeRewardExecutor:
             configure_worker_determinism()
             with synchronized_device_transfer(self._device):
                 self._model = model_cls(**kwargs)
-            await self._check_health("after_load")
             self._awake = True
 
     def reward_kwargs(self) -> dict[str, Any]:
@@ -152,15 +111,9 @@ class NativeRewardExecutor:
         with synchronized_device_transfer(self._device):
             self._model.to(destination)
 
-    @property
-    def reward_diagnostics(self):
-        """Optional request recorder owned by the currently loaded native model."""
-        return getattr(self._model, "reward_diagnostics", None)
-
     async def infer(self, *args, **kwargs):
         """Run model inference while protecting the wake/sleep boundary."""
         async with self._lock:
-            self._raise_if_unhealthy()
             if self._model is None or not self._awake:
                 raise RuntimeError(f"Native reward model {self.spec.name!r} is not awake")
             self._inflight += 1
@@ -187,16 +140,14 @@ class NativeRewardExecutor:
 
     async def close(self) -> None:
         """Destroy the model, including any retained CPU weights."""
-        await self._sleep(release=True, check_health=False)
+        await self._sleep(release=True)
 
-    async def _sleep(self, *, release: bool, check_health: bool = True) -> None:
+    async def _sleep(self, *, release: bool) -> None:
         while True:
             await self._idle.wait()
             async with self._lock:
                 if self._inflight:
                     continue
-                if check_health and self._awake and self._health_error is None:
-                    await self._check_health("before_sleep")
                 self._awake = False
                 if not release and self._model is not None:
                     await asyncio.to_thread(self._move_model, torch.device("cpu"))

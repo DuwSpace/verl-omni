@@ -149,6 +149,55 @@ must acknowledge the complete pair before generation. Training rollout versions
 are `2 * step - 1`; evaluation versions are `2 * step`, with zero for initial
 evaluation. Immutable old/ref hashes are checked during updates and serialization.
 
+## Start on another eight-NPU server
+
+The host launcher uses the existing image
+`crpi-gwfvpzl8eqw3jv8c.cn-shanghai.personal.cr.aliyuncs.com/verl_omni/npu:npu-a2-main-8d2a9fd`.
+It mounts this checkout at `/repo`, the complete model cache at `/hub`, parquet
+files at `/ltx-data`, and the chosen output directory at `/outputs`. Mounting the
+whole cache preserves Hugging Face snapshot symlinks. The host provides the NPU
+driver; CANN and the engine stack come from the image.
+
+```bash
+cp examples/unigrpo_nft_trainer/ltx2/server.env.example /tmp/ltx-server.env
+# Edit /tmp/ltx-server.env: host model cache, parquet and output directories.
+bash examples/unigrpo_nft_trainer/ltx2/start_docker.sh /tmp/ltx-server.env
+bash examples/unigrpo_nft_trainer/ltx2/start_train.sh ltx23-unigrpo --name first-run
+```
+
+`start_docker.sh` installs the recipe's missing dependencies inside the new
+container with `setup_npu_env.sh`. It pins the tested Transformers, Diffusers,
+PEFT and reward packages, and constrains pip to retain the image's Torch/NPU,
+vLLM and verl versions. It does not rebuild or replace the engine stack. For
+an offline server, prepare a wheel mirror/cache before running the installer;
+a local Docker image alone does not contain the missing Python packages.
+Set `PIP_INDEX_URL` in the server file to select a reachable package mirror.
+An existing container is never deleted or replaced automatically. To retry an
+interrupted install, run `docker exec CONTAINER bash
+/repo/examples/unigrpo_nft_trainer/ltx2/setup_npu_env.sh`.
+
+Training runs in the background by default, from scratch, with Text logprob
+checks enabled. HPS baseline checks and reward diagnostic captures have been
+removed; all five reward scorers still run normally. No HPS reference file is
+needed. Use `--no-text-check` to disable Text checks, or `--foreground` to wait
+for completion and stream logs. Extra arguments after `--` are Hydra overrides.
+
+```bash
+# Two full training steps, eight samples per step, no validation/checkpoint save.
+bash examples/unigrpo_nft_trainer/ltx2/start_train.sh ltx23-unigrpo --name smoke --smoke
+# Inspect startup, training and the final exit code (0 means success).
+docker exec ltx23-unigrpo tail -f /outputs/smoke/launcher.log
+docker exec ltx23-unigrpo cat /outputs/smoke/exit_code
+# Configuration-only check, without loading models or running training.
+bash examples/unigrpo_nft_trainer/ltx2/start_train.sh ltx23-unigrpo --name config-check --foreground -- --cfg job --resolve
+```
+
+The container uses the checkout from which `start_docker.sh` was invoked. Use
+separate checkouts/container names for the CPU-master and pretouch branches;
+keep the mounted code unchanged while a training process is running. Run names
+must be new, and a container permits one managed training run at a time. The
+scripts do not install host drivers or change the branches' offload behavior.
+
 ## Offline logging
 
 The recipe enables `trainer.logger=[console,wandb]`. The launcher sets
@@ -327,8 +376,8 @@ before loading its checkpoint.
 ## Consistency diagnostics and historical evidence
 
 Current text logprob diagnostics are configured through
-`actor_rollout_ref.rollout.ltx_joint.text_diagnostics`; HPS health checks remain
-under `reward.models.hpsv3.executor.kwargs.health_check`.
+`actor_rollout_ref.rollout.ltx_joint.text_diagnostics`. HPS baseline health checks
+and reward diagnostic captures have been removed.
 See [IMPLEMENTATION.md](IMPLEMENTATION.md#21-权重搬运与保留的检查) for the reading guide,
 CPU master lifecycle, and R/R′/T comparisons.
 
@@ -530,106 +579,7 @@ model shards again. This setting requires the installed verl checkpoint manager
 to support `save_lora_only`. The saved files remain distributed training
 checkpoints, not standalone PEFT `adapter_model.safetensors` exports.
 
-## Optional HPS fixed-input health checks
-
-`reward.models.hpsv3.executor.kwargs.health_check.enabled` defaults to `false`.
-When enabled, the same HPS worker scores fixed raw frames after loading weights,
-after each CPU-to-device restore, and after all scoring requests finish but
-before offload. Resident deployments (`offload=false`) check before and after
-each scoring batch. Checks never contribute samples or scores to training.
-LTX attaches the training step, `train`/`validation` phase and policy version to
-each check. Other callers may supply `batch.meta_info.reward_diagnostics_context`.
-
-First collect trusted raw joint samples using
-`trainer.joint_sample_save_tensors=true`. Select a few low/mid/high scoring
-samples and explicitly prepare a reference in the same runtime environment:
-
-```bash
-python examples/unigrpo_nft_trainer/ltx2/prepare_hps_health_reference.py \
-  --samples /path/to/sample-low.pt /path/to/sample-mid.pt /path/to/sample-high.pt \
-  --model-path "$LTX_REWARD_ROOT/HPSv3/HPSv3.safetensors" \
-  --base-model-path "$LTX_REWARD_ROOT/Qwen2-VL-7B-Instruct" \
-  --device npu:1 --num-frames 5 \
-  --output /path/to/hps-reference.pt
-```
-
-The tool uses the normal processor and strict checkpoint loader, skipping only
-random parameter initialization before checkpoint loading. It stores raw frames,
-original reward prompts, processor tensors, explicit decoder position IDs,
-both columns of frame logits, and parameter/buffer fingerprints. Review the
-reference scores before enabling checks. It refuses to overwrite an existing
-reference; training never creates or updates the baseline. MP4 frames are not
-accepted as raw joint sample files. Match the configured frame batch size and
-position-ID mode (`--no-sequential-position-ids` if that scorer setting is false).
-
-Append these overrides to the normal launch/resume command:
-
-```bash
-reward.models.hpsv3.executor.kwargs.health_check.enabled=true \
-reward.models.hpsv3.executor.kwargs.health_check.baseline_path=/path/to/hps-reference.pt \
-reward.models.hpsv3.executor.kwargs.health_check.output_dir="$LTX_OUTPUT_DIR/hps_health"
-```
-
-All paths must be visible inside the reward workers' environment/container.
-Checks require identical preprocessed input hashes and finite frame logits within
-`atol=0.001, rtol=0.0`; the tolerance can be explicitly overridden after measuring
-normal variability. A mean reward alone is not used as the health criterion.
-The normal cost is two probe passes per scoring batch plus the initial load
-check (one forward per selected sample per pass). No full weight hashing occurs
-during successful checks; baseline creation and failure capture hash the model.
-
-Each worker writes `checks-<pid>.jsonl`. On failure, it first saves
-`failure-*/failure.json` and `probes.pt`, then records model fingerprints,
-changed tensor names, buffers (including nonpersistent ones), and reward-head
-weights. Set `health_check.dump_model_state=true` to additionally save the full
-model, which requires substantial disk and host memory. Capture failures are
-reported in `model_capture_error`. The failed executor rejects further inference
-and wake requests; it does not silently reload or reset its baseline. The
-exception reaches the trainer before that reward batch can be used for an
-optimizer update, while explicit cleanup remains available.
-
-This diagnoses state/input drift under fixed probes; it does not establish
-reward quality for every prompt or guarantee detection of every model change.
-Preserve the failure directory before restarting a failed run.
-
-With health checks enabled, `health_check.input_stats.enabled=true` also records
-actual managed HPS scoring requests. `requests-<pid>.jsonl` contains a unique
-request ID, sample UID/seed (when available), step/phase, the selected reward prompt's hash, raw video
-shape/dtype/range/finite count/hash, frame selection and aggregation settings,
-and each micro-batch's frame offsets, selected-frame hash, processor input
-statistics (including effective position IDs), model device/training mode, both columns of logits and final
-reward. Captures use the actual forward, with no extra model inference. Tensor
-statistics require CPU copies/scans and add overhead when enabled.
-
-`batches-<pid>.jsonl` and the `HPS inputs` console summary report counts, errors,
-mean/min/max reward and changes against the preceding batch of the **same phase**.
-The default `score_drop_threshold=3.0` alerts on an absolute decrease in the mean
-scaled HPS reward, with at least `min_batch_samples=4` successful samples in both
-batches. This is a warning and evidence trigger, not a scorer-failure verdict or
-an automatic training stop. Set the threshold to `null` to disable drop alerts.
-
-Actual raw videos, prompts, selected frames and preprocessed tensors remain in a
-CPU ring buffer, bounded per worker by **all** of `max_batches=2`,
-`max_samples=16`, and `max_bytes=21474836480` (20 GiB of cached tensor payload).
-Those are upper limits, not a guarantee that two full batches fit. Oversize
-samples and evicted samples retain their JSON statistics but no cached tensors;
-`raw_input_cached` describes availability when the request finishes. The memory
-limit does not include temporary preprocessing/statistics tensors or the fixed
-health reference. Normal scoring writes no raw-sample files.
-
-Inference/invalid-input/nonfinite-output errors and drop alerts save the recent
-cache to `input-anomaly-*/recent_requests.pt`, at most `max_anomaly_dumps=2` times
-per worker process. A fixed-probe failure independently saves the cache into its
-`failure-*` directory before model fingerprinting. Preserve these files for exact
-raw-input and micro-batch replay; the anomaly dumps do not launch an independent
-rescoring process automatically. JSON encodes nonfinite diagnostic values as
-strings (`"nan"`, `"inf"`); tensor evidence preserves the original values.
-
-All these knobs are under
-`reward.models.hpsv3.executor.kwargs.health_check.input_stats`. Set its `enabled`
-to `false` to keep only the fixed-probe health checks.
-
-### Text rollout/actor logprob diagnosis
+## Text rollout/actor logprob diagnosis
 
 Use this when historical rollout scores disagree with actor old-policy replay.
 Diagnostics are disabled by default. With the same model/data/reward environment

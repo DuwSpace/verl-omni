@@ -48,9 +48,9 @@
 - 冻结参数和持久 buffer 保留 CPU 主副本。激活组件时校验 CPU 哈希、同步搬运，再逐块比较设备权重与 CPU 副本；卸载时恢复 CPU 存储，丢弃设备权重。非持久动态缓存仍走普通迁移。
 - Gemma 与 DiT 的 LoRA 在同一版本全部加载完成后，才发布 CPU 快照；更新未完成时禁止执行 rollout。原生 LoRA sidecar 也由同一驻留控制器管理。
 - 文本检查保留在 `text_diagnostics.py`：R 是生成时记录的 logprob，R′ 是 rollout 同策略重算，T 是 Actor old-policy 重算。对比必须对应相同 token、mask 和 policy version。配置入口仍为 `actor_rollout_ref.rollout.ltx_joint.text_diagnostics`。
-- HPS 健康检查保留，配置入口仍为 `reward.models.hpsv3.executor.kwargs.health_check`；它验证固定样本的评分行为，与文本对拍相互独立。
+- 已移除 HPS 固定输入健康检查和取证缓存；五个 Reward 正常打分不变，无需准备 HPS 基准。
 
-已删除针对 Gemma 第 47 层的临时 `weight_guard.py`、AV/MSProbe 对拍 RPC、专用启动脚本和配置。旧启动命令需去掉 `text_diagnostics.frozen_weight_guard` 覆盖项；常规文本检查和 HPS 检查参数不变。历史输出与证据不随清理删除。全量权重搬运校验不依赖文本诊断开关，仍保留在组件激活边界；这些校验能够检测差异，不能证明底层传输绝不会出错。
+已删除针对 Gemma 第 47 层的临时 `weight_guard.py`、AV/MSProbe 对拍 RPC、专用启动脚本和配置。旧启动命令需去掉 `text_diagnostics.frozen_weight_guard` 覆盖项；常规文本检查保留；旧命令中的 `health_check.*` 参数需删除。历史输出与证据不随清理删除。全量权重搬运校验不依赖文本诊断开关，仍保留在组件激活边界；这些校验能够检测差异，不能证明底层传输绝不会出错。
 
 `LTXJointRayTrainer` 继承 `BagelJointRayTrainer`，复用分组分发等公共能力，并覆盖 LTX 的更新、验证和产物逻辑。
 
