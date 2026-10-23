@@ -134,3 +134,6 @@ tensorboard_log
 
 # locally downloaded reward weights (ImageBind / CLAP)
 .checkpoints
+# Prepared LTX prompt splits for portable training launches.
+!data/omninft/vggsound/ltx_joint_full/train.parquet
+!data/omninft/vggsound/ltx_joint_full/test.parquet
