@@ -1,0 +1,9 @@
+# @package _global_
+# Keep AR recaption generation fixed; update DiT through OmniNFT.
+actor_rollout_ref:
+  actor:
+    diffusion_loss:
+      text_loss_weight: 0.0
+      av_loss_weight: 1.0
+trainer:
+  experiment_name: gemma-frozen-dit-train

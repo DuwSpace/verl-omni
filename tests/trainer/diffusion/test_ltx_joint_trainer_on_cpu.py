@@ -454,3 +454,24 @@ def test_full_batch_256_with_four_samples_per_rank_microbatch():
         config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu = invalid
         with pytest.raises(ValueError, match="micro-batch"):
             LTXJointRayTrainer.validate_joint_config(config)
+
+
+@pytest.mark.parametrize(
+    "mode,text_weight,av_weight", [("av_only", 0.0, 1.0), ("joint", 1.0, 1.0), ("ar_only", 1.0, 0.0)]
+)
+def test_ablation_recipe_changes_only_update_coefficients_and_run_label(monkeypatch, mode, text_weight, av_weight):
+    from hydra import compose, initialize_config_dir
+
+    for key in ("MODEL_PATH", "REWARD_ROOT", "TRAIN_FILE", "VAL_FILE", "OUTPUT_DIR"):
+        monkeypatch.setenv(f"LTX_{key}", f"/unused/{key}")
+    recipe = Path(__file__).resolve().parents[3] / "examples/unigrpo_nft_trainer/ltx2"
+    with initialize_config_dir(config_dir=str(recipe), version_base=None):
+        baseline = compose(config_name="joint_train")
+        selected = compose(config_name="joint_train", overrides=[f"ablation={mode}"])
+    loss = selected.actor_rollout_ref.actor.diffusion_loss
+    assert loss.text_loss_weight == text_weight
+    assert loss.av_loss_weight == av_weight
+    loss.text_loss_weight = baseline.actor_rollout_ref.actor.diffusion_loss.text_loss_weight
+    loss.av_loss_weight = baseline.actor_rollout_ref.actor.diffusion_loss.av_loss_weight
+    selected.trainer.experiment_name = baseline.trainer.experiment_name
+    assert OmegaConf.to_container(selected, resolve=True) == OmegaConf.to_container(baseline, resolve=True)

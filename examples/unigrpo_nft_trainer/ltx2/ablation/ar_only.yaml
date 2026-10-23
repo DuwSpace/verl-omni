@@ -1,0 +1,9 @@
+# @package _global_
+# Update AR/Gemma through GRPO; keep audiovisual DiT adapters fixed.
+actor_rollout_ref:
+  actor:
+    diffusion_loss:
+      text_loss_weight: 1.0
+      av_loss_weight: 0.0
+trainer:
+  experiment_name: gemma-train-dit-frozen

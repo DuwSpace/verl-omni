@@ -1,0 +1,9 @@
+# @package _global_
+# Train both AR/Gemma and audiovisual DiT adapters.
+actor_rollout_ref:
+  actor:
+    diffusion_loss:
+      text_loss_weight: 1.0
+      av_loss_weight: 1.0
+trainer:
+  experiment_name: gemma-dit-joint

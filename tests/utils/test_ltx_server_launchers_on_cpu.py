@@ -67,3 +67,20 @@ def test_run_name_cannot_escape_output_directory(docker_stub):
     result = subprocess.run(["bash", str(SCRIPT), "my-container", "--name", "../old-run"], env=env, capture_output=True)
     assert result.returncode == 2
     assert not calls.exists()
+
+
+@pytest.mark.parametrize("mode", ["av_only", "joint", "ar_only"])
+def test_training_launcher_passes_ablation(docker_stub, mode):
+    env, calls = docker_stub
+    subprocess.run(["bash", str(SCRIPT), "my-container", "--ablation", mode], env=env, check=True, capture_output=True)
+    preflight, launch = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert f"LTX_ABLATION={mode}" in preflight
+    assert f"LTX_ABLATION={mode}" in launch
+    assert any(value.startswith(f"LTX_RUN_NAME=ltx-{mode}-") for value in launch)
+
+
+def test_invalid_ablation_does_not_launch(docker_stub):
+    env, calls = docker_stub
+    result = subprocess.run(["bash", str(SCRIPT), "my-container", "--ablation", "typo"], env=env, capture_output=True)
+    assert result.returncode == 2
+    assert not calls.exists()

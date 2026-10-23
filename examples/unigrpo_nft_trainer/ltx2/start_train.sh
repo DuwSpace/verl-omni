@@ -38,7 +38,7 @@ if [[ ${1:-} == --inside || ${1:-} == --preflight ]]; then
     echo "Started $(date -Is), code=/repo, output=$LTX_OUTPUT_DIR"
     launcher=run_text_diagnostics.sh
     [[ ${LTX_TEXT_CHECK:-1} != 0 ]] || launcher=run_train.sh
-    overrides=(trainer.resume_mode=disable)
+    overrides=(trainer.resume_mode=disable "ablation=${LTX_ABLATION:-joint}")
     if [[ ${LTX_SMOKE:-0} == 1 ]]; then
         overrides+=(trainer.total_training_steps=2 trainer.test_freq=-1 trainer.save_freq=-1 \
             'trainer.logger=[console]' trainer.rollout_data_save_freq=0 data.train_batch_size=4 \
@@ -53,19 +53,21 @@ if [[ ${1:-} == --inside || ${1:-} == --preflight ]]; then
 fi
 set -u
 if [[ $# == 0 || ${1:-} == --help ]]; then
-    echo "Usage: bash $0 CONTAINER [--name RUN] [--foreground] [--smoke] [--no-text-check] [-- HYDRA_OVERRIDES...]"
+    echo "Usage: bash $0 CONTAINER [--name RUN] [--ablation joint|av_only|ar_only] [--foreground] [--smoke] [--no-text-check] [-- HYDRA_OVERRIDES...]"
     echo 'Default: background training with Text checks; no HPS baseline is needed.'
     exit 0
 fi
 container="$1"
 shift
-run_name="ltx-$(date +%Y%m%d-%H%M%S)"
+run_name=""
+ablation=joint
 foreground=0
 smoke=0
 text_check=1
 while (($#)); do
     case "$1" in
         --name) run_name="${2:?Missing run name}"; shift 2 ;;
+        --ablation) ablation="${2:?Missing ablation name}"; shift 2 ;;
         --foreground) foreground=1; shift ;;
         --smoke) smoke=1; shift ;;
         --no-text-check) text_check=0; shift ;;
@@ -73,9 +75,14 @@ while (($#)); do
         *) break ;;
     esac
 done
+case "$ablation" in
+    joint|av_only|ar_only) ;;
+    *) echo 'Ablation must be joint, av_only or ar_only' >&2; exit 2 ;;
+esac
+run_name="${run_name:-ltx-$ablation-$(date +%Y%m%d-%H%M%S)}"
 [[ $run_name =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo 'Invalid run name' >&2; exit 2; }
 entry=/repo/examples/unigrpo_nft_trainer/ltx2/start_train.sh
-env_args=(-e "LTX_RUN_NAME=$run_name" -e "LTX_SMOKE=$smoke" -e "LTX_TEXT_CHECK=$text_check")
+env_args=(-e "LTX_RUN_NAME=$run_name" -e "LTX_SMOKE=$smoke" -e "LTX_TEXT_CHECK=$text_check" -e "LTX_ABLATION=$ablation")
 docker exec "${env_args[@]}" "$container" bash "$entry" --preflight
 if ((foreground)); then
     docker exec "${env_args[@]}" "$container" bash "$entry" --inside "$@"

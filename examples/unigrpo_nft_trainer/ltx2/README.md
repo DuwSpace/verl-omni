@@ -200,6 +200,55 @@ keep the mounted code unchanged while a training process is running. Run names
 must be new, and a container permits one managed training run at a time. The
 scripts do not install host drivers or change the branches' offload behavior.
 
+## AR / OmniNFT update ablations
+
+All three variants inherit `joint_train.yaml`, including its data, seeds,
+learning rates, sample count, five rewards, validation geometry and EMA decay.
+Only the two loss coefficients and the experiment label differ:
+
+| Hydra selection | AR / Gemma LoRA | OmniNFT / DiT LoRA |
+| --- | --- | --- |
+| `ablation=av_only` | Fixed | Updated |
+| `ablation=joint` (default) | Updated | Updated |
+| `ablation=ar_only` | Updated | Fixed |
+
+AR still generates recaptions in every variant, and DiT still generates audio
+and video. A fixed AR policy can produce different text because sampling remains
+stochastic. This ablation disables parameter updates, not recaption generation.
+
+A zero `text_loss_weight` or `av_loss_weight` skips that branch's differentiable
+forward and backward. Disabled gradients are set to `None` before the shared
+optimizer step, preventing AdamW momentum and weight decay from moving the
+parameters. Its rollout `old` EMA is also held fixed. Both adapters remain in
+the model, checkpoint and export pair; `requires_grad` is retained because
+policy snapshots and adapter export use it to discover the complete pair.
+Text old-policy replay and diagnostics remain available in every variant.
+
+Run all three from the same initial model, sequentially on one container:
+
+```bash
+for mode in av_only joint ar_only; do
+  bash examples/unigrpo_nft_trainer/ltx2/start_train.sh ltx23-unigrpo \
+    --ablation "$mode" --foreground \
+    -- trainer.val_before_train=true || break
+done
+```
+
+Run names include the variant and timestamp. Add `--smoke` before `--` for a
+two-step wiring test; smoke mode disables periodic validation/checkpoint saving.
+For direct container launches, pass `ablation=ar_only` (or another variant) to
+`run_train.sh` / `run_text_diagnostics.sh`. Explicit Hydra overrides still take
+precedence over the selected preset. Use the same variant when resuming an
+experiment; switching a trained checkpoint to another variant is a different
+experiment from the from-scratch comparison above.
+
+Compare fixed-prompt validation reward curves at equal training steps, including
+all five components and their combined score. Keep train and validation curves
+separate. Record the initial validation score, Text logprob differences and
+`joint/update_text` / `joint/update_av`; disabled branch gradient norms should
+be zero. Repeat the comparison with matching seeds across variants if measuring
+quality differences; a two-step smoke run only verifies execution.
+
 ## Offline logging
 
 The recipe enables `trainer.logger=[console,wandb]`. The launcher sets

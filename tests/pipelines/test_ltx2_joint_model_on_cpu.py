@@ -1183,3 +1183,74 @@ def test_microbatch_four_matches_single_sample_gradients_with_ragged_text(model,
     assert runs[0][1].keys() == runs[1][1].keys()
     for name in runs[0][1]:
         torch.testing.assert_close(runs[0][1][name], runs[1][1][name], rtol=2e-4, atol=2e-6, msg=name)
+
+
+@pytest.mark.parametrize("text_weight,av_weight", [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0)])
+@pytest.mark.parametrize("micro_size", [1, 2])
+def test_ablation_freezes_parameters_optimizer_state_and_rollout_ema(model, text_weight, av_weight, micro_size):
+    """A disabled branch stays bitwise fixed even with existing AdamW momentum."""
+    from copy import deepcopy
+    from functools import partial
+    from types import SimpleNamespace
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.hooks import LTXJointHooks
+    from verl_omni.pipelines.ltx2_unigrpo_nft.loss import LTXJointLoss
+    from verl_omni.workers.config.diffusion.actor import LTXJointLossConfig
+
+    params = {n: p for n, p in model.named_parameters() if p.requires_grad}
+    optimizer = torch.optim.AdamW(params.values(), lr=0.01, weight_decay=0.1)
+    # Populate optimizer moments as in a resumed checkpoint; leave zero tensors
+    # behind instead of relying on optimizer.zero_grad's default set_to_none.
+    for parameter in params.values():
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=False)
+    hooks = LTXJointHooks(model, None, None)
+    hooks._device = lambda: torch.device("cpu")
+    hooks.begin_rollout(version=0)
+    data, _ = _joint_batch(model)
+    # Make current != old, so a frozen branch's EMA cannot silently drift.
+    with torch.no_grad():
+        for parameter in params.values():
+            parameter.add_(0.001)
+    config = SimpleNamespace(
+        diffusion_loss=LTXJointLossConfig(text_loss_weight=text_weight, av_loss_weight=av_weight, text_kl_coef=0.001),
+        ppo_micro_batch_size_per_gpu=micro_size,
+    )
+    calls = []
+    handle = model.register_forward_pre_hook(
+        lambda module, args, kwargs: calls.append((kwargs["task"], torch.is_grad_enabled())), with_kwargs=True
+    )
+    try:
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=False)
+            before = {n: p.detach().clone() for n, p in params.items()}
+            states = {n: deepcopy(optimizer.state[p]) for n, p in params.items()}
+            old = hooks.state_dict()["old"]
+            result = hooks.forward_backward_batch(data, partial(LTXJointLoss(), config=config))
+            assert result["metrics"]["joint/update_text"] == [text_weight]
+            assert result["metrics"]["joint/update_av"] == [av_weight]
+            assert "consistency/old_logprob_abs_max" in result["metrics"]
+            for prefix, enabled in (("gemma.", text_weight), ("transformer.", av_weight)):
+                selected = {n: p for n, p in params.items() if n.startswith(prefix)}
+                if not enabled:
+                    assert all(p.grad is None for p in selected.values())
+            optimizer.step()
+            hooks.ema_update_adapter(source="default", target="old", decay=0.5)
+            for prefix, enabled in (("gemma.", text_weight), ("transformer.", av_weight)):
+                selected = {n: p for n, p in params.items() if n.startswith(prefix)}
+                if enabled:
+                    assert any(not torch.equal(p, before[n]) for n, p in selected.items())
+                    assert any(not torch.equal(hooks.policies.old[n], old[n]) for n in selected)
+                else:
+                    for n, p in selected.items():
+                        torch.testing.assert_close(p, before[n], rtol=0, atol=0)
+                        torch.testing.assert_close(hooks.policies.old[n], old[n], rtol=0, atol=0)
+                        for key, value in optimizer.state[p].items():
+                            torch.testing.assert_close(value, states[n][key], rtol=0, atol=0)
+    finally:
+        handle.remove()
+    assert (("recaption", True) in calls) == bool(text_weight)
+    assert (("av", True) in calls) == bool(av_weight)
+    if not av_weight:
+        assert not any(task == "av" for task, _ in calls)

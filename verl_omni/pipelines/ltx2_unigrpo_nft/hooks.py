@@ -46,6 +46,8 @@ class LTXJointHooks(DiffusionEngineHooks):
         self.model_config = model_config
         self.optimizer_config = optimizer_config
         self.policies = LTXJointPolicyState(module)
+        self._update_text = True
+        self._update_av = True
         self._rollout_backend = None
         from .text_diagnostics import TextDiagnostics
 
@@ -165,7 +167,7 @@ class LTXJointHooks(DiffusionEngineHooks):
     def ema_update_adapter(self, *, source, target, decay):
         if (source, target) != ("default", "old"):
             raise ValueError("Joint EMA only supports default -> old")
-        self.policies.update_old(decay=decay)
+        self.policies.update_old(decay=decay, update_text=self._update_text, update_av=self._update_av)
 
     def state_dict(self):
         return self.policies.state_dict()
@@ -379,6 +381,11 @@ class LTXJointHooks(DiffusionEngineHooks):
         config = getattr(loss_function, "keywords", {}).get("config")
         if config is None or config.diffusion_loss.loss_mode != "ltx2_unigrpo_nft":
             raise ValueError("LTX joint hooks require the joint loss configuration")
+        self._update_text = config.diffusion_loss.text_loss_weight > 0
+        self._update_av = config.diffusion_loss.av_loss_weight > 0
+        if not (self._update_text or self._update_av):
+            raise ValueError("At least one joint update branch must be enabled")
+        self._clear_disabled_gradients()
         micro_size = config.ppo_micro_batch_size_per_gpu
         if type(micro_size) is not int or micro_size <= 0:
             raise ValueError("Joint micro-batch size must be a positive integer")
@@ -441,9 +448,22 @@ class LTXJointHooks(DiffusionEngineHooks):
         )
         metrics["train/forward_backward_time"] = perf_counter() - started
         metrics["joint/total_loss"] = total
+        metrics["joint/update_text"] = float(self._update_text)
+        metrics["joint/update_av"] = float(self._update_av)
+        # AdamW must see None, not zero gradients: momentum/decay can otherwise
+        # update a disabled adapter, including when resuming optimizer state.
+        self._clear_disabled_gradients()
         self.policies.assert_frozen()
         metrics["joint/frozen_snapshots_verified"] = 1.0
         return {"loss": [total], "metrics": {key: [value] for key, value in metrics.items()}, "model_output": {}}
+
+    def _clear_disabled_gradients(self):
+        """Keep paired LoRA/export topology while excluding disabled optimizer updates."""
+        for name, parameter in self.module.named_parameters():
+            if (name.startswith("gemma.") and not self._update_text) or (
+                name.startswith("transformer.") and not self._update_av
+            ):
+                parameter.grad = None
 
     def _validate_replay_records(self, records):
         """Validate replay identity on every rank before actor forwards."""
@@ -512,14 +532,27 @@ class LTXJointHooks(DiffusionEngineHooks):
                 self._check_text_diagnostic_batch(group, old_logprobs, text_inputs)
             else:
                 old_logprobs = self._ar_batch(group).detach().cpu()
-            old_predictions = [tuple(p.cpu() for p in av(step)[0]) for step in range(step_count)]
+            old_predictions = (
+                [tuple(p.cpu() for p in av(step)[0]) for step in range(step_count)] if self._update_av else []
+            )
         with self.policies.use("ref"):
-            ref_logprobs = self._ar_batch(group).detach().cpu() if config.diffusion_loss.text_kl_coef else None
-            ref_predictions = [tuple(p.cpu() for p in av(step)[0]) for step in range(step_count)]
+            ref_logprobs = (
+                self._ar_batch(group).detach().cpu()
+                if self._update_text and config.diffusion_loss.text_kl_coef
+                else None
+            )
+            ref_predictions = (
+                [tuple(p.cpu() for p in av(step)[0]) for step in range(step_count)] if self._update_av else []
+            )
         return old_logprobs, old_predictions, ref_logprobs, ref_predictions
 
     def _backward_text(self, data, group, selection, config, old_logprobs, ref_logprobs, sample_scale, collect):
         """Accumulate text GRPO/KL gradients and retain the baseline for AV gradient metrics."""
+        if not self._update_text:
+            mask = self._ar_batch_inputs(group)["response_mask"][:, 1:].cpu()
+            collect({"text/total_loss": 0.0, "train/text_time": 0.0})
+            collect(gradient_delta_metrics({}, {}, "text"))
+            return 0.0, old_logprobs[mask], gradient_snapshot(self.module)
         text_start = perf_counter()
         before_text = gradient_snapshot(self.module)
         current = self._ar_batch(group)
@@ -548,6 +581,10 @@ class LTXJointHooks(DiffusionEngineHooks):
         self, data, selection, config, av, old_predictions, ref_predictions, sample_scale, after_text, collect
     ):
         """Accumulate OmniNFT gradients, averaging over the sampled diffusion timesteps."""
+        if not self._update_av:
+            collect({"train/av_time": 0.0})
+            collect(gradient_delta_metrics({}, {}, "av"))
+            return 0.0
         total = 0.0
         step_count = len(old_predictions)
         av_start = perf_counter()

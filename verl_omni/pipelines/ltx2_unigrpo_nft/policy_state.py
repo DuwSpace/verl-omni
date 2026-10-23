@@ -77,8 +77,8 @@ class LTXJointPolicyState(TrainablePolicyState):
         self.rollout_started = True
         self._frozen_digests = self._snapshot_digests()
 
-    def update_old(self, *, decay):
-        """Update paired old adapters once after an entire actor update round."""
+    def update_old(self, *, decay, update_text=True, update_av=True):
+        """Advance enabled adapters' EMA, preserving disabled rollout weights exactly."""
         self.assert_frozen()
         if not math.isfinite(decay) or not 0 <= decay <= 1:
             raise ValueError("Joint old-policy decay must be finite and in [0, 1]")
@@ -86,7 +86,8 @@ class LTXJointPolicyState(TrainablePolicyState):
             raise ValueError("Begin a rollout before updating its old policy")
         current = self._snapshot()
         for name, value in current.items():
-            self.old[name].lerp_(value, 1.0 - decay)
+            if (name.startswith("gemma.") and update_text) or (name.startswith("transformer.") and update_av):
+                self.old[name].lerp_(value, 1.0 - decay)
         self._frozen_digests = self._snapshot_digests()
 
     @contextmanager

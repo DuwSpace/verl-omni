@@ -4,6 +4,7 @@ defaults:
   - diffusion_trainer
   - rewards
   - _self_
+  - ablation: joint
 
 hydra:
   searchpath:
