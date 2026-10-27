@@ -251,6 +251,9 @@ ltx_joint:
   # Maximum generated recaption length, including EOS.
   max_new_tokens: 256
 
+  # Rewriting instruction and chat format: planner or ltx_t2v.
+  recaption_prompt: planner
+
   # Temperature-only recaption sampling.
   temperature: 1.0
 

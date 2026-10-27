@@ -41,6 +41,8 @@ class LTXJointRolloutConfig(BaseConfig):
     """Synchronous two-stage native LTX worker settings."""
 
     max_new_tokens: int = 256
+    # Rewriting instruction and chat format shared by training and validation.
+    recaption_prompt: str = "planner"
     temperature: float = 1.0
     sync_timeout_seconds: int = 600
     cpu_offload: bool = True
@@ -53,6 +55,8 @@ class LTXJointRolloutConfig(BaseConfig):
     def __post_init__(self):
         import math
 
+        if self.recaption_prompt not in ("planner", "ltx_t2v"):
+            raise ValueError("LTX recaption_prompt must be planner or ltx_t2v")
         if self.max_new_tokens <= 0 or self.sync_timeout_seconds <= 0:
             raise ValueError("LTX recaption token limit and sync timeout must be positive")
         if not math.isfinite(self.temperature) or self.temperature <= 0:

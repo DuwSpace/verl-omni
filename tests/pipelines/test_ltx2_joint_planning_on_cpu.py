@@ -16,11 +16,37 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl_omni.pipelines.ltx2_unigrpo_nft.replay import LTXJointReplay, parse_planned_recaption, planning_instruction
+from verl_omni.pipelines.ltx2_unigrpo_nft.replay import (
+    LTXJointReplay,
+    parse_planned_recaption,
+    planning_instruction,
+    recaption_messages,
+)
 
 PLAN = "Show the bell before the strike. Synchronize its motion with one chime."
 CAPTION = "A brass bell swings once with a clear chime, filmed in a steady close-up."
 RESPONSE = f"<plan>{PLAN}</plan>\n<recaption>{CAPTION}</recaption>"
+
+
+def test_recaption_presets_preserve_default_and_upstream_chat():
+    import hashlib
+
+    assert recaption_messages(CAPTION) == [{"role": "user", "content": planning_instruction(CAPTION)}]
+    messages = recaption_messages(CAPTION, preset="ltx_t2v")
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[1]["content"] == f"user prompt: {CAPTION}"
+    # Pin the unmodified upstream prompt, including its whitespace.
+    expected_digest = "0f98f02f9fffae27ee3f576685d6d9f9ef13194a0c2068aacdd97f86ea96efd2"
+    assert hashlib.sha256(messages[0]["content"].encode()).hexdigest() == expected_digest
+
+
+def test_recaption_rejects_unknown_preset():
+    from verl_omni.workers.config.diffusion import LTXJointRolloutConfig
+
+    with pytest.raises(ValueError, match="preset"):
+        recaption_messages(CAPTION, preset="typo")
+    with pytest.raises(ValueError, match="recaption_prompt"):
+        LTXJointRolloutConfig(recaption_prompt="typo")
 
 
 def test_planning_prompt_preserves_task_and_duration():
@@ -185,7 +211,8 @@ def test_sampling_rejects_invalid_geometry_and_guidance(key, value):
         sampling_params(config)
 
 
-def test_backend_forwards_guidance_without_mutating_cached_geometry():
+@pytest.mark.parametrize("preset", ["planner", "ltx_t2v"])
+def test_backend_forwards_guidance_without_mutating_cached_geometry(preset):
     from copy import deepcopy
 
     from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTXModalityGuidance
@@ -202,6 +229,7 @@ def test_backend_forwards_guidance_without_mutating_cached_geometry():
     validation["num_inference_steps"] = 40
     validation["extra_args"].update(audio_cfg_scale=7.0, video_modality_scale=3.0, video_rescale_scale=0.7)
     backend.policy_version, backend.temperature, backend.max_new_tokens = 3, 1.0, 512
+    backend.recaption_prompt = preset
     backend.lora_request = None
     seen = []
 
@@ -216,6 +244,7 @@ def test_backend_forwards_guidance_without_mutating_cached_geometry():
     assert [item.num_inference_steps for item in seen] == [40, 20]
     assert [item.extra_args["audio_cfg_scale"] for item in seen] == [7.0, 3.0]
     assert seen[0].extra_args["recaption_max_new_tokens"] == 512
+    assert [item.extra_args["recaption_prompt"] for item in seen] == [preset, preset]
     guidance = LTXModalityGuidance(cfg_scale=7.0, modality_scale=3.0, rescale_scale=0.7)
     assert guidance.do_cfg and guidance.do_modality_guidance
     assert backend.geometry == original

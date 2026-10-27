@@ -13,6 +13,13 @@ if [[ ${1:-} == --inside || ${1:-} == --preflight ]]; then
     cd /repo
     export PYTHONPATH="/repo${PYTHONPATH:+:$PYTHONPATH}"
     export VLLM_ASCEND_ENABLE_NZ=0
+    export LTX_TRAIN_FILE="${LTX_TRAIN_FILE:-/repo/data/omninft/vggsound/ltx_joint_full/train.parquet}"
+    export LTX_VAL_FILE="${LTX_VAL_FILE:-/repo/data/omninft/vggsound/ltx_joint_full/test.parquet}"
+    # Older containers only mount /repo; keep their outputs on the host too.
+    if [[ -z ${LTX_OUTPUT_ROOT:-} ]]; then
+        export LTX_OUTPUT_ROOT=/repo/outputs
+        [[ ! -d /outputs ]] || export LTX_OUTPUT_ROOT=/outputs
+    fi
     : "${LTX_MODEL_PATH:?Set LTX_MODEL_PATH when creating the container}"
     : "${LTX_REWARD_ROOT:?Set LTX_REWARD_ROOT when creating the container}"
     for path in "$LTX_MODEL_PATH/model_index.json" "${LTX_TRAIN_FILE:?}" "${LTX_VAL_FILE:?}" \
@@ -27,6 +34,7 @@ if [[ ${1:-} == --inside || ${1:-} == --preflight ]]; then
     if [[ $mode == --preflight ]]; then
         [[ ! -e ${LTX_OUTPUT_ROOT:-/outputs}/${LTX_RUN_NAME:?} ]] || { echo 'Run directory already exists' >&2; exit 2; }
         flock -n /tmp/ltx-training.lock true || { echo 'An LTX training run is already active' >&2; exit 2; }
+        printf '%s\n' "$LTX_OUTPUT_ROOT/$LTX_RUN_NAME"
         exit 0
     fi
     exec 9>/tmp/ltx-training.lock
@@ -83,12 +91,12 @@ run_name="${run_name:-ltx-$ablation-$(date +%Y%m%d-%H%M%S)}"
 [[ $run_name =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo 'Invalid run name' >&2; exit 2; }
 entry=/repo/examples/unigrpo_nft_trainer/ltx2/start_train.sh
 env_args=(-e "LTX_RUN_NAME=$run_name" -e "LTX_SMOKE=$smoke" -e "LTX_TEXT_CHECK=$text_check" -e "LTX_ABLATION=$ablation")
-docker exec "${env_args[@]}" "$container" bash "$entry" --preflight
+run_dir=$(docker exec "${env_args[@]}" "$container" bash "$entry" --preflight)
 if ((foreground)); then
     docker exec "${env_args[@]}" "$container" bash "$entry" --inside "$@"
 else
     docker exec -d "${env_args[@]}" "$container" bash "$entry" --inside "$@"
 fi
 echo "Run: $run_name"
-echo "Logs: docker exec $container tail -f /outputs/$run_name/launcher.log"
-echo "Exit code after completion: /outputs/$run_name/exit_code"
+echo "Logs: docker exec $container tail -f $run_dir/launcher.log"
+echo "Exit code after completion: $run_dir/exit_code"

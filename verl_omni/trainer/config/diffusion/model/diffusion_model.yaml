@@ -187,6 +187,9 @@ ltx_joint:
   # Maximum generated recaption length, including EOS.
   max_new_tokens: ${oc.select:actor_rollout_ref.rollout.ltx_joint.max_new_tokens,256}
 
+  # Rewriting instruction and chat format mirrored from rollout.
+  recaption_prompt: ${oc.select:actor_rollout_ref.rollout.ltx_joint.recaption_prompt,planner}
+
   # Temperature-only recaption sampling.
   temperature: ${oc.select:actor_rollout_ref.rollout.ltx_joint.temperature,1.0}
 

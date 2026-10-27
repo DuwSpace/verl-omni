@@ -1,0 +1,6 @@
+# @package _global_
+# Upstream LTX-2.3 Gemma T2V system prompt and system/user chat format.
+actor_rollout_ref:
+  rollout:
+    ltx_joint:
+      recaption_prompt: ltx_t2v

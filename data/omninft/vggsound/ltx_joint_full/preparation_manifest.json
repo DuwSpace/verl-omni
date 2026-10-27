@@ -1,0 +1,16 @@
+{
+  "splits": {
+    "train": {
+      "rows": 19487,
+      "source_file": "/tmp/ltx-omninft-train_metadata_20k.jsonl",
+      "source_sha256": "e2b3629e4aa729bb91b780c5933f49e2044e603f38ea3c730e5ee99313d3db66",
+      "parquet_sha256": "197aeec9fa0e4f54a0531278162f73b061afc921d21e02cce2b91169ef6b17de"
+    },
+    "test": {
+      "rows": 16,
+      "source_file": "/tmp/ltx-omninft-test_metadata.jsonl",
+      "source_sha256": "4c5c47856856e8896c90ea0edb3656cee051f9e93f0f78867350a2bba1d63fb8",
+      "parquet_sha256": "f763131d67a02576755c31cd466906ce649fa3d6d78bb2bac468896c2e283647"
+    }
+  }
+}

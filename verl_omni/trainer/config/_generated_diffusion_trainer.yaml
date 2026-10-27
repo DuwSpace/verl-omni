@@ -287,6 +287,7 @@ actor_rollout_ref:
     ltx_joint:
       _target_: verl_omni.workers.config.diffusion.LTXJointRolloutConfig
       max_new_tokens: 256
+      recaption_prompt: planner
       temperature: 1.0
       sync_timeout_seconds: 600
       cpu_offload: true
@@ -414,6 +415,7 @@ actor_rollout_ref:
     ltx_joint:
       _target_: verl_omni.workers.config.diffusion.LTXJointRolloutConfig
       max_new_tokens: ${oc.select:actor_rollout_ref.rollout.ltx_joint.max_new_tokens,256}
+      recaption_prompt: ${oc.select:actor_rollout_ref.rollout.ltx_joint.recaption_prompt,planner}
       temperature: ${oc.select:actor_rollout_ref.rollout.ltx_joint.temperature,1.0}
       sync_timeout_seconds: ${oc.select:actor_rollout_ref.rollout.ltx_joint.sync_timeout_seconds,600}
       cpu_offload: ${oc.select:actor_rollout_ref.rollout.ltx_joint.cpu_offload,true}

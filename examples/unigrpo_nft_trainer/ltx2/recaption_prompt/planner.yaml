@@ -1,0 +1,6 @@
+# @package _global_
+# Existing audiovisual planning instruction, with a direct caption response.
+actor_rollout_ref:
+  rollout:
+    ltx_joint:
+      recaption_prompt: planner

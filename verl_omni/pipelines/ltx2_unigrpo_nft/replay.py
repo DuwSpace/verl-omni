@@ -17,6 +17,7 @@
 import math
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -171,6 +172,17 @@ def planning_instruction(prompt: str, duration_seconds: float | None = None) -> 
     if duration_seconds is not None and (not math.isfinite(duration_seconds) or duration_seconds <= 0):
         raise ValueError("Recaption duration must be finite and positive")
     return _PLANNING_PROMPT + prompt
+
+
+def recaption_messages(prompt: str, duration_seconds: float | None = None, *, preset: str = "planner") -> list[dict]:
+    """Preserve the default chat exactly, or use the upstream LTX T2V chat format."""
+    instruction = planning_instruction(prompt, duration_seconds)
+    if preset == "planner":
+        return [{"role": "user", "content": instruction}]
+    if preset == "ltx_t2v":
+        system = (Path(__file__).parent / "prompts" / "gemma_t2v_system_prompt.txt").read_text(encoding="utf-8")
+        return [{"role": "system", "content": system}, {"role": "user", "content": f"user prompt: {prompt}"}]
+    raise ValueError(f"Unknown recaption prompt preset: {preset!r}; choose planner or ltx_t2v")
 
 
 def parse_planned_recaption(text: str, *, ended_with_eos: bool = False) -> tuple[str, str]:

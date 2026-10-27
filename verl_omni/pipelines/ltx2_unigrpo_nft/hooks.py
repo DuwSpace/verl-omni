@@ -101,6 +101,7 @@ class LTXJointHooks(DiffusionEngineHooks):
                 geometry=sampling_params(geometry),
                 recaption_temperature=settings.temperature,
                 recaption_max_new_tokens=settings.max_new_tokens,
+                recaption_prompt=getattr(settings, "recaption_prompt", "planner"),
                 sync_timeout_seconds=settings.sync_timeout_seconds,
                 enable_cpu_offload=settings.cpu_offload,
                 shared_cpu_weights_dir=getattr(settings, "shared_cpu_weights_dir", None),

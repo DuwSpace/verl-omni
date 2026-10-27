@@ -332,6 +332,9 @@ def test_ready_cache_binds_meta_parameters_without_checkpoint_or_hash_scan(tmp_p
     from verl_omni.utils import frozen_cpu_weights as storage
 
     class TaggedParameter(torch.nn.Parameter):
+        def __new__(cls, data, *, tag):
+            return super().__new__(cls, data)
+
         def __init__(self, data, *, tag):
             self.tag = tag
 

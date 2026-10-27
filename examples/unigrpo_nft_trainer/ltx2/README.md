@@ -212,6 +212,32 @@ Only the two loss coefficients and the experiment label differ:
 | `ablation=joint` (default) | Updated | Updated |
 | `ablation=ar_only` | Updated | Fixed |
 
+The rewriting instruction is independently selectable with `recaption_prompt`:
+
+| Hydra selection | Instruction / chat format |
+| --- | --- |
+| `recaption_prompt=planner` (default) | Existing audiovisual planner, single user message |
+| `recaption_prompt=ltx_t2v` | Upstream LTX-2.3 T2V system prompt, separate system and user messages |
+
+For example, select the upstream prompt with AR-only training:
+
+```bash
+bash examples/unigrpo_nft_trainer/ltx2/start_train.sh CONTAINER --ablation ar_only -- recaption_prompt=ltx_t2v
+```
+
+Direct `run_train.sh` launches accept the same Hydra override. For the standalone
+`smoke_rollout.py`, use `--recaption-prompt ltx_t2v`. Both training and validation
+use the selected instruction; reward text targets remain the original dataset
+prompts. Actor replay uses captured prompt token IDs, including the selected chat
+format. Existing generation limits and sampling settings are unchanged.
+
+The upstream text is bundled unmodified from
+[bunter96/LTX-2.3, commit f735012](https://github.com/bunter96/LTX-2.3/blob/f73501238862129bcd5ef2fd0fb8ae2b9461010e/packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/prompts/gemma_t2v_system_prompt.txt),
+with its source notice and LTX license under
+`verl_omni/pipelines/ltx2_unigrpo_nft/prompts/`; runtime network access is unnecessary.
+Unlike the planner instruction, this preset asks for concrete quoted dialogue when
+speech is mentioned without supplied words. Compare it as a separate experiment.
+
 AR still generates recaptions in every variant, and DiT still generates audio
 and video. A fixed AR policy can produce different text because sampling remains
 stochastic. This ablation disables parameter updates, not recaption generation.

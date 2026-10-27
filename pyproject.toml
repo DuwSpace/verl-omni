@@ -192,6 +192,7 @@ version = {file = "verl_omni/version/version"}
 [tool.setuptools.package-data]
 verl_omni = [
   "version/*",
+  "pipelines/ltx2_unigrpo_nft/prompts/*",
   "trainer/config/*.yaml",
   "trainer/config/*/*.yaml",
   "trainer/config/*/*/*.yaml",

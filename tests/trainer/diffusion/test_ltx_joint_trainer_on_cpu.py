@@ -475,3 +475,17 @@ def test_ablation_recipe_changes_only_update_coefficients_and_run_label(monkeypa
     loss.av_loss_weight = baseline.actor_rollout_ref.actor.diffusion_loss.av_loss_weight
     selected.trainer.experiment_name = baseline.trainer.experiment_name
     assert OmegaConf.to_container(selected, resolve=True) == OmegaConf.to_container(baseline, resolve=True)
+
+
+@pytest.mark.parametrize("preset", ["planner", "ltx_t2v"])
+@pytest.mark.parametrize("mode", ["joint", "ar_only", "av_only"])
+def test_recaption_prompt_recipe_reaches_actor_settings(monkeypatch, preset, mode):
+    from hydra import compose, initialize_config_dir
+
+    for key in ("MODEL_PATH", "REWARD_ROOT", "TRAIN_FILE", "VAL_FILE", "OUTPUT_DIR"):
+        monkeypatch.setenv(f"LTX_{key}", f"/unused/{key}")
+    recipe = Path(__file__).resolve().parents[3] / "examples/unigrpo_nft_trainer/ltx2"
+    with initialize_config_dir(config_dir=str(recipe), version_base=None):
+        config = compose(config_name="joint_train", overrides=[f"recaption_prompt={preset}", f"ablation={mode}"])
+    assert config.actor_rollout_ref.rollout.ltx_joint.recaption_prompt == preset
+    assert config.actor_rollout_ref.model.ltx_joint.recaption_prompt == preset

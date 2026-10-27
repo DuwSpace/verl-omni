@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--frames", type=int, default=33)
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--recaption-tokens", type=int, default=4096)
+    parser.add_argument("--recaption-prompt", choices=["planner", "ltx_t2v"], default="planner")
     parser.add_argument("--video-cfg-scale", type=float, default=1.0)
     parser.add_argument("--audio-cfg-scale", type=float, default=1.0)
     parser.add_argument("--modality-scale", type=float, default=1.0)
@@ -105,6 +106,7 @@ def main():
         },
         recaption_temperature=1.0,
         recaption_max_new_tokens=args.recaption_tokens,
+        recaption_prompt=args.recaption_prompt,
         sync_timeout_seconds=300,
         vae_use_tiling=True,
     )

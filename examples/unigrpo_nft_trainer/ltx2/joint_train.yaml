@@ -5,6 +5,7 @@ defaults:
   - rewards
   - _self_
   - ablation: joint
+  - recaption_prompt: planner
 
 hydra:
   searchpath:
@@ -14,7 +15,7 @@ hydra:
 data:
   train_files: ${oc.env:LTX_TRAIN_FILE,data/omninft/vggsound/ltx_joint_full/train.parquet}
   val_files: ${oc.env:LTX_VAL_FILE,data/omninft/vggsound/ltx_joint_full/test.parquet}
-  train_batch_size: 8
+  train_batch_size: 32
   max_prompt_length: 1024
   dataloader_num_workers: 0
   validation_shuffle: false
@@ -55,7 +56,7 @@ actor_rollout_ref:
     checkpoint:
       # Keep resumable training state while omitting frozen base model weights.
       save_lora_only: true
-    ppo_mini_batch_size: 64
+    ppo_mini_batch_size: 256
     ppo_micro_batch_size_per_gpu: 8
     ppo_epochs: 1
     shuffle: false
@@ -178,7 +179,7 @@ trainer:
   logger: [console, wandb]
   project_name: ltx2-unigrpo-nft
   experiment_name: gemma-dit-joint
-  val_before_train: false
+  val_before_train: true
   n_gpus_per_node: 8
   nnodes: 1
   save_freq: 2

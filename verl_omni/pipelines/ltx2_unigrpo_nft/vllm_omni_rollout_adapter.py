@@ -32,7 +32,7 @@ from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 
 from .config import GUIDANCE_DEFAULTS
 from .model import base_encoder
-from .replay import LTXJointReplay, direct_recaption, planning_instruction
+from .replay import LTXJointReplay, direct_recaption, recaption_messages
 
 
 @VllmOmniPipelineBase.register("LTX2Pipeline", algorithm="ltx2_unigrpo_nft")
@@ -148,14 +148,15 @@ class LTXJointPipeline(LTX2Pipeline):
         self._joint_forward_context = forward_ctx
         return super()._unpack_and_denormalize_stage(forward_ctx, latents, audio_latents)
 
-    def _recaption(self, prompt, *, seed, temperature, max_new_tokens, duration_seconds=None):
+    def _recaption(
+        self, prompt, *, seed, temperature, max_new_tokens, duration_seconds=None, recaption_prompt="planner"
+    ):
         from transformers import GenerationConfig
 
         if type(max_new_tokens) is not int or max_new_tokens <= 0:
             raise ValueError("Recaption max_new_tokens must be a positive integer")
-        instruction = planning_instruction(prompt, duration_seconds)
         ids = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": instruction}],
+            recaption_messages(prompt, duration_seconds, preset=recaption_prompt),
             tokenize=True,
             add_generation_prompt=True,
             return_dict=False,
@@ -278,6 +279,7 @@ class LTXJointPipeline(LTX2Pipeline):
             seed=seed,
             temperature=temperature,
             max_new_tokens=extra["recaption_max_new_tokens"],
+            recaption_prompt=extra.get("recaption_prompt", "planner"),
             duration_seconds=(incoming.sampling_params.num_frames - 1) / incoming.sampling_params.frame_rate,
         )
         text_diagnostic = None

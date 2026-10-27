@@ -299,6 +299,7 @@ def test_joint_generate_exports_frozen_pair_and_preserves_av_reward_replay(model
     class Backend:
         def __init__(self, **kwargs):
             assert kwargs["geometry"]["extra_args"]["video_cfg_scale"] == 1.0
+            assert kwargs["recaption_prompt"] == "ltx_t2v"
 
         def load_actor_policy(self, module, version):
             assert module is model and hooks.policies.rollout_started and hooks.policies.version == version == 1
@@ -337,7 +338,11 @@ def test_joint_generate_exports_frozen_pair_and_preserves_av_reward_replay(model
     monkeypatch.setattr(ltx_joint_backend, "LTXJointVllmBackend", Backend)
     geometry = SimpleNamespace(**records[0].generation_params, max_sequence_length=32)
     hooks = LTXJointHooks(
-        model, SimpleNamespace(ltx_joint=LTXJointRolloutConfig(), pipeline=geometry, local_path="fixture"), None
+        model,
+        SimpleNamespace(
+            ltx_joint=LTXJointRolloutConfig(recaption_prompt="ltx_t2v"), pipeline=geometry, local_path="fixture"
+        ),
+        None,
     )
     monkeypatch.setattr(hooks, "_device", lambda: torch.device("cpu"))
     hooks.begin_rollout(version=0)
@@ -694,7 +699,8 @@ def test_joint_bundle_tampering_is_rejected_before_live_policy_mutation(model, t
 
 
 @pytest.mark.parametrize("offloaded", [False, True])
-def test_worker_recaption_sampling_logprobs_match_teacher_forcing(model, monkeypatch, offloaded):
+@pytest.mark.parametrize("preset", ["planner", "ltx_t2v"])
+def test_worker_recaption_sampling_logprobs_match_teacher_forcing(model, monkeypatch, offloaded, preset):
     from contextlib import contextmanager
     from types import SimpleNamespace
 
@@ -703,6 +709,7 @@ def test_worker_recaption_sampling_logprobs_match_teacher_forcing(model, monkeyp
     from tokenizers.pre_tokenizers import Whitespace
     from transformers import PreTrainedTokenizerFast
 
+    from verl_omni.pipelines.ltx2_unigrpo_nft.replay import recaption_messages
     from verl_omni.pipelines.ltx2_unigrpo_nft.vllm_omni_rollout_adapter import LTXJointPipeline
 
     # Use the real chat-template API: a stub hid its BatchEncoding default on
@@ -744,8 +751,15 @@ def test_worker_recaption_sampling_logprobs_match_teacher_forcing(model, monkeyp
         device=torch.device("cpu"),
         od_config=SimpleNamespace(enable_cpu_offload=offloaded),
     )
+    apply_template = tokenizer.apply_chat_template
+
+    def checked_template(messages, **kwargs):
+        assert messages == recaption_messages("A bell rings.", preset=preset)
+        return apply_template(messages, **kwargs)
+
+    monkeypatch.setattr(tokenizer, "apply_chat_template", checked_template)
     text, prompt, response, logprobs, eos = LTXJointPipeline._recaption(
-        worker, "A bell rings.", seed=13, temperature=0.8, max_new_tokens=3
+        worker, "A bell rings.", seed=13, temperature=0.8, max_new_tokens=3, recaption_prompt=preset
     )
     assert prompt.tolist() == [2, 3]
     assert not active

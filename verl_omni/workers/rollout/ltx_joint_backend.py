@@ -41,6 +41,7 @@ class LTXJointVllmBackend:
         shared_cpu_weights_dir=None,
         vae_use_tiling=False,
         text_diagnostics=None,
+        recaption_prompt="planner",
     ):
         from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
         from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -59,6 +60,9 @@ class LTXJointVllmBackend:
         self.geometry = dict(geometry)
         self.temperature = recaption_temperature
         self.max_new_tokens = recaption_max_new_tokens
+        if recaption_prompt not in ("planner", "ltx_t2v"):
+            raise ValueError("LTX recaption_prompt must be planner or ltx_t2v")
+        self.recaption_prompt = recaption_prompt
         self.timeout = sync_timeout_seconds
         self.policy_version = None
         self.lora_request = None
@@ -204,6 +208,7 @@ class LTXJointVllmBackend:
             policy_version=version,
             recaption_temperature=self.temperature,
             recaption_max_new_tokens=self.max_new_tokens,
+            recaption_prompt=self.recaption_prompt,
         )
         request = OmniDiffusionRequest(
             prompt={"prompt": prompt, "modalities": ["video", "audio"]},
