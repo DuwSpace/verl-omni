@@ -1268,3 +1268,92 @@ def test_ablation_freezes_parameters_optimizer_state_and_rollout_ema(model, text
     assert (("av", True) in calls) == bool(av_weight)
     if not av_weight:
         assert not any(task == "av" for task, _ in calls)
+
+
+@pytest.mark.parametrize("source", ["modality_probability", "combined_reward"])
+@pytest.mark.parametrize("global_std", [True, False])
+def test_text_credit_config_uses_full_batch_std(source, global_std):
+    import numpy as np
+    from tensordict import TensorDict
+    from verl import DataProto
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.loss import LTXJointLoss
+    from verl_omni.workers.config.diffusion.actor import LTXJointLossConfig
+
+    rewards = torch.tensor([0.0, 0.5, 0.1, 0.8])
+    batch = DataProto(
+        batch=TensorDict(
+            {"reward_prob": rewards[:, None, None], "rm_scores": (20 * rewards)[:, None]},
+            batch_size=[4],
+        ),
+        non_tensor_batch={"uid": np.array(["a", "b", "a", "b"])},
+    )
+    config = LTXJointLossConfig(text_advantage_source=source, text_global_std=global_std)
+    LTXJointLoss._prepare_text_credit(batch, config)
+    scale = 20 if source == "combined_reward" else 1
+    centered = scale * torch.tensor([-0.05, -0.15, 0.05, 0.15])
+    std = scale * (rewards.std(correction=0) if global_std else torch.tensor([0.05, 0.15, 0.05, 0.15]))
+    torch.testing.assert_close(batch.batch["text_advantages"], centered / (std + 1e-6))
+    torch.testing.assert_close(batch.batch["reward_prob"], rewards[:, None, None])
+    assert LTXJointLossConfig().text_global_std is True
+
+
+@pytest.mark.parametrize("global_std", [True, False])
+def test_text_component_advantages_are_normalized_before_equal_weight_mean(global_std):
+    import numpy as np
+    from tensordict import TensorDict
+    from verl import DataProto
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.loss import LTXJointLoss
+    from verl_omni.workers.config.diffusion.actor import LTXJointLossConfig
+
+    # Two interleaved groups, five scorers with different scales, opposite
+    # preferences and a constant scorer (which must still count in the mean).
+    rewards = torch.tensor(
+        [
+            [0.0, 0.0, 2.0, 7.0, 0.0],
+            [10.0, 100.0, 16.0, 7.0, 6.0],
+            [2.0, 20.0, 0.0, 7.0, 4.0],
+            [16.0, 160.0, 10.0, 7.0, 2.0],
+        ],
+        requires_grad=True,
+    )
+    probabilities = torch.full((4, 1, 2), 0.5)
+    names = ["video_align", "hpsv3", "audiobox", "clap", "desync"]
+    batch = DataProto(
+        batch=TensorDict({"reward_prob": probabilities.clone(), "rm_scores": rewards}, batch_size=[4]),
+        non_tensor_batch={"uid": np.array(["a", "b", "a", "b"])},
+        meta_info={"reward_names": names},
+    )
+    config = LTXJointLossConfig(text_global_std=global_std)
+    LTXJointLoss._prepare_text_credit(batch, config)
+
+    centered = torch.tensor(
+        [
+            [-1.0, -10.0, 1.0, 0.0, -2.0],
+            [-3.0, -30.0, 3.0, 0.0, 2.0],
+            [1.0, 10.0, -1.0, 0.0, 2.0],
+            [3.0, 30.0, -3.0, 0.0, -2.0],
+        ]
+    )
+    if global_std:
+        std = torch.tensor([41.0**0.5, 10 * 41.0**0.5, 41.0**0.5, 0.0, 5.0**0.5])
+    else:
+        std = torch.tensor([[1.0, 10.0, 1.0, 0.0, 2.0], [3.0, 30.0, 3.0, 0.0, 2.0]]).repeat(2, 1)
+    expected = (centered / (std + 1e-6)).mean(-1)
+    actual = batch.batch["text_advantages"]
+    torch.testing.assert_close(actual, expected)
+    assert not actual.requires_grad
+    torch.testing.assert_close(batch.batch["reward_prob"], probabilities)
+    torch.testing.assert_close(batch.batch["rm_scores"], rewards)
+    metrics = batch.meta_info["text_reward_metrics"]
+    assert not any(key.endswith("/advantage_std") for key in metrics)
+    for i, name in enumerate(names):
+        assert metrics[f"text/components/{name}/reward_std"] == pytest.approx(
+            rewards[:, i].detach().std(correction=0).item()
+        )
+    assert metrics["text/advantage_abs_mean"] == pytest.approx(expected.abs().mean().item())
+    assert metrics["text/constant_group_fraction"] == pytest.approx(0.2)
+    assert metrics["text/components/clap/advantage_abs_mean"] == 0
+    assert metrics["text/reward_source_component_advantage_mean"] == 1
+    assert batch.meta_info["text_reward_source"] == "component_advantage_mean"

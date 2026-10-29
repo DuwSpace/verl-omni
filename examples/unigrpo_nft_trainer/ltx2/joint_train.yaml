@@ -76,11 +76,13 @@ actor_rollout_ref:
       _target_: verl_omni.workers.config.diffusion.LTXJointLossConfig
       loss_mode: ltx2_unigrpo_nft
       text_policy_loss: grpo
-      text_advantage_source: modality_probability
+      text_advantage_source: component_advantage_mean
       text_loss_weight: 1.0
       av_loss_weight: 1.0
       text_kl_coef: 0.001
       text_probability_reduction: mean
+      # Shared std across the full rollout batch; means remain per prompt group.
+      text_global_std: true
       text_advantage_epsilon: 1.0e-6
       ar_clip_ratio: 0.01
       mix_beta: 1.0

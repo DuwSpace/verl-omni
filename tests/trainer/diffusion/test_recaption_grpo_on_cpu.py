@@ -30,6 +30,7 @@ def test_probabilities_are_centered_by_original_prompt_and_constant_groups_are_z
     torch.testing.assert_close(advantage, torch.tensor([-1.0, 0.0, 1.0, 0.0, 0.0]), atol=4e-6, rtol=0)
     assert not advantage.requires_grad
     assert metrics["text/constant_group_fraction"] == pytest.approx(2 / 3)
+    assert metrics["text/probability_group_std_mean"] == pytest.approx(0.1)
 
 
 def test_clipped_loss_excludes_padding_and_freezes_denominator_and_advantage():
@@ -242,6 +243,7 @@ def test_scalar_credit_handles_signed_interleaved_and_constant_groups():
     assert not advantage.requires_grad
     assert metrics["text/constant_group_fraction"] == pytest.approx(2 / 3)
     assert metrics["text/reward_mean"] == pytest.approx(4.6)
+    assert metrics["text/reward_group_std_mean"] == pytest.approx(1 / 3)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
@@ -255,7 +257,31 @@ def test_scalar_credit_rejects_nonfinite_rewards(value):
 def test_text_credit_source_config_rejects_unknown_value():
     from verl_omni.workers.config.diffusion.actor import LTXJointLossConfig
 
-    assert LTXJointLossConfig().text_advantage_source == "modality_probability"
+    assert LTXJointLossConfig().text_advantage_source == "component_advantage_mean"
     assert LTXJointLossConfig(text_advantage_source="combined_reward").text_advantage_source == "combined_reward"
     with pytest.raises(ValueError, match="text_advantage_source"):
         LTXJointLossConfig(text_advantage_source="invalid")
+
+
+@pytest.mark.parametrize("global_std", [True, False])
+def test_text_credit_shares_raw_batch_std_with_group_relative_means(global_std):
+    from verl_omni.trainer.diffusion.recaption_grpo import reward_group_advantages
+
+    # Interleaved groups with different means and spreads distinguish batch std
+    # from group std and from the std of already-centered rewards.
+    rewards = torch.tensor([0.0, 10.0, 2.0, 16.0], requires_grad=True)
+    advantages, metrics = reward_group_advantages(rewards, ["a", "b", "a", "b"], global_std=global_std)
+    denominator = torch.tensor(41.0).sqrt() if global_std else torch.tensor([1.0, 3.0, 1.0, 3.0])
+    expected = torch.tensor([-1.0, -3.0, 1.0, 3.0]) / (denominator + 1e-6)
+    torch.testing.assert_close(advantages, expected)
+    assert not advantages.requires_grad
+    assert metrics["text/reward_std"] == pytest.approx(41.0**0.5)
+    assert metrics["text/global_std"] == float(global_std)
+
+
+@pytest.mark.parametrize("values,groups", [([2.0], ["a"]), ([2.0, 2.0], ["a", "a"]), ([2.0, 8.0], ["a", "b"])])
+def test_global_text_std_constant_and_singleton_groups(values, groups):
+    from verl_omni.trainer.diffusion.recaption_grpo import reward_group_advantages
+
+    advantages, _ = reward_group_advantages(torch.tensor(values), groups, global_std=True)
+    torch.testing.assert_close(advantages, torch.zeros(len(values)))

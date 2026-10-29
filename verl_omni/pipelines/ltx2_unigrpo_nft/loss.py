@@ -109,18 +109,55 @@ class LTXJointLoss(OmniNFTLoss):
             probabilities,
             batch.non_tensor_batch["uid"],
             epsilon=loss_config.text_advantage_epsilon,
+            global_std=loss_config.text_global_std,
         )
-        source = getattr(loss_config, "text_advantage_source", "modality_probability")
+        source = getattr(loss_config, "text_advantage_source", "component_advantage_mean")
         scalar_reward = probabilities
         if source == "combined_reward":
             # Same raw sum as critic/reward/combined/mean in preserve-components runs.
             scalar_reward = batch.batch["rm_scores"].detach().float().sum(dim=-1)
             advantages, reward_metrics = reward_group_advantages(
-                scalar_reward, batch.non_tensor_batch["uid"], epsilon=loss_config.text_advantage_epsilon
+                scalar_reward,
+                batch.non_tensor_batch["uid"],
+                epsilon=loss_config.text_advantage_epsilon,
+                global_std=loss_config.text_global_std,
             )
             metrics.update(reward_metrics)
+        elif source == "component_advantage_mean":
+            rewards = batch.batch["rm_scores"].detach().float()
+            if rewards.ndim != 2 or rewards.shape[1] == 0:
+                raise ValueError("Component text advantages require rm_scores shaped [samples, rewards]")
+            names = batch.meta_info.get("reward_names", [str(i) for i in range(rewards.shape[1])])
+            if len(names) != rewards.shape[1] or len(set(names)) != len(names):
+                raise ValueError("Component text advantages require one unique name per reward")
+            component_advantages = []
+            constant_fractions = []
+            for i, name in enumerate(names):
+                component_advantage, component_metrics = reward_group_advantages(
+                    rewards[:, i],
+                    batch.non_tensor_batch["uid"],
+                    epsilon=loss_config.text_advantage_epsilon,
+                    global_std=loss_config.text_global_std,
+                )
+                component_advantages.append(component_advantage)
+                constant_fractions.append(component_metrics["text/constant_group_fraction"])
+                metrics.update(
+                    {
+                        f"text/components/{name}/{key.removeprefix('text/')}": value
+                        for key, value in component_metrics.items()
+                    }
+                )
+            # Equal weight per scorer, including constant components. No second normalization.
+            advantages = torch.stack(component_advantages, dim=-1).mean(dim=-1)
+            # Diagnostic scalar only: advantages are computed before this raw reward mean.
+            scalar_reward = rewards.mean(dim=-1)
+            metrics["text/constant_group_fraction"] = sum(constant_fractions) / len(constant_fractions)
+            metrics["text/advantage_abs_mean"] = advantages.abs().mean().item()
         elif source != "modality_probability":
-            raise ValueError("Supported text_advantage_source: modality_probability, combined_reward")
+            raise ValueError(
+                "Supported text_advantage_source: modality_probability, combined_reward, component_advantage_mean"
+            )
+        metrics["text/reward_source_component_advantage_mean"] = float(source == "component_advantage_mean")
         metrics["text/reward_source_combined"] = float(source == "combined_reward")
         batch.batch["text_advantages"] = advantages
         batch.batch["text_reward_prob"] = probabilities

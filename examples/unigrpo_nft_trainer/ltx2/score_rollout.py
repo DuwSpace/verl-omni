@@ -41,6 +41,8 @@ def reward_config(root, fps):
                         "adv_clip_max": 5.0,
                         "text_probability_reduction": "mean",
                         "text_advantage_epsilon": 1e-6,
+                        "text_global_std": True,
+                        "text_advantage_source": "component_advantage_mean",
                     },
                 },
             },

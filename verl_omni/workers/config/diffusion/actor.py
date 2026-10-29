@@ -138,19 +138,23 @@ class LTXJointLossConfig(OmniNFTLossConfig):
     av_loss_weight: float = 1.0
     # Token-level GRPO or length-normalized sequence-level GSPO.
     text_policy_loss: str = "grpo"
-    # Select the scalar optimized by the Gemma branch; AV rewards are unchanged.
-    text_advantage_source: str = "modality_probability"
+    # Select text credit: average per-component advantages or normalize a scalar reward.
+    text_advantage_source: str = "component_advantage_mean"
     # Scalar text reward uses the mean of the source video/audio probabilities.
     text_probability_reduction: str = "mean"
-    # Within-prompt population-standard-deviation stabilization for text GRPO.
+    # Share population std over all batch_size * rollout.n text rewards across prompt groups.
+    text_global_std: bool = True
+    # Population-standard-deviation stabilization for text GRPO.
     text_advantage_epsilon: float = 1e-6
     # Sampled-token k3 KL against the fixed initial Gemma policy; zero disables it.
     text_kl_coef: float = 0.0
 
     def __post_init__(self):
         super().__post_init__()
-        if self.text_advantage_source not in {"modality_probability", "combined_reward"}:
-            raise ValueError("Supported text_advantage_source: modality_probability, combined_reward")
+        if self.text_advantage_source not in {"modality_probability", "combined_reward", "component_advantage_mean"}:
+            raise ValueError(
+                "Supported text_advantage_source: modality_probability, combined_reward, component_advantage_mean"
+            )
         if self.text_policy_loss not in {"grpo", "gspo"}:
             raise ValueError("Supported text_policy_loss: grpo, gspo")
         if not math.isfinite(self.av_loss_weight) or self.av_loss_weight < 0:

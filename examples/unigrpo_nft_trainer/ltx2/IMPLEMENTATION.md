@@ -398,7 +398,13 @@ backend 重建 `LTXJointReplay` 后，逐个核对原始 prompt、seed 和 versi
 
 ### 6.2 文本 GRPO/GSPO
 
-默认 `text_advantage_source=modality_probability`：先取 `(p_video + p_audio) / 2`，再在相同原始 prompt 的候选组内减均值、除总体标准差加 epsilon。组内奖励完全一致时 advantage 为零。
+默认 `text_advantage_source=component_advantage_mean`：五路 `rm_scores` 各自计算 advantage，再等权平均：
+`A[i] = mean_k((r[i,k] - mean_group(i)(r[:,k])) / (std_batch(r[:,k]) + epsilon))`。
+`text_global_std=true` 时，每一路 std 使用完整 `batch_size × rollout.n` 个样本（`correction=0`），跨 group 共享；设为 false 则使用组内 std。组内常量 reward 的该路 advantage 为零，仍计入五路平均的分母。平均后不再归一化或应用 AV 路由权重。
+
+`text/components/<reward_name>/` 记录各路 reward 和 advantage 指标，`reward_std` 为每路全 batch 的 reward std，`reward_group_std_mean` 为组内 std 均值；`text/advantage_abs_mean` 记录最终平均 advantage 的绝对值均值，不记录 advantage std。此模式的 `text/constant_group_fraction` 是各路常量 group 占比的均值；保存的 `text_reward` 是原始五路 reward 的均值，仅供诊断，不是先合并再归一化的计算输入。
+
+可选 `modality_probability`：先取 `(p_video + p_audio) / 2`，再减组内均值并按 `text_global_std` 选择 std。
 
 可选 `combined_reward` 使用五路 `rm_scores` 的原始总和作为文本奖励，再做组内标准化；这会改变文本信用分配，不改变 AV 的概率路由。
 

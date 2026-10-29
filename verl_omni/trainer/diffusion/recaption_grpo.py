@@ -23,25 +23,28 @@ import torch
 
 
 def probability_group_advantages(
-    probabilities: torch.Tensor, group_ids: Sequence[Any], *, epsilon: float = 1e-6
+    probabilities: torch.Tensor, group_ids: Sequence[Any], *, epsilon: float = 1e-6, global_std: bool = False
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Legacy probability credit with the original bounds and metric names."""
     if not bool(torch.isfinite(probabilities).all()) or bool(((probabilities < 0) | (probabilities > 1)).any()):
         raise ValueError("Recaption rewards must be finite probabilities in [0, 1]")
-    advantages, metrics = reward_group_advantages(probabilities, group_ids, epsilon=epsilon)
+    advantages, metrics = reward_group_advantages(probabilities, group_ids, epsilon=epsilon, global_std=global_std)
     metrics["text/probability_mean"] = metrics.pop("text/reward_mean")
     metrics["text/probability_std"] = metrics.pop("text/reward_std")
+    metrics["text/probability_group_std_mean"] = metrics.pop("text/reward_group_std_mean")
     return advantages, metrics
 
 
 def reward_group_advantages(
-    rewards: torch.Tensor, group_ids: Sequence[Any], *, epsilon: float = 1e-6
+    rewards: torch.Tensor, group_ids: Sequence[Any], *, epsilon: float = 1e-6, global_std: bool = False
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Normalize finite scalar rewards within each original-prompt group.
 
     The caller selects its scalar probability from the reward pipeline; this
     helper never aggregates or reroutes the component scorers. Population std
     keeps singleton and equal-reward groups well-defined with zero advantage.
+    With global_std, the caller must pass the full rollout batch: the denominator
+    uses all batch_size * rollout.n raw rewards, while means remain per prompt.
     """
     if rewards.ndim != 1 or rewards.numel() == 0 or len(group_ids) != rewards.numel():
         raise ValueError("Recaption requires one scalar reward and group ID per sample")
@@ -53,22 +56,29 @@ def reward_group_advantages(
     groups = defaultdict(list)
     for index, group_id in enumerate(group_ids):
         groups[group_id].append(index)
+    batch_std = rewards.std(correction=0)
     advantages = torch.empty_like(rewards)
     constant_groups = 0
+    group_stds = []
     for indices in groups.values():
         values = rewards[indices]
+        group_std = values.std(correction=0)
+        group_stds.append(group_std)
         constant = bool((values == values[0]).all())
         constant_groups += int(constant)
         if constant:
             advantages[indices] = 0
         else:
-            advantages[indices] = (values - values.mean()) / (values.std(correction=0) + epsilon)
+            std = batch_std if global_std else group_std
+            advantages[indices] = (values - values.mean()) / (std + epsilon)
     return advantages, {
         "text/reward_mean": rewards.mean().item(),
-        "text/reward_std": rewards.std(correction=0).item(),
+        "text/reward_std": batch_std.item(),
+        "text/global_std": float(global_std),
+        # Equal weight per prompt, before normalization or epsilon; include constant groups.
+        "text/reward_group_std_mean": torch.stack(group_stds).mean().item(),
         "text/constant_group_fraction": constant_groups / len(groups),
         "text/advantage_abs_mean": advantages.abs().mean().item(),
-        "text/advantage_std": advantages.std(correction=0).item(),
     }
 
 
