@@ -28,11 +28,17 @@ reward:
       backend: native
       offload: true
       executor:
+        max_batch_size: 16
+        batch_wait_ms: 10.0
+        deterministic: true
         model: verl_omni.utils.reward_score.videoalign:VideoAlignModel
     hpsv3:
       backend: native
       offload: true
       executor:
+        max_batch_size: 32
+        batch_wait_ms: 10.0
+        deterministic: true
         model: verl_omni.utils.reward_score.hpsv3_reward:HPSv3Model
         kwargs:
           use_sequential_position_ids: true
@@ -40,16 +46,25 @@ reward:
       backend: native
       offload: true
       executor:
+        max_batch_size: 32
+        batch_wait_ms: 10.0
+        deterministic: true
         model: verl_omni.utils.reward_score.audiobox:AudioBoxModel
     clap:
       backend: native
       offload: true
       executor:
+        max_batch_size: 32
+        batch_wait_ms: 10.0
+        deterministic: true
         model: verl_omni.utils.reward_score.clap:CLAPModel
     desync:
       backend: native
       offload: true
       executor:
+        max_batch_size: 32
+        batch_wait_ms: 10.0
+        deterministic: true
         model: verl_omni.utils.reward_score.desync:DeSyncModel
   reward_functions:
     video_align:
@@ -73,7 +88,7 @@ reward:
       top_fraction: 0.3
       score_cap: 15.0
       reward_scale: 1.0
-      max_batch_size: 5
+      max_batch_size: 32
       weight: 1.0
       required: true
       routing_weights: {video: 1.5, audio: 0.0}

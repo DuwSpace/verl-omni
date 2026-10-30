@@ -292,10 +292,12 @@ async def compute_score(
 class VideoAlignModel(NativeRewardCpuOffload):
     """Raw VideoAlign inference adapter owned by a native reward executor."""
 
+    batch_input_names = ("videos", "prompts")
+
     def __init__(self, model_path: str, device, base_model_path: str) -> None:
         self.model, self.processor = _load_components(model_path, base_model_path)
         self.device = torch.device(device)
-        self.model.to(self.device).eval()
+        self.model.eval()
         self._infer_lock = threading.Lock()
         self._init_cpu_offload(device)
 
@@ -303,6 +305,7 @@ class VideoAlignModel(NativeRewardCpuOffload):
         """Release retained weights and processors permanently."""
         with self._infer_lock:
             self._offload_closed = True
+            self._cpu_weights.clear()
             self.model = None
             self.processor = None
             self.device = None

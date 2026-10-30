@@ -723,13 +723,15 @@ def _frame_to_pil(frame: torch.Tensor) -> Image.Image:
 class HPSv3Model(NativeRewardCpuOffload):
     """Executor-owned HPSv3 inference using the shared loader and preprocessing."""
 
+    batch_input_names = ("images", "prompts")
+
     def __init__(
         self, model_path: str, device, base_model_path: str = _BASE_MODEL, use_sequential_position_ids: bool = False
     ) -> None:
         self._inferencer = _HPSv3Inferencer(
             checkpoint_path=model_path,
             base_config=base_model_path,
-            device=device,
+            device="cpu",
             use_sequential_position_ids=use_sequential_position_ids,
         )
         self._infer_lock = threading.Lock()
@@ -746,6 +748,7 @@ class HPSv3Model(NativeRewardCpuOffload):
         """Release retained weights and processors permanently."""
         with self._infer_lock:
             self._offload_closed = True
+            self._cpu_weights.clear()
             self._inferencer = None
 
     @torch.inference_mode()

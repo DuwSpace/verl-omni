@@ -253,11 +253,16 @@ async def compute_score(
 class DeSyncModel(NativeRewardCpuOffload):
     """Raw Synchformer inference adapter owned by a native reward executor."""
 
-    def __init__(self, model_path: str, device, source_root: str) -> None:
+    batch_input_names = ("video", "audio")
+    batch_output_dim = 1
+
+    def __init__(self, model_path: str, device, source_root: str, feature_batch_size: int = 8) -> None:
+        if isinstance(feature_batch_size, bool) or not isinstance(feature_batch_size, int) or feature_batch_size < 1:
+            raise ValueError("DeSync feature_batch_size must be a positive integer")
+        self.feature_batch_size = feature_batch_size
         self.model, self.mel = _load_components(model_path, source_root)
         self.device = torch.device(device)
-        self.model.to(self.device).eval()
-        self.mel.to(self.device)
+        self.model.eval()
         self._infer_lock = threading.Lock()
         self._init_cpu_offload(device)
 
@@ -268,6 +273,7 @@ class DeSyncModel(NativeRewardCpuOffload):
         """Release retained weights and processors permanently."""
         with self._infer_lock:
             self._offload_closed = True
+            self._cpu_weights.clear()
             self.model = None
             self.mel = None
             self.device = None
@@ -278,8 +284,33 @@ class DeSyncModel(NativeRewardCpuOffload):
         Extract video and normalized log-mel features on the active device, then
         compare the first and last 14 segments separately. Return detached CPU
         logits ``[2, B, 21]`` in model-output dtype; the caller sets inference mode
-        and the MHA compatibility switch.
+        and the MHA compatibility switch. Feature extraction is chunked by
+        feature_batch_size samples because each sample expands to 24 segments.
         """
+        batch_size = video.shape[0]
+        features = [
+            self._extract_features(video_chunk, audio_chunk)
+            for video_chunk, audio_chunk in zip(
+                video.split(self.feature_batch_size), audio.split(self.feature_batch_size), strict=True
+            )
+        ]
+        visual = torch.cat([pair[0] for pair in features], dim=0)
+        auditory = torch.cat([pair[1] for pair in features], dim=0)
+
+        logits_batches = []
+        for start in (0, _SEGMENTS - _COMPARE_SEGMENTS):
+            logits = self.model.compare_v_a(
+                visual[:, start : start + _COMPARE_SEGMENTS], auditory[:, start : start + _COMPARE_SEGMENTS]
+            )
+            if not isinstance(logits, torch.Tensor) or logits.shape != (batch_size, 21):
+                raise ValueError(f"DeSync logits must have shape ({batch_size}, 21).")
+            if not torch.isfinite(logits).all():
+                raise ValueError("DeSync logits must contain only finite values.")
+            logits_batches.append(logits.detach().cpu())
+        return torch.stack(logits_batches)
+
+    def _extract_features(self, video: torch.Tensor, audio: torch.Tensor):
+        """Bound feature-extraction memory before comparing the full scoring batch."""
         batch_size = video.shape[0]
         video_segments = video.unfold(1, _VIDEO_SEGMENT, _VIDEO_STEP).movedim(-1, 2)
         audio_segments = audio.unfold(1, _AUDIO_SEGMENT, _AUDIO_STEP)
@@ -297,17 +328,7 @@ class DeSyncModel(NativeRewardCpuOffload):
         mel = (mel - (-4.2677393)) / (2 * 4.5689974)
         auditory = self.model.extract_afeats(mel.unsqueeze(2))
 
-        logits_batches = []
-        for start in (0, _SEGMENTS - _COMPARE_SEGMENTS):
-            logits = self.model.compare_v_a(
-                visual[:, start : start + _COMPARE_SEGMENTS], auditory[:, start : start + _COMPARE_SEGMENTS]
-            )
-            if not isinstance(logits, torch.Tensor) or logits.shape != (batch_size, 21):
-                raise ValueError(f"DeSync logits must have shape ({batch_size}, 21).")
-            if not torch.isfinite(logits).all():
-                raise ValueError("DeSync logits must contain only finite values.")
-            logits_batches.append(logits.detach().cpu())
-        return torch.stack(logits_batches)
+        return visual, auditory
 
     @torch.inference_mode()
     def infer(self, video: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:

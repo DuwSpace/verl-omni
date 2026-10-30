@@ -277,11 +277,13 @@ async def compute_score(
 class CLAPModel(NativeRewardCpuOffload):
     """Raw CLAP inference adapter owned by a native reward executor."""
 
+    batch_input_names = ("waveforms", "prompts")
+
     def __init__(self, model_path: str, device, model_kwargs=None, processor_kwargs=None) -> None:
         from transformers import AutoProcessor, ClapModel
 
         self.device = torch.device(device)
-        self.model = ClapModel.from_pretrained(model_path, **(model_kwargs or {})).to(self.device).eval()
+        self.model = ClapModel.from_pretrained(model_path, **(model_kwargs or {})).eval()
         self.processor = AutoProcessor.from_pretrained(model_path, **(processor_kwargs or {}))
         self._infer_lock = threading.Lock()
         self._init_cpu_offload(device)
@@ -290,6 +292,7 @@ class CLAPModel(NativeRewardCpuOffload):
         """Release retained weights and processors permanently."""
         with self._infer_lock:
             self._offload_closed = True
+            self._cpu_weights.clear()
             self.model = None
             self.processor = None
             self.device = None

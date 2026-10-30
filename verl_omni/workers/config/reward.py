@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -118,20 +119,45 @@ class NativeRewardModelExecutorConfig(BaseConfig):
 
     model: str = ""
     kwargs: dict[str, Any] = field(default_factory=dict)
+    # Maximum inference rows per forward; null disables cross-request batching.
+    max_batch_size: int | None = None
+    # Maximum wait to collect an underfilled batch, in milliseconds.
+    batch_wait_ms: float = 10.0
+    # Require deterministic native operators in the reward worker process.
+    deterministic: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or ":" not in self.model or not all(self.model.rsplit(":", 1)):
             raise ValueError("Native reward model requires executor.model")
+        if not isinstance(self.deterministic, bool):
+            raise ValueError("Native reward executor.deterministic must be a boolean")
+        if self.max_batch_size is not None:
+            _validate_positive_int(self.max_batch_size, "Native reward executor.max_batch_size")
+        if (
+            isinstance(self.batch_wait_ms, bool)
+            or not isinstance(self.batch_wait_ms, int | float)
+            or not math.isfinite(self.batch_wait_ms)
+            or self.batch_wait_ms < 0
+        ):
+            raise ValueError("Native reward executor.batch_wait_ms must be finite and non-negative")
         if not isinstance(self.kwargs, dict):
             raise TypeError("Native reward model executor.kwargs must be a mapping")
 
     @classmethod
     def from_mapping(cls, name: str, value) -> NativeRewardModelExecutorConfig:
         executor = to_mapping(value)
-        _reject_unknown_fields(name, executor, {"model", "kwargs"}, prefix="executor.")
+        _reject_unknown_fields(
+            name,
+            executor,
+            {"model", "kwargs", "max_batch_size", "batch_wait_ms", "deterministic"},
+            prefix="executor.",
+        )
         return cls(
             model=executor.get("model", ""),
             kwargs=to_mapping(executor.get("kwargs")),
+            max_batch_size=executor.get("max_batch_size"),
+            batch_wait_ms=executor.get("batch_wait_ms", 10.0),
+            deterministic=executor.get("deterministic", False),
         )
 
 

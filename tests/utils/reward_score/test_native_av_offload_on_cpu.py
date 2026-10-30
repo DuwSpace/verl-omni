@@ -41,8 +41,12 @@ class Weights(torch.nn.Module):
         self.moves.append(torch.device(device))
         if self.fail_transfer:
             raise RuntimeError("transfer failed")
-        # Record accelerator destinations without requiring accelerator hardware.
-        return super().to(device) if torch.device(device).type == "cpu" else self
+        # Emulate separate accelerator storage without accelerator hardware.
+        if torch.device(device).type != "cpu":
+            self.weight.data = self.weight.detach().clone()
+            self.calibration = self.calibration.clone()
+            return self
+        return super().to(device)
 
     def forward(self, *args, **kwargs):
         value = (self.weight.float().sum() + self.calibration).reshape(1, 1)
@@ -151,6 +155,7 @@ async def test_models_retain_identity_outputs_and_dtypes_across_cycles(reward_ca
     await executor.close()
     assert executor._model is None
     assert model._offload_closed
+    assert not model._cpu_weights
     assert (model._inferencer if case.kind == "hpsv3" else model.model) is None
     with pytest.raises(RuntimeError, match="closed"):
         model.wake_up()
@@ -188,4 +193,55 @@ async def test_transfer_failure_releases_retained_model(reward_case, monkeypatch
         await executor.sleep()
     assert executor._model is None and executor._closed
     assert model._offload_closed
+    assert not model._cpu_weights
     assert (model._inferencer if case.kind == "hpsv3" else model.model) is None
+
+
+def test_sleep_reuses_cpu_storage_and_preserves_runtime_buffers(reward_case):
+    case = reward_case
+    model = case.cls(device="cuda:3", **case.kwargs)
+    masters = list(model._cpu_weights)
+    for _ in range(3):
+        for parameter, host in masters:
+            assert not parameter.requires_grad
+            assert parameter.data_ptr() != host.data_ptr()
+        expected_buffers = []
+        for module in case.modules:
+            module.calibration.add_(1)
+            expected_buffers.append(module.calibration.clone())
+        model.sleep()
+        for parameter, host in masters:
+            assert parameter.data_ptr() == host.data_ptr()
+            torch.testing.assert_close(parameter, torch.tensor([1, 2], dtype=torch.bfloat16))
+        for module, expected in zip(case.modules, expected_buffers, strict=True):
+            torch.testing.assert_close(module.calibration, expected)
+        model.wake_up()
+    model.close()
+    assert not model._cpu_weights
+
+
+def test_desync_chunks_features_without_changing_sample_order():
+    model = object.__new__(desync.DeSyncModel)
+    model.feature_batch_size = 8
+    chunks = []
+
+    def features(video, audio):
+        chunks.append(len(video))
+        return video[:, None, None, :].expand(-1, 24, 1, -1), audio[:, None, None, :].expand(-1, 24, 1, -1)
+
+    model._extract_features = features
+    model.model = SimpleNamespace(
+        compare_v_a=lambda visual, auditory: (visual[:, 0, 0] + auditory[:, 0, 0]).expand(-1, 21)
+    )
+    video = torch.arange(32, dtype=torch.float32).reshape(-1, 1)
+    audio = video + 10
+    logits = model._infer_micro_batch(video, audio)
+    assert chunks == [8, 8, 8, 8]
+    expected = (video + audio).expand(-1, 21).unsqueeze(0).expand(2, -1, -1)
+    torch.testing.assert_close(logits, expected)
+
+
+@pytest.mark.parametrize("size", [0, -1, True, 1.5])
+def test_desync_rejects_invalid_feature_batch_size(size):
+    with pytest.raises(ValueError, match="feature_batch_size"):
+        desync.DeSyncModel("unused", "cpu", "unused", feature_batch_size=size)

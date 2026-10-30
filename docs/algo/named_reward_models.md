@@ -419,6 +419,36 @@ local modifications separately. Path checks do not authenticate source contents.
 The existing loader and AST compatibility lookup use the upstream package
 namespace; replacing only the entry-file import would not isolate that package.
 
+### Batch native audio/video inference
+
+Set `reward.models.<name>.executor.max_batch_size` to coalesce concurrent requests
+for VideoAlign, HPSv3, AudioBox, CLAP, or DeSync. The default `null` preserves
+individual inference calls. `executor.batch_wait_ms` (default `10.0`) bounds the
+wait for an underfilled batch; full batches run immediately. Oversized individual
+requests are split into bounded forwards and reassembled before scoring. Pending
+requests finish before sleep or close, including when a caller is cancelled.
+
+This limit counts inference rows: videos for VideoAlign, frames for HPSv3, audio
+windows for AudioBox, audio/text pairs for CLAP, and AV pairs for DeSync. It is
+separate from `dispatch_batch_size`, which limits samples sent to each replica.
+Use a dispatch size large enough to supply the desired inference batch. The LTX
+joint recipe sets VideoAlign to 16 rows and the other four models to 32. DeSync
+expands each sample into 24 segments, so `executor.kwargs.feature_batch_size`
+(default `8` samples) bounds its feature extractor separately; the comparison
+head still receives the full scoring batch.
+
+For custom synchronous models, declare `batch_input_names` for aligned lists or
+tensors (leading batch axis). Return a tensor or a dictionary of tensors; declare
+`batch_output_dim` if the output batch axis is not zero. `batch_output_key` selects
+the batched subtree when other top-level entries are shared metadata.
+
+`executor.deterministic: true` enables strict deterministic operators and fixed
+initialization seeds in the isolated reward worker before loading its model.
+Unsupported nondeterministic operations raise an error. This reproduces the same
+batch; it does not guarantee identical scores across different batch sizes or
+compositions. The LTX joint recipe enables this setting. Batch-invariant kernels
+from vLLM-Ascend are not installed in these native reward workers.
+
 ## Use native on CPU
 
 Small native reward executors can run as ordinary Ray CPU actors without

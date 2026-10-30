@@ -25,7 +25,10 @@ from typing import Any
 import torch
 from verl.utils.device import get_device_id, get_device_name
 
-from verl_omni.workers.config.reward import RewardModelSpec, is_engine_backend
+from verl_omni.workers.config.reward import NativeRewardModelExecutorConfig, RewardModelSpec, is_engine_backend
+
+from .native_batching import NativeRewardBatcher
+from .reward_reproducibility import configure_reward_reproducibility
 
 __all__ = [
     "EngineRewardExecutor",
@@ -95,6 +98,7 @@ class NativeRewardExecutor:
             raise ValueError(f"NativeRewardExecutor requires a native spec, got {spec.backend!r}")
         self.spec = spec
         self._model: Any | None = None
+        self._batcher: NativeRewardBatcher | None = None
         self._inflight = 0
         self._idle = asyncio.Event()
         self._idle.set()
@@ -115,6 +119,9 @@ class NativeRewardExecutor:
                 return
             try:
                 if self._model is None:
+                    configure_reward_reproducibility(
+                        deterministic=self.spec.executor_config.get("deterministic", False),
+                    )
                     model_cls = _load_native_model(self.spec.executor_config["model"])
                     kwargs = dict(self.spec.executor_config.get("kwargs", {}))
                     if self.spec.model_path is not None:
@@ -126,6 +133,10 @@ class NativeRewardExecutor:
                             else torch.device(get_device_name(), get_device_id())
                         )
                     self._model = model_cls(**kwargs)
+                    batch_size = self.spec.executor_config.get("max_batch_size")
+                    if batch_size is not None:
+                        config = NativeRewardModelExecutorConfig.from_mapping(self.spec.name, self.spec.executor_config)
+                        self._batcher = NativeRewardBatcher(self._model, config.max_batch_size, config.batch_wait_ms)
                 elif self._supports_cpu_offload(self._model):
                     await self._call(self._model.wake_up)
                 async with self._lock:
@@ -160,6 +171,8 @@ class NativeRewardExecutor:
 
     async def _infer_owned(self, model, args, kwargs):
         try:
+            if self._batcher is not None:
+                return await self._batcher.infer(args, kwargs)
             infer_fn = getattr(model, "infer", None)
             if infer_fn is None:
                 raise TypeError(f"Native reward model {type(self._model).__name__!r} must define infer()")
@@ -190,6 +203,7 @@ class NativeRewardExecutor:
                     await self._call(model.sleep)
                 else:
                     self._model = None
+                    self._batcher = None
                     self._close_failed = True
                     await self._dispose(model)
                     self._close_failed = False
@@ -213,6 +227,7 @@ class NativeRewardExecutor:
                 self._closed = True
             await self._idle.wait()
             model, self._model = self._model, None
+            self._batcher = None
             self._close_failed = True
             await self._dispose(model)
             if self.spec.device_type != "cpu":
@@ -224,6 +239,7 @@ class NativeRewardExecutor:
             self._awake = False
             self._closed = True
         model, self._model = self._model, None
+        self._batcher = None
         if model is None and self._close_failed:
             return
         self._close_failed = True

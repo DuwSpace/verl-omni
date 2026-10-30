@@ -129,6 +129,9 @@ async def compute_score(
 class AudioBoxModel(NativeRewardCpuOffload):
     """Raw AudioBox inference adapter owned by a native reward executor."""
 
+    batch_input_names = ("windows", "masks")
+    batch_output_key = "predictions"
+
     def __init__(self, model_path: str, device) -> None:
         self.model = _load_model(model_path)
         self.target_transform = {
@@ -136,7 +139,7 @@ class AudioBoxModel(NativeRewardCpuOffload):
             for axis in _AXES
         }
         self.device = torch.device(device)
-        self.model.to(self.device).eval()
+        self.model.eval()
         self._infer_lock = threading.Lock()
         self._init_cpu_offload(device)
 
@@ -144,6 +147,7 @@ class AudioBoxModel(NativeRewardCpuOffload):
         """Release retained weights and processors permanently."""
         with self._infer_lock:
             self._offload_closed = True
+            self._cpu_weights.clear()
             self.model = None
             self.target_transform = {}
             self.device = None

@@ -260,7 +260,13 @@ class NativeManagedRewardModel(ManagedRewardModel):
             model = parse_reward_model_config(name, model)
         offload = model.resolved_offload
         self.placement = model.placement
-        executor_config = {"model": model.executor.model, "kwargs": model.executor.kwargs}
+        executor_config = {
+            "model": model.executor.model,
+            "kwargs": model.executor.kwargs,
+            "max_batch_size": model.executor.max_batch_size,
+            "batch_wait_ms": model.executor.batch_wait_ms,
+            "deterministic": model.executor.deterministic,
+        }
 
         super().__init__(
             RewardModelSpec(

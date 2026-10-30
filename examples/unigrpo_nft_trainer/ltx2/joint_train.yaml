@@ -193,6 +193,7 @@ reward:
       executor:
         kwargs:
           source_root: ${oc.env:LTX_REWARD_ROOT}/OmniNFT-reference
+          feature_batch_size: 8
 
 trainer:
   device: npu
