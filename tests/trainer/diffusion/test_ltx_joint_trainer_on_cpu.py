@@ -269,7 +269,9 @@ def test_composed_recipe_prepares_joint_actor_batch_without_dataclass_instantiat
     selected_steps = max(1, int(30 * config.algorithm.timestep_fraction))
     assert result.batch["reward_prob"].shape == (4, selected_steps, 2)
     assert result.batch["video_forward_noise"].shape == (4, selected_steps, 2, 4)
-    torch.testing.assert_close(result.batch["text_advantages"], torch.tensor([-1.0, 1.0, -1.0, 1.0]), atol=1e-4, rtol=0)
+    # The recipe defaults to global std, while centering remains per prompt.
+    expected = torch.tensor([-2.5, 2.5, -2.5, 2.5]) / (scores[:, 0].std(correction=0) + 1e-6)
+    torch.testing.assert_close(result.batch["text_advantages"], expected, atol=1e-4, rtol=0)
 
 
 def test_train_eval_train_sampling_settings_are_request_scoped(monkeypatch):
@@ -489,3 +491,105 @@ def test_recaption_prompt_recipe_reaches_actor_settings(monkeypatch, preset, mod
         config = compose(config_name="joint_train", overrides=[f"recaption_prompt={preset}", f"ablation={mode}"])
     assert config.actor_rollout_ref.rollout.ltx_joint.recaption_prompt == preset
     assert config.actor_rollout_ref.model.ltx_joint.recaption_prompt == preset
+
+
+def test_nested_dispatch_keeps_videos_together_and_restores_order(monkeypatch):
+    config = _config()
+    config.actor_rollout_ref.rollout.ltx_joint.update(tree_rollout=True, rewrites_per_prompt=2, videos_per_rewrite=3)
+    LTXJointRayTrainer.validate_joint_config(config)
+    assert config.actor_rollout_ref.rollout.n == 6
+    trainer = object.__new__(LTXJointRayTrainer)
+    trainer.config, trainer.global_steps = config, 1
+    uids = np.repeat(np.array(["a", "b", "c", "d"], dtype=object), 6)
+    batch = DataProto(batch=TensorDict({}, batch_size=[24]), non_tensor_batch={"uid": uids})
+
+    def generate(self, dispatched):
+        seeds = dispatched.non_tensor_batch["_ltx_recaption_seed"]
+        for rank_seeds in np.split(seeds, 2):
+            assert (rank_seeds.reshape(-1, 3) == rank_seeds.reshape(-1, 3)[:, :1]).all()
+        return DataProto(
+            batch=TensorDict(
+                {"identity": torch.tensor(dispatched.non_tensor_batch["_ltx_sample_seed"])}, batch_size=[24]
+            )
+        )
+
+    monkeypatch.setattr(NativeRayDiffusionTrainer, "_generate_native", generate)
+    result = trainer._generate_native(batch)
+    assert result.batch["identity"].tolist() == list(range(66, 90))
+    assert len(set(batch.non_tensor_batch["_ltx_recaption_seed"])) == 8
+    assert len(set(batch.non_tensor_batch["_ltx_sample_seed"])) == 24
+
+
+@pytest.mark.parametrize("rewrites,videos", [(1, 2), (2, 0), (None, 2), (2, True)])
+def test_nested_config_rejects_invalid_counts(rewrites, videos):
+    config = _config()
+    config.actor_rollout_ref.rollout.ltx_joint.update(
+        tree_rollout=True, rewrites_per_prompt=rewrites, videos_per_rewrite=videos
+    )
+    with pytest.raises(ValueError):
+        LTXJointRayTrainer.validate_joint_config(config)
+
+
+def test_rewrite_av_group_requires_multiple_videos():
+    config = _config()
+    config.actor_rollout_ref.rollout.ltx_joint.update(tree_rollout=True, rewrites_per_prompt=2)
+    config.actor_rollout_ref.actor.diffusion_loss.av_advantage_group = "rewrite"
+    with pytest.raises(ValueError, match="videos_per_rewrite >= 2"):
+        LTXJointRayTrainer.validate_joint_config(config)
+    config.actor_rollout_ref.rollout.ltx_joint.update(tree_rollout=True, rewrites_per_prompt=2, videos_per_rewrite=2)
+    LTXJointRayTrainer.validate_joint_config(config)
+    assert config.actor_rollout_ref.rollout.n == 4
+    config.actor_rollout_ref.actor.diffusion_loss.av_advantage_group = "typo"
+    with pytest.raises(ValueError, match="av_advantage_group"):
+        LTXJointRayTrainer.validate_joint_config(config)
+
+
+@pytest.mark.parametrize("rewrites,videos", [(1, 1), (8, 4)])
+def test_tree_disabled_preserves_legacy_n_and_dispatch(monkeypatch, rewrites, videos):
+    config = _config()
+    config.actor_rollout_ref.rollout.n = 8
+    config.actor_rollout_ref.rollout.ltx_joint.update(
+        tree_rollout=False, rewrites_per_prompt=rewrites, videos_per_rewrite=videos
+    )
+    config.actor_rollout_ref.actor.diffusion_loss.av_advantage_group = "rewrite"
+    LTXJointRayTrainer.validate_joint_config(config)
+    assert config.actor_rollout_ref.rollout.n == 8
+    trainer = object.__new__(LTXJointRayTrainer)
+    trainer.config, trainer.global_steps = config, 1
+    batch = DataProto(
+        batch=TensorDict({}, batch_size=[32]),
+        non_tensor_batch={"uid": np.repeat(np.array(["a", "b", "c", "d"], dtype=object), 8)},
+    )
+
+    def generate(self, dispatched):
+        assert "_ltx_rewrite_id" not in dispatched.non_tensor_batch
+        assert "_ltx_recaption_seed" not in dispatched.non_tensor_batch
+        return DataProto(
+            batch=TensorDict(
+                {"identity": torch.tensor(dispatched.non_tensor_batch["_ltx_sample_seed"])}, batch_size=[32]
+            )
+        )
+
+    monkeypatch.setattr(NativeRayDiffusionTrainer, "_generate_native", generate)
+    output = trainer._generate_native(batch)
+    assert output.batch["identity"].tolist() == list(range(74, 106))
+
+
+def test_text_ema_switch_is_mirrored_to_actor_config(monkeypatch):
+    from hydra import compose, initialize_config_dir
+
+    from verl_omni.workers.config.diffusion import LTXJointRolloutConfig
+
+    for key in ("MODEL_PATH", "REWARD_ROOT", "TRAIN_FILE", "VAL_FILE", "OUTPUT_DIR"):
+        monkeypatch.setenv(f"LTX_{key}", f"/unused/{key}")
+    recipe = Path(__file__).resolve().parents[3] / "examples/unigrpo_nft_trainer/ltx2"
+    with initialize_config_dir(config_dir=str(recipe), version_base=None):
+        default = compose(config_name="joint_train")
+        disabled = compose(
+            config_name="joint_train", overrides=["actor_rollout_ref.rollout.ltx_joint.text_ema_enabled=false"]
+        )
+    assert default.actor_rollout_ref.model.ltx_joint.text_ema_enabled is True
+    assert disabled.actor_rollout_ref.model.ltx_joint.text_ema_enabled is False
+    assert LTXJointRolloutConfig().text_ema_enabled is True
+    with pytest.raises(ValueError, match="text_ema_enabled"):
+        LTXJointRolloutConfig(text_ema_enabled="false")

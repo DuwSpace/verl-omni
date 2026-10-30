@@ -269,14 +269,24 @@ class LTXJointPipeline(LTX2Pipeline):
             raise ValueError("Joint rollout requires the original user prompt text")
         return original, version, extra
 
+    def _cached_recaption(self, original, *, version, **kwargs):
+        # One-entry CPU cache, invalidated by policy version and all text settings.
+        key = (original, version, tuple(sorted(kwargs.items())))
+        cached = getattr(self, "_last_recaption", None)
+        if cached is None or cached[0] != key:
+            cached = (key, self._recaption(original, **kwargs))
+            self._last_recaption = cached
+        return cached[1]
+
     def _recaption_request(self, incoming, original, version, extra):
         """Sample text, capture R/R-prime immediately, then parse the AV caption."""
         seed = int(incoming.sampling_params.seed)
         temperature = float(extra["recaption_temperature"])
         started = perf_counter()
-        response_text, prompt_ids, response_ids, logprobs, eos = self._recaption(
+        response_text, prompt_ids, response_ids, logprobs, eos = self._cached_recaption(
             original,
-            seed=seed,
+            version=version,
+            seed=int(extra.get("recaption_seed", seed)),
             temperature=temperature,
             max_new_tokens=extra["recaption_max_new_tokens"],
             recaption_prompt=extra.get("recaption_prompt", "planner"),

@@ -79,6 +79,8 @@ actor_rollout_ref:
       text_advantage_source: component_advantage_mean
       text_loss_weight: 1.0
       av_loss_weight: 1.0
+      # prompt: R*V candidates; rewrite: V videos conditioned on the same text.
+      av_advantage_group: prompt
       text_kl_coef: 0.001
       text_probability_reduction: mean
       # Shared std across the full rollout batch; means remain per prompt group.
@@ -94,6 +96,11 @@ actor_rollout_ref:
   rollout:
     name: vllm_omni
     ltx_joint:
+      text_ema_enabled: true
+      # Off: legacy rollout.n. On: total rollout.n = rewrites_per_prompt * videos_per_rewrite.
+      tree_rollout: false
+      rewrites_per_prompt: 1
+      videos_per_rewrite: 1
       cpu_offload: true
       # Share frozen CPU pages across local rollout processes; null disables.
       # Requires ~90 GiB of local disk space. Do not put this directory on NFS.

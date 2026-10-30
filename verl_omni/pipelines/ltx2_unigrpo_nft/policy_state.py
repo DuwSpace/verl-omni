@@ -77,17 +77,20 @@ class LTXJointPolicyState(TrainablePolicyState):
         self.rollout_started = True
         self._frozen_digests = self._snapshot_digests()
 
-    def update_old(self, *, decay, update_text=True, update_av=True):
+    def update_old(self, *, decay, update_text=True, update_av=True, text_ema_enabled=True):
         """Advance enabled adapters' EMA, preserving disabled rollout weights exactly."""
         self.assert_frozen()
         if not math.isfinite(decay) or not 0 <= decay <= 1:
             raise ValueError("Joint old-policy decay must be finite and in [0, 1]")
         if not self.rollout_started:
             raise ValueError("Begin a rollout before updating its old policy")
+        if type(text_ema_enabled) is not bool:
+            raise ValueError("text_ema_enabled must be boolean")
         current = self._snapshot()
         for name, value in current.items():
             if (name.startswith("gemma.") and update_text) or (name.startswith("transformer.") and update_av):
-                self.old[name].lerp_(value, 1.0 - decay)
+                component_decay = 0.0 if name.startswith("gemma.") and not text_ema_enabled else decay
+                self.old[name].lerp_(value, 1.0 - component_decay)
         self._frozen_digests = self._snapshot_digests()
 
     @contextmanager

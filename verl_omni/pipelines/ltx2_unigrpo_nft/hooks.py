@@ -119,6 +119,9 @@ class LTXJointHooks(DiffusionEngineHooks):
         sync = perf_counter() - started
         request_configs = tu.get(data, "_ltx_sampling_params")
         overrides = {}
+        recaption_seeds = tu.get(data, "_ltx_recaption_seed")
+        if recaption_seeds is not None:
+            overrides["recaption_seeds"] = list(recaption_seeds)
         if request_configs is not None:
             request_configs = list(request_configs)
             if len(request_configs) != len(texts) or any(item != request_configs[0] for item in request_configs):
@@ -169,7 +172,13 @@ class LTXJointHooks(DiffusionEngineHooks):
     def ema_update_adapter(self, *, source, target, decay):
         if (source, target) != ("default", "old"):
             raise ValueError("Joint EMA only supports default -> old")
-        self.policies.update_old(decay=decay, update_text=self._update_text, update_av=self._update_av)
+        settings = getattr(self.model_config, "ltx_joint", None)
+        self.policies.update_old(
+            decay=decay,
+            update_text=self._update_text,
+            update_av=self._update_av,
+            text_ema_enabled=getattr(settings, "text_ema_enabled", True),
+        )
 
     def state_dict(self):
         return self.policies.state_dict()

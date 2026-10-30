@@ -66,6 +66,7 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
         if batch.batch is None:
             batch.batch = TensorDict({}, batch_size=[len(batch)])
         batch.meta_info["global_steps"] = self.global_steps
+        batch.meta_info["ltx_is_evaluation"] = True
         self._evaluating = True
         try:
             batch = batch.union(self._generate_native(batch))
@@ -116,6 +117,24 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
             raise ValueError("Joint LTX requires its paired adapter and loss")
         if rollout.name != "vllm_omni" or rollout.tensor_model_parallel_size != 1:
             raise ValueError("Joint LTX requires independent TP=1 native vLLM-Omni workers")
+        nested = rollout.get("ltx_joint", {})
+        tree = nested.get("tree_rollout", False)
+        if type(tree) is not bool:
+            raise ValueError("tree_rollout must be boolean")
+        videos = 1
+        if tree:
+            videos = nested.get("videos_per_rewrite", 1)
+            rewrites = nested.get("rewrites_per_prompt", 1)
+            if type(videos) is not int or videos < 1:
+                raise ValueError("videos_per_rewrite must be a positive integer")
+            if type(rewrites) is not int or rewrites < 2:
+                raise ValueError("tree rollout rewrites_per_prompt must be at least two")
+            rollout.n = rewrites * videos
+            av_group = actor.diffusion_loss.get("av_advantage_group", "prompt")
+            if av_group not in {"prompt", "rewrite"}:
+                raise ValueError("av_advantage_group must be prompt or rewrite")
+            if av_group == "rewrite" and videos < 2:
+                raise ValueError("av_advantage_group=rewrite requires videos_per_rewrite >= 2")
         if rollout.n < 2 or config.trainer.nnodes != 1 or config.algorithm.sample_source != "online":
             raise ValueError("Joint LTX requires online grouped samples on one node")
         if model.lora_rank <= 0 or tuple(model.policy_state_adapters) != ("default",):
@@ -127,6 +146,8 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
             raise ValueError("Joint micro-batch size must be a positive integer")
         world = config.trainer.n_gpus_per_node
         samples = config.data.train_batch_size * rollout.n
+        if world > 0 and videos > 1 and config.data.train_batch_size * rewrites % world:
+            raise ValueError("Prompt count times rewrites_per_prompt must divide across actor ranks")
         if world <= 0 or samples <= 0 or actor.ppo_mini_batch_size <= 0:
             raise ValueError("Joint actor world and batch sizes must be positive")
         if samples % world or actor.ppo_mini_batch_size % world or samples % actor.ppo_mini_batch_size:
@@ -165,7 +186,25 @@ class LTXJointRayTrainer(BagelJointRayTrainer):
         else:
             if len(gen_batch_output) % world:
                 raise ValueError("Joint rollout samples must divide across all actor ranks")
-            output = super()._generate_native(gen_batch_output)
+            nested = rollout.get("ltx_joint", {})
+            videos = nested.get("videos_per_rewrite", 1) if nested.get("tree_rollout", False) else 1
+            if videos == 1:
+                output = super()._generate_native(gen_batch_output)
+            else:
+                count, group = len(gen_batch_output), rollout.n
+                uids = gen_batch_output.non_tensor_batch["uid"]
+                if count % group or not (uids.reshape(-1, group) == uids.reshape(-1, group)[:, :1]).all():
+                    raise ValueError("Nested rollout requires complete contiguous prompt groups")
+                version = self._rollout_version()
+                seeds = self._rollout_seeds(count, version)
+                gen_batch_output.non_tensor_batch[self.policy_version_key] = np.full(count, version)
+                gen_batch_output.non_tensor_batch[self.sample_seed_key] = seeds
+                gen_batch_output.non_tensor_batch["_ltx_recaption_seed"] = np.repeat(seeds[::videos], videos)
+                gen_batch_output.non_tensor_batch["_ltx_rewrite_id"] = np.repeat(np.arange(count // videos), videos)
+                # Keep each rewrite's videos together on a worker to reuse sampled text.
+                permutation = np.arange(count).reshape(-1, group // videos, videos).transpose(1, 0, 2).reshape(-1)
+                output = NativeRayDiffusionTrainer._generate_native(self, gen_batch_output.select_idxs(permutation))
+                output = output.select_idxs(np.argsort(permutation))
         # Dataset modality targets must survive generation/reordering. Native
         # workers use the original AV prompt only as a fallback for plain tasks.
         targets = gen_batch_output.non_tensor_batch.get("reward_inputs")

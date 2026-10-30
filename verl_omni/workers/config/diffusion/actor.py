@@ -136,6 +136,7 @@ class LTXJointLossConfig(OmniNFTLossConfig):
     loss_mode: str = "ltx2_unigrpo_nft"
     # AV coefficient; text_loss_weight is inherited. No normalization by their sum.
     av_loss_weight: float = 1.0
+    av_advantage_group: str = "prompt"
     # Token-level GRPO or length-normalized sequence-level GSPO.
     text_policy_loss: str = "grpo"
     # Select text credit: average per-component advantages or normalize a scalar reward.
@@ -151,6 +152,8 @@ class LTXJointLossConfig(OmniNFTLossConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.av_advantage_group not in {"prompt", "rewrite"}:
+            raise ValueError("av_advantage_group must be prompt or rewrite")
         if self.text_advantage_source not in {"modality_probability", "combined_reward", "component_advantage_mean"}:
             raise ValueError(
                 "Supported text_advantage_source: modality_probability, combined_reward, component_advantage_mean"

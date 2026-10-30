@@ -181,6 +181,9 @@ bagel_joint:
 # Native two-stage LTX settings mirrored from rollout.
 ltx_joint:
 
+  # Disable smoothing only for Gemma old-policy updates.
+  text_ema_enabled: ${oc.select:actor_rollout_ref.rollout.ltx_joint.text_ema_enabled,true}
+
   # Typed actor-side settings.
   _target_: verl_omni.workers.config.diffusion.LTXJointRolloutConfig
 

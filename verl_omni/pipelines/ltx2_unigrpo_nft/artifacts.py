@@ -121,6 +121,9 @@ def save_joint_samples(batch, directory, reward_names, *, save_tensors=False):
             "audio_sample_rate": rate,
             "fps": fps,
         }
+        for source, target in (("_ltx_rewrite_id", "rewrite_id"), ("_ltx_recaption_seed", "recaption_seed")):
+            if source in batch.non_tensor_batch:
+                sample[target] = int(batch.non_tensor_batch[source][i])
         if save_tensors:
             sample.update(
                 replay=asdict(record), ar_inputs=record.ar_inputs(torch.device("cpu")), video=video, audio=audio
@@ -164,6 +167,7 @@ def save_joint_samples(batch, directory, reward_names, *, save_tensors=False):
                 "video_file": f"{stem}.mp4",
                 "audio_file": f"{stem}.wav",
                 "uid": sample["uid"],
+                **{key: sample[key] for key in ("rewrite_id", "recaption_seed") if key in sample},
                 "original_prompt": record.original_prompt,
                 "recaption": record.recaption,
                 "planning": record.planning,

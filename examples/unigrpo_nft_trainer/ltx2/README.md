@@ -774,3 +774,53 @@ cache contents raise an error instead of silently replacing a live mapping.
 
 This reduces replicated frozen CPU storage. It does not fix defective memory or
 prove that an NPU transfer path is reliable.
+
+### Multiple videos per rewrite
+
+Enable `actor_rollout_ref.rollout.ltx_joint.tree_rollout=true`, then set
+`actor_rollout_ref.rollout.ltx_joint.rewrites_per_prompt=8` and
+`actor_rollout_ref.rollout.ltx_joint.videos_per_rewrite=4` to sample eight
+rewrites per training prompt and four AV generations per rewrite. The trainer
+sets total `rollout.n=32`; do not also use `rollout.n` to specify rewrite count.
+The default `tree_rollout=false` preserves the existing `rollout.n` behavior
+and ignores tree counts and AV grouping, even if they are set. Tree counts default
+to `rewrites_per_prompt=1`, `videos_per_rewrite=1` as inactive placeholders;
+when enabling tree rollout, explicitly set at least two rewrites. Validation remains controlled by `val_kwargs.n`.
+
+Each rewrite is sampled once per worker and policy version, retaining exactly
+the same response tokens and old logprobs across its videos. AV seeds are
+independent. Prompt count times rewrite count must divide across actor ranks;
+PPO mini-batch sizes still count videos and must divide the total video batch.
+At least two rewrites are required. Generation cost scales with R times V.
+
+For text credit, rewards are averaged over each rewrite's videos *before*
+normalization across rewrites. `component_advantage_mean` averages each scorer
+first, computes its advantage, then averages the scorer advantages. Global text
+std now uses batch_size times R rewrite means. `combined_reward` uses averaged
+combined rewards; `modality_probability` uses averaged modality probabilities.
+The same text advantage is broadcast to the V video rows. With equal V this
+keeps the average text-loss weighting unchanged; it does repeat text forwards
+and can span multiple optimizer mini-batches. AV reward normalization and AV
+training remain per video. Rollout artifacts record rewrite IDs and text seeds.
+
+Set `actor_rollout_ref.actor.diffusion_loss.av_advantage_group=rewrite` to
+center AV component rewards within each rewrite's V videos (requires V >= 2).
+Within tree rollout, the default `prompt` centers across R*V candidates.
+`algorithm.global_std=true` still uses all B*R*V video rewards for each scorer's
+standard deviation; when false, std uses the selected group. Routing weights,
+clipping and probability mapping are unchanged. Text grouping always remains
+by original prompt, and validation continues using its independent prompt groups.
+With `text_advantage_source=modality_probability`, changing AV groups also changes
+the probabilities subsequently averaged for text credit; default
+`component_advantage_mean` text credit is unaffected by the AV grouping choice.
+
+### Text old-policy EMA switch
+
+`actor_rollout_ref.rollout.ltx_joint.text_ema_enabled=true` (default) keeps
+Gemma's existing EMA behavior. Set it to `false` to copy current Gemma LoRA
+parameters directly into the old snapshot at each scheduled old-policy update.
+DiT still uses the configured EMA decay. The shared `old_policy_update_interval`
+still determines update timing; old text weights stay frozen throughout all
+mini-batches in a round. This switch does not disable text training or KL, change
+the fixed reference, or unfreeze text in `av_only` ablation. It is independent
+of tree rollout. Resume restores saved old/ref snapshots without an extra update.

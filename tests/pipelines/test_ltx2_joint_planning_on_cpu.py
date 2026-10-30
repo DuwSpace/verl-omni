@@ -287,3 +287,41 @@ def test_plan_may_refer_to_recaption_tag_without_creating_another_section(rollou
     if not closing_tag:
         with pytest.raises(ValueError, match="truncated"):
             parse_planned_recaption(response, ended_with_eos=False)
+
+
+def test_nested_rollout_reuses_text_but_preserves_each_video_seed(rollout, monkeypatch):
+    pipeline, request, calls, _, _ = rollout
+    original = pipeline._recaption
+    text_seeds = []
+
+    def counted(*args, **kwargs):
+        text_seeds.append(kwargs["seed"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "_recaption", counted)
+    params = request.requests[0].sampling_params
+    params.extra_args["recaption_seed"] = 100
+    records = []
+    for seed in (42, 43, 44):
+        params.seed = seed
+        output = pipeline.forward(request)
+        records.append(LTXJointReplay(**output.output["metadata"]["rl"]["ltx_joint_replay"]))
+    assert text_seeds == [100]
+    assert [r.seed for r in records] == [42, 43, 44]
+    assert calls.count("av") == 3
+    for r in records:
+        r.validate()
+        torch.testing.assert_close(r.rollout_logprobs, records[0].rollout_logprobs)
+    params.extra_args["recaption_seed"] = 101
+    pipeline.forward(request)
+    assert text_seeds == [100, 101]
+    pipeline._cached_recaption(
+        "A bell rings.",
+        version=4,
+        seed=101,
+        temperature=1.0,
+        max_new_tokens=512,
+        recaption_prompt="planner",
+        duration_seconds=8 / 24,
+    )
+    assert text_seeds == [100, 101, 101]

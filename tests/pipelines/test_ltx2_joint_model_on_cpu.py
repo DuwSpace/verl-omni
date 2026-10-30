@@ -1357,3 +1357,128 @@ def test_text_component_advantages_are_normalized_before_equal_weight_mean(globa
     assert metrics["text/components/clap/advantage_abs_mean"] == 0
     assert metrics["text/reward_source_component_advantage_mean"] == 1
     assert batch.meta_info["text_reward_source"] == "component_advantage_mean"
+
+
+def test_nested_text_credit_averages_rewards_before_normalization():
+    from types import SimpleNamespace
+
+    import numpy as np
+    from tensordict import TensorDict
+    from verl import DataProto
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.loss import LTXJointLoss
+    from verl_omni.workers.config.diffusion.actor import LTXJointLossConfig
+
+    # Rewrite means are 1 and 5. Per-video normalization would give different credit.
+    scores = torch.tensor([[0.0], [2.0], [4.0], [6.0]])
+    replay = [
+        SimpleNamespace(response_token_ids=torch.tensor([j // 2, 9]), rollout_logprobs=torch.tensor([-1.0, -2.0]))
+        for j in range(4)
+    ]
+    batch = DataProto(
+        batch=TensorDict({"rm_scores": scores.clone(), "reward_prob": torch.full((4, 1, 2), 0.5)}, batch_size=[4]),
+        non_tensor_batch={
+            "uid": np.array(["a"] * 4, dtype=object),
+            "_ltx_rewrite_id": np.array([0, 0, 1, 1]),
+            "ltx_joint_replay": np.array(replay, dtype=object),
+        },
+    )
+    LTXJointLoss._prepare_nested_text_credit(batch, LTXJointLossConfig())
+    torch.testing.assert_close(
+        batch.batch["text_advantages"], torch.tensor([-1.0, -1.0, 1.0, 1.0]), atol=1e-5, rtol=1e-5
+    )
+    torch.testing.assert_close(batch.batch["rm_scores"], scores)
+    torch.testing.assert_close(batch.batch["text_reward"], torch.tensor([1.0, 1.0, 5.0, 5.0]))
+    replay[1].response_token_ids = torch.tensor([7, 9])
+    with pytest.raises(ValueError, match="tokens"):
+        LTXJointLoss._prepare_nested_text_credit(batch, LTXJointLossConfig())
+
+
+@pytest.mark.parametrize("global_std", [True, False])
+def test_av_rewrite_group_centers_per_rewrite_and_preserves_text_groups(global_std):
+    from types import SimpleNamespace
+
+    import numpy as np
+    from tensordict import TensorDict
+    from verl import DataProto
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.loss import LTXJointLoss
+    from verl_omni.workers.config.diffusion.actor import LTXJointLossConfig
+
+    scores = torch.tensor([[0.0], [2.0], [10.0], [14.0]])
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(
+            norm_adv_by_std_in_grpo=True, global_std=global_std, adv_mode="continuous", timestep_fraction=1.0
+        ),
+        actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(diffusion_loss=LTXJointLossConfig(av_advantage_group="rewrite"), data_loader_seed=42),
+            rollout=SimpleNamespace(ltx_joint=SimpleNamespace(tree_rollout=True)),
+        ),
+        reward=SimpleNamespace(reward_functions={"score": {"routing_weights": {"video": 1.0, "audio": 1.0}}}),
+    )
+    uids = np.array(["a"] * 4, dtype=object)
+    batch = DataProto(
+        batch=TensorDict(
+            {
+                "rm_scores": scores.clone(),
+                "train_timesteps": torch.tensor([[900.0, 500.0]]).repeat(4, 1),
+                "video_latents_clean": torch.zeros(4, 2, 4),
+                "audio_latents_clean": torch.zeros(4, 2, 4),
+            },
+            batch_size=[4],
+        ),
+        non_tensor_batch={"uid": uids, "_ltx_rewrite_id": np.array([0, 0, 1, 1])},
+        meta_info={"reward_names": ["score"]},
+    )
+    LTXJointLoss._prepare_av_credit(batch, scores, config)
+    denominator = scores.std(correction=0) if global_std else torch.tensor([1.0, 1.0, 2.0, 2.0])
+    expected = torch.tensor([-1.0, 1.0, -2.0, 2.0]) / (denominator + 1e-4)
+    torch.testing.assert_close(batch.batch["advantages"][:, 0], expected)
+    torch.testing.assert_close(batch.batch["reward_prob"][:, 0, 0], expected / 10 + 0.5)
+    assert batch.non_tensor_batch["uid"] is uids
+    torch.testing.assert_close(batch.batch["rm_scores"], scores)
+    # Evaluation uses original prompt groups even when training requests rewrite groups.
+    batch.meta_info["ltx_is_evaluation"] = True
+    LTXJointLoss._prepare_av_credit(batch, scores, config)
+    expected_eval = (scores[:, 0] - scores.mean()) / (scores.std(correction=0) + 1e-4)
+    torch.testing.assert_close(batch.batch["advantages"][:, 0], expected_eval)
+    batch.meta_info["ltx_is_evaluation"] = False
+    config.actor_rollout_ref.rollout.ltx_joint.tree_rollout = False
+    LTXJointLoss._prepare_av_credit(batch, scores, config)
+    torch.testing.assert_close(batch.batch["advantages"][:, 0], expected_eval)
+    config.actor_rollout_ref.rollout.ltx_joint.tree_rollout = True
+    batch.non_tensor_batch["_ltx_rewrite_id"] = np.arange(4)
+    with pytest.raises(ValueError, match="at least two"):
+        LTXJointLoss._prepare_av_credit(batch, scores, config)
+    assert batch.non_tensor_batch["uid"] is uids
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("update_text", [True, False])
+def test_text_ema_switch_keeps_av_ema_and_reference(model, enabled, update_text):
+    from types import SimpleNamespace
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.hooks import LTXJointHooks
+    from verl_omni.workers.config.diffusion import LTXJointRolloutConfig
+
+    hooks = LTXJointHooks(model, SimpleNamespace(ltx_joint=LTXJointRolloutConfig(text_ema_enabled=enabled)), None)
+    hooks._update_text = update_text
+    hooks.begin_rollout(version=0)
+    initial = hooks.state_dict()["old"]
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.add_(2)
+    current = hooks.policies._snapshot()
+    hooks.ema_update_adapter(source="default", target="old", decay=0.75)
+    for name in initial:
+        text = name.startswith("gemma.")
+        delta = (0 if not update_text else (0.5 if enabled else 2)) if text else 0.5
+        torch.testing.assert_close(hooks.policies.old[name], initial[name] + delta)
+        torch.testing.assert_close(hooks.policies.reference[name], initial[name])
+        torch.testing.assert_close(hooks.policies._snapshot()[name], current[name])
+    saved = hooks.state_dict()
+    hooks.load_state_dict(saved)
+    hooks.begin_rollout(version=1)
+    for name in initial:
+        torch.testing.assert_close(hooks.policies.old[name], saved["old"][name])

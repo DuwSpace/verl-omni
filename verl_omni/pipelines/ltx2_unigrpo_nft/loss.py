@@ -94,10 +94,82 @@ class LTXJointLoss(OmniNFTLoss):
         if "rm_scores" not in batch.batch or not bool(torch.isfinite(batch.batch["rm_scores"]).all()):
             raise ValueError("Joint actor preparation requires finite component reward scores")
         # Preserve the source normalization, routing, probability map and timestep selection.
-        batch = OmniNFTLoss.prepare_actor_batch(batch, reward_tensor, config)
-        cls._prepare_text_credit(batch, config.actor_rollout_ref.actor.diffusion_loss)
+        batch = cls._prepare_av_credit(batch, reward_tensor, config)
+        cls._prepare_nested_text_credit(batch, config.actor_rollout_ref.actor.diffusion_loss)
         cls._prepare_forward_noise(batch, records)
         return batch
+
+    @staticmethod
+    def _prepare_av_credit(batch, reward_tensor, config):
+        rollout = getattr(config.actor_rollout_ref, "rollout", None)
+        settings = getattr(rollout, "ltx_joint", None)
+        tree = getattr(settings, "tree_rollout", False)
+        mode = (
+            getattr(config.actor_rollout_ref.actor.diffusion_loss, "av_advantage_group", "prompt") if tree else "prompt"
+        )
+        if mode not in {"prompt", "rewrite"}:
+            raise ValueError("av_advantage_group must be prompt or rewrite")
+        # Validation retains its independent candidate count and original prompt groups.
+        if mode == "prompt" or batch.meta_info.get("ltx_is_evaluation", False):
+            return OmniNFTLoss.prepare_actor_batch(batch, reward_tensor, config)
+        import numpy as np
+
+        ids = batch.non_tensor_batch.get("_ltx_rewrite_id")
+        if ids is None or len(ids) != len(batch):
+            raise ValueError("Rewrite AV advantages require a rewrite ID per video")
+        _, inverse, counts = np.unique(ids, return_inverse=True, return_counts=True)
+        if (counts < 2).any() or not (counts == counts[0]).all():
+            raise ValueError("Rewrite AV advantages require equal groups with at least two videos")
+        prompt_ids = batch.non_tensor_batch["uid"]
+        for i in range(len(counts)):
+            group = prompt_ids[inverse == i]
+            if not (group == group[0]).all():
+                raise ValueError("One rewrite cannot contain multiple original prompts")
+        # Only change the grouping passed to OmniNFT. Preserve all individual scores,
+        # full-batch std, routing, clipping and timestep selection; restore text groups.
+        batch.non_tensor_batch["uid"] = ids
+        try:
+            return OmniNFTLoss.prepare_actor_batch(batch, reward_tensor, config)
+        finally:
+            batch.non_tensor_batch["uid"] = prompt_ids
+
+    @classmethod
+    def _prepare_nested_text_credit(cls, batch, loss_config):
+        ids = batch.non_tensor_batch.get("_ltx_rewrite_id")
+        if ids is None:
+            return cls._prepare_text_credit(batch, loss_config)
+        import numpy as np
+        from verl import DataProto
+
+        _, first, inverse, counts = np.unique(ids, return_index=True, return_inverse=True, return_counts=True)
+        if not (counts == counts[0]).all():
+            raise ValueError("Every rewrite must have the same number of videos")
+        records = batch.non_tensor_batch["ltx_joint_replay"]
+        for i, index in enumerate(first):
+            for j in np.flatnonzero(inverse == i):
+                if (
+                    batch.non_tensor_batch["uid"][j] != batch.non_tensor_batch["uid"][index]
+                    or not torch.equal(records[j].response_token_ids, records[index].response_token_ids)
+                    or not torch.equal(records[j].rollout_logprobs, records[index].rollout_logprobs)
+                ):
+                    raise ValueError("Videos of one rewrite must share prompt, tokens and old logprobs")
+        tensors = {}
+        for key in ("rm_scores", "reward_prob"):
+            value = batch.batch[key]
+            tensors[key] = torch.stack([value[np.flatnonzero(inverse == i)].mean(0) for i in range(len(first))])
+        reduced = DataProto(
+            batch=TensorDict(tensors, batch_size=[len(first)]),
+            non_tensor_batch={"uid": batch.non_tensor_batch["uid"][first]},
+            meta_info=dict(batch.meta_info),
+        )
+        cls._prepare_text_credit(reduced, loss_config)
+        for key in ("text_advantages", "text_reward_prob", "text_reward"):
+            batch.batch[key] = reduced.batch[key][torch.as_tensor(inverse, device=reduced.batch[key].device)]
+        for key in ("text_reward_source", "text_reward_metrics"):
+            batch.meta_info[key] = reduced.meta_info[key]
+        batch.meta_info["text_reward_metrics"].update(
+            {"text/unique_rewrites": len(first), "text/videos_per_rewrite": int(counts[0])}
+        )
 
     @staticmethod
     def _prepare_text_credit(batch, loss_config):

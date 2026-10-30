@@ -40,6 +40,10 @@ __all__ = [
 class LTXJointRolloutConfig(BaseConfig):
     """Synchronous two-stage native LTX worker settings."""
 
+    text_ema_enabled: bool = True
+    tree_rollout: bool = False
+    rewrites_per_prompt: int = 1
+    videos_per_rewrite: int = 1
     max_new_tokens: int = 256
     # Rewriting instruction and chat format shared by training and validation.
     recaption_prompt: str = "planner"
@@ -55,6 +59,15 @@ class LTXJointRolloutConfig(BaseConfig):
     def __post_init__(self):
         import math
 
+        if type(self.text_ema_enabled) is not bool:
+            raise ValueError("text_ema_enabled must be boolean")
+        if type(self.tree_rollout) is not bool:
+            raise ValueError("tree_rollout must be boolean")
+        if self.tree_rollout:
+            if type(self.videos_per_rewrite) is not int or self.videos_per_rewrite < 1:
+                raise ValueError("videos_per_rewrite must be a positive integer")
+            if type(self.rewrites_per_prompt) is not int or self.rewrites_per_prompt < 2:
+                raise ValueError("tree rollout rewrites_per_prompt must be at least two")
         if self.recaption_prompt not in ("planner", "ltx_t2v"):
             raise ValueError("LTX recaption_prompt must be planner or ltx_t2v")
         if self.max_new_tokens <= 0 or self.sync_timeout_seconds <= 0:

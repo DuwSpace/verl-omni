@@ -245,6 +245,8 @@ bagel_joint:
 # Native two-stage LTX settings.
 ltx_joint:
 
+  text_ema_enabled: true
+
   # Typed rollout settings.
   _target_: verl_omni.workers.config.diffusion.LTXJointRolloutConfig
 

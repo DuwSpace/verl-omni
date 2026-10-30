@@ -185,13 +185,17 @@ class LTXJointVllmBackend:
         self.policy_version = version
         return manifest
 
-    def generate(self, prompts, seeds, *, version, sampling_params=None):
+    def generate(self, prompts, seeds, *, version, sampling_params=None, recaption_seeds=None):
         """Generate sequential requests, then release device memory before reward/actor work."""
         if self.policy_version is None or version != self.policy_version:
             raise RuntimeError("Load the complete paired policy before rollout")
+        if recaption_seeds is not None and len(recaption_seeds) != len(prompts):
+            raise ValueError("Expected one recaption seed per video")
         results = []
         for index, (prompt, seed) in enumerate(zip(prompts, seeds, strict=True)):
             request = self._make_request(prompt, seed, version, index, sampling_params)
+            if recaption_seeds is not None:
+                request.sampling_params.extra_args["recaption_seed"] = int(recaption_seeds[index])
             output = self.engine.add_req_and_wait_for_response(request)
             results.append(self._read_response(output, prompt, seed, version))
         self.engine.collective_rpc("release_joint_device_memory", timeout=self.timeout)
