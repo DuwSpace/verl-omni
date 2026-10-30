@@ -21,6 +21,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from .cpu_offload import NativeRewardCpuOffload
 from .hpsv3_reward import Qwen2VLRewardModelBT, smart_resize
 from .reward_utils import load_torch_state_dict, video_reward_tensor
 
@@ -288,7 +289,7 @@ async def compute_score(
     return {"score": float(score)}
 
 
-class VideoAlignModel:
+class VideoAlignModel(NativeRewardCpuOffload):
     """Raw VideoAlign inference adapter owned by a native reward executor."""
 
     def __init__(self, model_path: str, device, base_model_path: str) -> None:
@@ -296,12 +297,15 @@ class VideoAlignModel:
         self.device = torch.device(device)
         self.model.to(self.device).eval()
         self._infer_lock = threading.Lock()
+        self._init_cpu_offload(device)
 
     def close(self) -> None:
-        """Drop model/processor references; reuse requires constructing a new adapter."""
-        self.model = None
-        self.processor = None
-        self.device = None
+        """Release retained weights and processors permanently."""
+        with self._infer_lock:
+            self._offload_closed = True
+            self.model = None
+            self.processor = None
+            self.device = None
 
     def _prepare_batch(self, videos: list[torch.Tensor], prompts: list[str]) -> dict[str, Any]:
         """Resize sampled RGB clips and tokenize video/prompt pairs on the active device.

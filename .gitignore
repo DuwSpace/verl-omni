@@ -123,6 +123,8 @@ ENV/
 
 # data
 *.parquet
+!data/omninft/vggsound/ltx_joint_full/train.parquet
+!data/omninft/vggsound/ltx_joint_full/test.parquet
 
 
 # local logs

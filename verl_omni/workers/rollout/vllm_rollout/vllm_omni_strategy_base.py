@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -88,7 +89,9 @@ class OmniStrategyBase(ABC):
         Returns:
             The mode's rollout-config dataclass instance.
         """
-        return omega_conf_to_dataclass(config, dataclass_type=self.rollout_config_cls)
+        # Respect nested pipeline subclasses declared by the recipe's _target_.
+        config_cls = None if isinstance(config, Mapping) and config.get("_target_") else self.rollout_config_cls
+        return omega_conf_to_dataclass(config, dataclass_type=config_cls)
 
     def init_model_config(self, model_config: Any) -> Any:
         """Convert the raw model config into :attr:`model_config_cls`.
@@ -99,7 +102,10 @@ class OmniStrategyBase(ABC):
         Returns:
             The mode's model-config dataclass instance.
         """
-        return omega_conf_to_dataclass(model_config, dataclass_type=self.model_config_cls)
+        config_cls = (
+            None if isinstance(model_config, Mapping) and model_config.get("_target_") else self.model_config_cls
+        )
+        return omega_conf_to_dataclass(model_config, dataclass_type=config_cls)
 
     def validate_configs(self) -> None:
         """Validate/normalize ``self.server.config`` after it is built.

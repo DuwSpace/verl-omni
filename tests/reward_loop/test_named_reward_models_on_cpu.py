@@ -1452,13 +1452,14 @@ def test_component_rewards_require_named_models():
         OmniRewardLoopManager(config)
 
 
-def test_component_rewards_accept_registered_omninft_loss(monkeypatch):
+@pytest.mark.parametrize("loss_mode", ["omni_nft", "ltx2_unigrpo_nft"])
+def test_component_rewards_accept_registered_omninft_loss(monkeypatch, loss_mode):
     from verl_omni.reward_loop import reward_loop as loop_module
 
     config = _config({"quality": {"backend": "engine"}})
     config.reward.aggregation = "preserve_components"
     config.algorithm.trainer_type = "direct_preference"
-    config.actor_rollout_ref.actor.diffusion_loss.loss_mode = "omni_nft"
+    config.actor_rollout_ref.actor.diffusion_loss.loss_mode = loss_mode
     config.reward.reward_manager.name = "MultiVisualRewardManager"
     config.reward.reward_functions = OmegaConf.create({"quality": {"path": "unused", "name": "compute_score"}})
     monkeypatch.setattr(
@@ -1471,11 +1472,12 @@ def test_component_rewards_accept_registered_omninft_loss(monkeypatch):
     assert manager._preserve_reward_components is True
 
 
-def test_component_rewards_reject_policy_gradient_omninft_configuration():
+@pytest.mark.parametrize("loss_mode", ["omni_nft", "ltx2_unigrpo_nft"])
+def test_component_rewards_reject_policy_gradient_omninft_configuration(loss_mode):
     config = _config({"quality": {"backend": "engine"}})
     config.reward.aggregation = "preserve_components"
     config.algorithm.trainer_type = "policy_gradient"
-    config.actor_rollout_ref.actor.diffusion_loss.loss_mode = "omni_nft"
+    config.actor_rollout_ref.actor.diffusion_loss.loss_mode = loss_mode
     with pytest.raises(ValueError, match="OmniNFT direct-preference trainer"):
         OmniRewardLoopManager(config)
 
@@ -1782,3 +1784,28 @@ async def test_model_wake_failure_drains_other_model_before_sleep():
     finally:
         release.set()
         await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+
+@pytest.mark.parametrize("mode", ["joint", "ar_only", "av_only"])
+def test_joint_recipe_component_rewards_initialize(monkeypatch, mode):
+    from pathlib import Path
+
+    from verl_omni.reward_loop import reward_loop as loop_module
+
+    root = Path(__file__).resolve().parents[2]
+    monkeypatch.setenv("LTX_REWARD_ROOT", "/models/rewards")
+    monkeypatch.setenv("LTX_OUTPUT_DIR", "/tmp/ltx")
+    monkeypatch.setenv("LTX_MODEL_PATH", "/models/ltx")
+    with initialize_config_dir(config_dir=str(root / "examples/unigrpo_nft_trainer/ltx2"), version_base=None):
+        config = compose(config_name="joint_train", overrides=[f"ablation={mode}"])
+    monkeypatch.setattr(
+        loop_module,
+        "MultiRewardModelManager",
+        lambda *args, **kwargs: SimpleNamespace(models={name: object() for name in config.reward.models}),
+    )
+    initialized = []
+    monkeypatch.setattr(OmniRewardLoopManager, "_init_reward_loop_workers", lambda self: initialized.append(self))
+    manager = OmniRewardLoopManager(config)
+    assert initialized == [manager]
+    assert manager._preserve_reward_components
+    assert len(manager.multi_reward_model_manager.models) == 5

@@ -151,6 +151,10 @@ class LoRAAdapterMixin:
             for source_param, target_param in zip(source_params, target_params, strict=True):
                 target_param.copy_(source_param)
 
+    def adapter_ema_decay(self, parameter_name, decay):
+        """Default to uniform EMA; composite engines may select per-component decay."""
+        return decay
+
     def ema_update_adapter(self, source: str = "default", target: str = "old", decay: float = 0.0) -> None:
         """EMA-update target adapter parameters from source adapter parameters."""
         if not 0.0 <= decay <= 1.0:
@@ -163,8 +167,12 @@ class LoRAAdapterMixin:
                     f"Adapter EMA {source!r} -> {target!r} found mismatched params: "
                     f"{len(source_params)} vs {len(target_params)}"
                 )
+            names = {id(parameter): name for name, parameter in self.module.named_parameters()}
             for source_param, target_param in zip(source_params, target_params, strict=True):
-                target_param.lerp_(source_param, 1.0 - decay)
+                component_decay = self.adapter_ema_decay(names[id(source_param)], decay)
+                if not 0.0 <= component_decay <= 1.0:
+                    raise ValueError("Component adapter EMA decay must be in [0, 1]")
+                target_param.lerp_(source_param, 1.0 - component_decay)
 
     @contextmanager
     def disable_adapter(self):

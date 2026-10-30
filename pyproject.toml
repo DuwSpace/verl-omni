@@ -197,6 +197,7 @@ verl_omni = [
   "trainer/config/*/*.yaml",
   "trainer/config/*/*/*.yaml",
   "utils/agentic/*.json",
+  "pipelines/ltx2_unigrpo_nft/text/prompts/*",
 ]
 
 # -------------------------------

@@ -26,12 +26,14 @@ import torch.nn.functional as F
 from verl.utils.device import get_device_name
 
 if __package__:
+    from .cpu_offload import NativeRewardCpuOffload
     from .reward_utils import audio_info_from_batch, get_audio, resample_audio
 else:
     # File-path scorers have no parent package. Load the sibling without
     # importing verl_omni's engine/pipeline registration side effects.
     from verl.utils.import_utils import load_module
 
+    NativeRewardCpuOffload = load_module(str(Path(__file__).with_name("cpu_offload.py"))).NativeRewardCpuOffload
     _reward_utils = load_module(str(Path(__file__).with_name("reward_utils.py")))
     audio_info_from_batch = _reward_utils.audio_info_from_batch
     get_audio = _reward_utils.get_audio
@@ -272,7 +274,7 @@ async def compute_score(
     return {"score": score, "source_sample_rate": source_rate}
 
 
-class CLAPModel:
+class CLAPModel(NativeRewardCpuOffload):
     """Raw CLAP inference adapter owned by a native reward executor."""
 
     def __init__(self, model_path: str, device, model_kwargs=None, processor_kwargs=None) -> None:
@@ -282,12 +284,15 @@ class CLAPModel:
         self.model = ClapModel.from_pretrained(model_path, **(model_kwargs or {})).to(self.device).eval()
         self.processor = AutoProcessor.from_pretrained(model_path, **(processor_kwargs or {}))
         self._infer_lock = threading.Lock()
+        self._init_cpu_offload(device)
 
     def close(self) -> None:
-        """Drop model/processor references; reuse requires constructing a new adapter."""
-        self.model = None
-        self.processor = None
-        self.device = None
+        """Release retained weights and processors permanently."""
+        with self._infer_lock:
+            self._offload_closed = True
+            self.model = None
+            self.processor = None
+            self.device = None
 
     @torch.inference_mode()
     def infer(self, waveforms: list[np.ndarray], prompts: list[str]) -> dict[str, torch.Tensor]:

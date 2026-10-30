@@ -114,6 +114,19 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
 
         return super().__new__(cls)
 
+    def prepare_rollout_requests(self, requests):
+        """Run a pipeline's optional preparation stage before scheduler admission."""
+        if not requests:
+            raise ValueError("Preparation requires at least one request")
+        params = requests[0].sampling_params
+        if self.lora_manager is not None:
+            self.lora_manager.set_active_adapter(params.lora_request, params.lora_scale)
+        return self.model_runner.pipeline.prepare_rollout_requests(requests)
+
+    def clear_prepared_rollout(self):
+        """Release pipeline-owned conditions for a completed or failed round."""
+        self.model_runner.pipeline.clear_prepared_rollout()
+
     def set_pending_lora_peft_config(self, peft_config: dict | None = None):
         """Stash the actor's LoRA ``peft_config`` for the next
         ``update_weights_from_ipc`` call (separate-async NCCL path only).

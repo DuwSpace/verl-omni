@@ -53,6 +53,71 @@ def _load_module():
 hpsv3_reward = _load_module()
 
 
+@pytest.mark.parametrize("missing_weight", [False, True])
+def test_checkpoint_loader_skips_random_init_and_restores_all_weights(monkeypatch, tmp_path, missing_weight):
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from transformers import Qwen2VLConfig
+
+    config = Qwen2VLConfig(
+        text_config={
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 24,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "rope_parameters": {"rope_type": "default", "mrope_section": [1, 1, 2]},
+        },
+        vision_config={"depth": 1, "embed_dim": 16, "hidden_size": 16, "num_heads": 2, "patch_size": 2},
+    )
+    original_config = deepcopy(config)
+    reference = hpsv3_reward.Qwen2VLRewardModelBT(config, special_token_ids=[32])
+    reference.resize_token_embeddings(33, mean_resizing=False)
+    reference.to(torch.bfloat16)
+    reference.rm_head.float()
+    checkpoint = reference.state_dict()
+    if missing_weight:
+        checkpoint.pop("rm_head.0.weight")
+    path = tmp_path / "reward.pt"
+    torch.save(checkpoint, path)
+
+    class Tokenizer:
+        padding_side = "right"
+        pad_token_id = 0
+
+        def __len__(self):
+            return 33
+
+        def add_special_tokens(self, tokens):
+            pass
+
+        def convert_tokens_to_ids(self, tokens):
+            return [32]
+
+    monkeypatch.setattr(hpsv3_reward.AutoConfig, "from_pretrained", lambda *a, **kw: original_config)
+    monkeypatch.setattr(
+        hpsv3_reward.AutoProcessor, "from_pretrained", lambda *a, **kw: SimpleNamespace(tokenizer=Tokenizer())
+    )
+
+    def unexpected_init(*args, **kwargs):
+        raise AssertionError("Checkpoint loading must not randomly initialize weights")
+
+    monkeypatch.setattr(torch.nn.init, "normal_", unexpected_init)
+    if missing_weight:
+        with pytest.raises(RuntimeError, match="Missing key"):
+            hpsv3_reward._HPSv3Inferencer(str(path), base_config="unused", device="cpu")
+        return
+    loaded = hpsv3_reward._HPSv3Inferencer(str(path), base_config="unused", device="cpu").model
+    assert torch.nn.init.normal_ is unexpected_init  # Context restored process-wide initialization functions.
+    for name, tensor in loaded.state_dict().items():
+        torch.testing.assert_close(tensor, reference.state_dict()[name], rtol=0, atol=0)
+    assert loaded.rm_head[0].weight.dtype == torch.float32
+    assert loaded.get_input_embeddings().weight.dtype == torch.bfloat16
+    assert all(not parameter.requires_grad for parameter in loaded.parameters())
+
+
 class _FakeInferencer:
     def __init__(self):
         self.batches = []

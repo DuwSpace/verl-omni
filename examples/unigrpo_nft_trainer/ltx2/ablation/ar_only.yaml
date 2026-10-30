@@ -1,0 +1,5 @@
+# @package _global_
+actor_rollout_ref:
+  model:
+    pipeline:
+      update_mode: ar_only

@@ -21,7 +21,7 @@ from verl.trainer.config import CheckpointConfig
 from verl.trainer.config.algorithm import RolloutCorrectionConfig
 from verl.utils.profiler import ProfilerConfig
 from verl.workers.config.engine import EngineConfig, FSDPEngineConfig
-from verl.workers.config.optimizer import OptimizerConfig
+from verl.workers.config.optimizer import FSDPOptimizerConfig, OptimizerConfig
 
 from .model import DiffusionModelConfig
 
@@ -31,6 +31,7 @@ __all__ = [
     "VeOmniDiffusionOptimizerConfig",
     "DiffusionActorConfig",
     "FSDPDiffusionActorConfig",
+    "FSDPDiffusionOptimizerConfig",
     "VeOmniDiffusionActorConfig",
 ]
 
@@ -64,6 +65,7 @@ class DiffusionLossConfig(BaseConfig):
             "grpo_guard",
             "diffusion_nft",
             "omni_nft",
+            "ltx2_unigrpo_nft",
             "dgpo",
             "awm",
             "dpo",
@@ -149,6 +151,12 @@ class VeOmniDiffusionOptimizerConfig(OptimizerConfig):
                 f"Invalid VeOmni lr_scheduler_type={self.lr_scheduler_type!r}; "
                 "expected one of ['constant', 'linear', 'cosine']."
             )
+
+
+@dataclass
+class FSDPDiffusionOptimizerConfig(FSDPOptimizerConfig):
+    # Name-substring LR overrides; first match wins, unmatched parameters use lr.
+    param_group_lrs: dict[str, float] | None = None
 
 
 @dataclass

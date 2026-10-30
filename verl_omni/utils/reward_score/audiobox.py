@@ -20,6 +20,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from .cpu_offload import NativeRewardCpuOffload
 from .reward_utils import audio_info_from_batch, get_audio, resample_audio
 
 _AUDIOBOX_SAMPLE_RATE = 16_000
@@ -125,7 +126,7 @@ async def compute_score(
     return {"score": float(score)}
 
 
-class AudioBoxModel:
+class AudioBoxModel(NativeRewardCpuOffload):
     """Raw AudioBox inference adapter owned by a native reward executor."""
 
     def __init__(self, model_path: str, device) -> None:
@@ -137,12 +138,15 @@ class AudioBoxModel:
         self.device = torch.device(device)
         self.model.to(self.device).eval()
         self._infer_lock = threading.Lock()
+        self._init_cpu_offload(device)
 
     def close(self) -> None:
-        """Drop model/transform references; further inference requires a new adapter."""
-        self.model = None
-        self.target_transform = {}
-        self.device = None
+        """Release retained weights and processors permanently."""
+        with self._infer_lock:
+            self._offload_closed = True
+            self.model = None
+            self.target_transform = {}
+            self.device = None
 
     @torch.inference_mode()
     def infer(self, windows: torch.Tensor, masks: torch.Tensor) -> dict[str, Any]:

@@ -1,0 +1,110 @@
+# @package _global_
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Reward configuration from DuwSpace/verl-omni at 66595248b0407749eb0a7cccc5107f8642519d2a.
+# Compose with the joint launcher; frame_rate resolves from its rollout pipeline.
+reward:
+  reward_model:
+    enable: false
+    enable_resource_pool: false
+  accelerator_workers:
+    enabled: false
+  reward_manager:
+    name: MultiVisualRewardManager
+  aggregation: preserve_components
+  models:
+    video_align:
+      backend: native
+      offload: true
+      executor:
+        model: verl_omni.utils.reward_score.videoalign:VideoAlignModel
+    hpsv3:
+      backend: native
+      offload: true
+      executor:
+        model: verl_omni.utils.reward_score.hpsv3_reward:HPSv3Model
+        kwargs:
+          use_sequential_position_ids: true
+    audiobox:
+      backend: native
+      offload: true
+      executor:
+        model: verl_omni.utils.reward_score.audiobox:AudioBoxModel
+    clap:
+      backend: native
+      offload: true
+      executor:
+        model: verl_omni.utils.reward_score.clap:CLAPModel
+    desync:
+      backend: native
+      offload: true
+      executor:
+        model: verl_omni.utils.reward_score.desync:DeSyncModel
+  reward_functions:
+    video_align:
+      path: pkg://verl_omni.utils.reward_score.videoalign
+      name: compute_score
+      model: video_align
+      fps: ${actor_rollout_ref.rollout.pipeline.frame_rate}
+      prompt_key: video
+      score_weights: [0.5, 0.0, 0.5]
+      score_means: [3.6757, 0.0, 2.8105]
+      score_stds: [2.2476, 1.0, 2.5121]
+      weight: 1.0
+      required: true
+      routing_weights: {video: 1.0, audio: 0.0}
+    hpsv3:
+      path: pkg://verl_omni.utils.reward_score.hpsv3_reward
+      name: compute_score_hpsv3
+      model: hpsv3
+      prompt_key: video
+      num_frames: 5
+      top_fraction: 0.3
+      score_cap: 15.0
+      reward_scale: 1.0
+      max_batch_size: 5
+      weight: 1.0
+      required: true
+      routing_weights: {video: 1.5, audio: 0.0}
+    audiobox:
+      path: pkg://verl_omni.utils.reward_score.audiobox
+      name: compute_score
+      model: audiobox
+      audio_layout: CT
+      axis_weights: {CE: 1.0, CU: 1.0, PC: -1.0, PQ: 1.0}
+      score_scale: 0.025
+      weight: 1.0
+      required: true
+      routing_weights: {video: 0.0, audio: 0.5}
+    clap:
+      path: pkg://verl_omni.utils.reward_score.clap
+      name: compute_score
+      model: clap
+      prompt_key: audio
+      score_scale: 0.5
+      score_offset: 0.5
+      score_min: 0.0
+      score_max: 1.0
+      weight: 1.0
+      required: true
+      routing_weights: {video: 0.0, audio: 1.0}
+    desync:
+      path: pkg://verl_omni.utils.reward_score.desync
+      name: compute_score
+      model: desync
+      fps: ${actor_rollout_ref.rollout.pipeline.frame_rate}
+      audio_layout: CT
+      weight: 1.0
+      required: true
+      routing_weights: {video: 1.0, audio: 1.0}

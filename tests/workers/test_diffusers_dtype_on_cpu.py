@@ -71,3 +71,23 @@ def test_ordinary_diffusers_model_is_cast_to_engine_dtype():
 
     assert model[0].weight.dtype == torch.bfloat16
     assert _fsdp_param_dtype(model, torch.bfloat16) == torch.bfloat16
+
+
+def test_registry_loader_preserves_declared_fp32_islands(monkeypatch):
+    from types import SimpleNamespace
+
+    from verl_omni.pipelines.model_base import DiffusionModelBase
+    from verl_omni.workers.engine.fsdp.diffusers_impl import DiffusersFSDPEngine
+
+    model = torch.nn.Module()
+    model.sensitive = torch.nn.Linear(2, 2).float()
+    model.ordinary = torch.nn.Linear(2, 2).bfloat16()
+    model._keep_in_fp32_modules = ["sensitive"]
+    before = model.sensitive.weight.detach().clone()
+    adapter = SimpleNamespace(build_module=lambda *args: model, preserve_fp32_modules=lambda: True)
+    monkeypatch.setattr(DiffusionModelBase, "get_class", lambda config: adapter)
+    engine = SimpleNamespace(model_config=SimpleNamespace(enable_gradient_checkpointing=False))
+    actual = DiffusersFSDPEngine._build_module_from_registry(engine, torch.bfloat16)
+    assert actual.sensitive.weight.dtype == torch.float32
+    assert actual.ordinary.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.sensitive.weight, before, rtol=0, atol=0)

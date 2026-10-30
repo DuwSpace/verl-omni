@@ -143,8 +143,12 @@ class OmniRewardLoopManager(RewardLoopManager):
         if self._preserve_reward_components:
             if not has_reward_models(config):
                 raise ValueError("preserve_components requires named reward.models.")
+            from verl_omni.trainer.diffusion.diffusion_algos import OmniNFTLoss, get_diffusion_loss_fn
+
             loss_mode = config.actor_rollout_ref.actor.diffusion_loss.loss_mode
-            if config.algorithm.get("trainer_type") != "direct_preference" or loss_mode != "omni_nft":
+            if config.algorithm.get("trainer_type") != "direct_preference" or not isinstance(
+                get_diffusion_loss_fn(loss_mode), OmniNFTLoss
+            ):
                 raise ValueError(
                     "reward.aggregation=preserve_components requires the OmniNFT direct-preference trainer; "
                     "use reward.aggregation=weighted_sum for this trainer."

@@ -245,7 +245,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         )
 
         try:
-            module.to(torch_dtype)
+            _cast_loaded_diffusers_module(module, torch_dtype, preserve_fp32_modules=model_cls.preserve_fp32_modules())
         except AttributeError:
             raise TypeError(
                 f"{type(module).__name__} returned by build_module() has no to() method. "
@@ -452,7 +452,9 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
 
-        optimizer = build_optimizer(module.parameters(), self.optimizer_config)
+        from .optimizer import optimizer_parameters
+
+        optimizer = build_optimizer(optimizer_parameters(module, self.optimizer_config), self.optimizer_config)
 
         return optimizer
 
@@ -688,6 +690,11 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
         """Run one diffusion step forward (and loss); implemented by algorithm-specific subclasses."""
         pass
+
+    def adapter_ema_decay(self, parameter_name, decay):
+        return DiffusionModelBase.get_class(self.model_config).adapter_ema_decay(
+            self.model_config, parameter_name, decay
+        )
 
     def optimizer_zero_grad(self):
         """
@@ -1380,6 +1387,11 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
     def forward_backward_batch(
         self, data: TensorDict, loss_function: Callable, forward_only: bool = False
     ) -> list[TensorDict]:
+        result = DiffusionModelBase.get_class(self.model_config).forward_backward_batch(
+            self.module, self.model_config, data, loss_function, forward_only, use_adapter=self.use_adapter
+        )
+        if result is not None:
+            return result
         return self._run_forward_backward_batch(data, loss_function, forward_only, timesteps_key="train_timesteps")
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):

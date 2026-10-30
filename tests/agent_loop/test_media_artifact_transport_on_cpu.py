@@ -54,10 +54,17 @@ def _internal():
 @pytest.mark.parametrize("transport", ["ordinary", "tq"])
 @pytest.mark.parametrize("batch_size", [1, 2])
 async def test_named_media_survives_to_preview_and_reward_consumers(monkeypatch, transport, batch_size):
+    import numpy as np
+
+    reward_inputs = {"text": {"video": "A bell moves.", "audio": "A bell rings."}}
     internals = [_internal() for _ in range(batch_size)]
+    for index, internal in enumerate(internals):
+        internal.extra_fields["sample_replay"] = {"seed": index, "tokens": torch.tensor([index, 7])}
     if transport == "ordinary":
         worker = object.__new__(DiffusionAgentLoopWorker)
-        data = worker._postprocess(internals)
+        data = worker._postprocess(
+            internals, input_non_tensor_batch={"reward_inputs": np.array([reward_inputs] * batch_size, dtype=object)}
+        )
     else:
         worker = object.__new__(DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class)
         stored = {}
@@ -67,7 +74,11 @@ async def test_named_media_survives_to_preview_and_reward_consumers(monkeypatch,
 
         monkeypatch.setattr(tq_utils.tq, "async_kv_batch_put", put)
         await worker._write_trajectories_to_tq(
-            list(enumerate(internals)), uid="sample", trajectory={"step": 1}, validate=False
+            list(enumerate(internals)),
+            uid="sample",
+            trajectory={"step": 1},
+            validate=False,
+            reward_inputs=reward_inputs,
         )
         monkeypatch.setattr(tq_utils.tq, "kv_batch_get", lambda **kwargs: stored["fields"])
         data = tq_utils.diffusion_tq_batch_to_dataproto(
@@ -75,7 +86,12 @@ async def test_named_media_survives_to_preview_and_reward_consumers(monkeypatch,
         )
 
     assert data.batch["media_artifact__video_latent"].dtype == torch.float16
+    for item in data:
+        assert item.non_tensor_batch["reward_inputs"] == reward_inputs
     assert data.batch["media_artifact__video_latent"].shape == (batch_size, 16, 2, 2, 2)
+    for index, record in enumerate(data.non_tensor_batch["sample_replay"]):
+        assert record["seed"] == index
+        torch.testing.assert_close(record["tokens"], torch.tensor([index, 7]))
     previews = previews_from_batch(data)
     assert len(previews) == batch_size and previews[0].data.dtype == torch.uint8
     assert previews[0].spec.fps == 12

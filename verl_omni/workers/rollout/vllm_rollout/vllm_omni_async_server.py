@@ -293,6 +293,31 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         # TODO (mike): support multi node
         raise NotImplementedError("vLLM-Omni headless mode is not implemented yet.")
 
+    async def prepare_rollout_requests(self, payloads):
+        """Prepare diffusion requests on their assigned worker without AV generation."""
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+        from verl_omni.pipelines.rollout_request import OmniRolloutRequest
+
+        if not isinstance(self._generate_strategy, DiffusionStrategy):
+            raise ValueError("Staged preparation requires a diffusion strategy")
+        lora_request = await self._resolve_lora_request()
+        requests = []
+        for payload in payloads:
+            inputs = {
+                key: value for key, value in payload.items() if key not in {"request_id", "sampling_params", "priority"}
+            }
+            request = OmniRolloutRequest.from_generate_kwargs(**inputs)
+            prompt, params = self._generate_strategy.preprocess_input(request, payload["sampling_params"], lora_request)
+            requests.append(
+                OmniDiffusionRequest(prompt=prompt, sampling_params=params[-1], request_id=payload["request_id"])
+            )
+        await self.collective_rpc("prepare_rollout_requests", args=(requests,), require_ack=True)
+
+    async def clear_prepared_rollout(self):
+        """Clear worker-local staged conditions."""
+        await self.collective_rpc("clear_prepared_rollout", require_ack=True)
+
     async def collective_rpc(
         self,
         method: Any,

@@ -116,6 +116,25 @@ class DiffusionModelBase(ABC):
         return {"x0": x0, "xt": (1.0 - t) * x0 + t * noise, "t_expanded": t}
 
     @classmethod
+    def forward_backward_batch(
+        cls,
+        module: torch.nn.Module,
+        model_config: DiffusionModelConfig,
+        data: TensorDict,
+        loss_function: Callable,
+        forward_only: bool,
+        *,
+        use_adapter: Callable,
+    ) -> Optional[dict[str, Any]]:
+        """Optionally execute a composite objective with multiple backward passes."""
+        return None
+
+    @classmethod
+    def adapter_ema_decay(cls, model_config: DiffusionModelConfig, parameter_name: str, decay: float) -> float:
+        """Select a component-specific old-policy decay; default is uniform."""
+        return decay
+
+    @classmethod
     def validate_engine_config(cls, engine_config) -> None:
         """Validate adapter requirements before NFT engine initialization."""
         return

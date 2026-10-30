@@ -35,6 +35,71 @@ from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import ARStrat
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
 
+@pytest.mark.parametrize("mode", ["joint", "ar_only", "av_only"])
+@pytest.mark.parametrize("as_dict", [False, True])
+def test_server_initializes_joint_recipe_with_pipeline_subclasses(monkeypatch, tmp_path, mode, as_dict):
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.config import LTXJointPipelineConfig
+    from verl_omni.workers.config import DiffusionModelConfig
+
+    for name in ("LTX_MODEL_PATH", "LTX_REWARD_ROOT", "LTX_OUTPUT_DIR"):
+        monkeypatch.setenv(name, str(tmp_path))
+    root = Path(__file__).resolve().parents[4]
+    with initialize_config_dir(config_dir=str(root / "examples/unigrpo_nft_trainer/ltx2"), version_base=None):
+        cfg = compose(
+            config_name="joint_train",
+            overrides=[f"ablation={mode}", "+actor_rollout_ref.model.load_tokenizer=false"],
+        )
+    model_input = OmegaConf.to_container(cfg.actor_rollout_ref.model, resolve=True)
+    rollout_input = OmegaConf.to_container(cfg.actor_rollout_ref.rollout, resolve=True)
+    if not as_dict:
+        model_input = OmegaConf.create(model_input)
+        rollout_input = OmegaConf.create(rollout_input)
+    server = object.__new__(server_module.vLLMOmniHttpServer)
+    # Use the same conversion boundary as the Ray actor constructor, without an engine.
+    rollout = server._init_config(rollout_input)
+    model = server._init_model_config(model_input)
+
+    assert isinstance(model, DiffusionModelConfig)
+    assert isinstance(rollout, DiffusionRolloutConfig)
+    for pipeline in (model.pipeline, rollout.pipeline, rollout.val_kwargs.pipeline):
+        assert isinstance(pipeline, LTXJointPipelineConfig)
+        assert pipeline.recaption_prompt == "ltx_t2av"
+    assert model.pipeline.update_mode == mode
+    assert model.pipeline.text_ema_enabled is False
+    assert rollout.pipeline.audio_cfg_scale == 3.0
+    assert rollout.pipeline.video_cfg_scale == 1.5
+    assert rollout.val_kwargs.pipeline.num_inference_steps == 40
+    assert model_input == cfg.actor_rollout_ref.model
+    assert rollout_input == cfg.actor_rollout_ref.rollout
+    # Already instantiated configs also cross this boundary in replica setup.
+    assert server._init_model_config(model) is model
+    assert server._init_config(rollout) is rollout
+
+
+def test_diffusion_strategy_accepts_configs_without_target(tmp_path):
+    from verl_omni.workers.config import DiffusionModelConfig, DiffusionPipelineConfig
+
+    strategy = DiffusionStrategy(SimpleNamespace())
+    model = strategy.init_model_config(
+        {
+            "path": str(tmp_path),
+            "architecture": "TestPipeline",
+            "algorithm": "flow_grpo",
+            "load_tokenizer": False,
+            "attn_backend": "native",
+            "pipeline": {"height": 128},
+        }
+    )
+    rollout = strategy.init_config({"name": "vllm_omni", "pipeline": {"height": 128}})
+    assert isinstance(model, DiffusionModelConfig)
+    assert isinstance(rollout, DiffusionRolloutConfig)
+    assert isinstance(model.pipeline, DiffusionPipelineConfig)
+    assert model.pipeline.height == rollout.pipeline.height == 128
+
+
 @pytest.mark.parametrize(
     ("output_mode", "expected_kind"),
     [("ar", "ar"), ("diffusion", "diffusion"), (None, "diffusion")],
@@ -1542,3 +1607,37 @@ def test_diffusion_ingress_allowed_fields_supports_npu_frontend_path(monkeypatch
 
     assert isinstance(allowed, frozenset)
     assert "host" in allowed
+
+
+@pytest.mark.asyncio
+async def test_staged_prepare_reuses_strategy_and_requires_worker_ack():
+    from unittest.mock import AsyncMock
+
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    server = object.__new__(server_module.vLLMOmniHttpServer)
+    server._generate_strategy = DiffusionStrategy(server)
+    server._generate_strategy.preprocess_input = lambda request, params, lora: (
+        request.to_diffusion_prompt(),
+        [OmniDiffusionSamplingParams(extra_args=params, seed=42)],
+    )
+    server._resolve_lora_request = AsyncMock(return_value=None)
+    server.collective_rpc = AsyncMock()
+    await server.prepare_rollout_requests(
+        [
+            dict(
+                request_id="stage-id",
+                prompt_ids=[1, 2],
+                prompt_mask=[True, True],
+                sampling_params={"prepared_request_id": "stage-id"},
+                priority=0,
+            )
+        ]
+    )
+    args = server.collective_rpc.call_args
+    assert args.args == ("prepare_rollout_requests",)
+    assert args.kwargs["require_ack"] is True
+    request = args.kwargs["args"][0][0]
+    assert request.request_id == "stage-id"
+    assert request.prompt["prompt_ids"] == [1, 2]
+    assert request.sampling_params.extra_args["prepared_request_id"] == "stage-id"

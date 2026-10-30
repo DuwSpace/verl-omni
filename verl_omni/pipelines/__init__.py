@@ -19,6 +19,7 @@ from . import (
     flux_dance_grpo,
     ltx2_flow_grpo,
     ltx2_omni_nft,
+    ltx2_unigrpo_nft,
     minicpm,
     minimax_h3_diffusion_nft,
     minimax_h3_flow_grpo,
@@ -42,6 +43,7 @@ from .boogu_image_flow_grpo import *  # noqa: F401, F403
 from .flux_dance_grpo import *  # noqa: F401, F403
 from .ltx2_flow_grpo import *  # noqa: F401, F403
 from .ltx2_omni_nft import *  # noqa: F401, F403
+from .ltx2_unigrpo_nft import *  # noqa: F401, F403
 from .minicpm import *  # noqa: F401, F403
 from .minimax_h3_diffusion_nft import *  # noqa: F401, F403
 from .minimax_h3_flow_grpo import *  # noqa: F401, F403
@@ -81,3 +83,5 @@ __all__ += list(qwen_image_edit_flow_grpo.__all__)
 __all__ += list(boogu_image_flow_grpo.__all__)
 __all__ += list(boogu_image_diffusion_nft.__all__)
 __all__ += list(flux_dance_grpo.__all__)
+
+__all__ += list(ltx2_unigrpo_nft.__all__)

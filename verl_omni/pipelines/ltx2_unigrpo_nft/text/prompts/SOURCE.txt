@@ -1,0 +1,5 @@
+gemma_t2v_system_prompt.txt is copied without modification from Lightricks/LTX-2,
+as distributed by bunter96/LTX-2.3 at commit f73501238862129bcd5ef2fd0fb8ae2b9461010e.
+Source: https://github.com/bunter96/LTX-2.3/blob/f73501238862129bcd5ef2fd0fb8ae2b9461010e/packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/prompts/gemma_t2v_system_prompt.txt
+The upstream LTX-2 Community License Agreement is included in LICENSE.ltx;
+its use restrictions and acceptable use policies apply to the upstream material.

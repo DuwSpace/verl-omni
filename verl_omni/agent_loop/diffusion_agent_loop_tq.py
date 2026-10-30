@@ -31,7 +31,6 @@ from verl_omni.agent_loop.diffusion_agent_loop import (
     _InternalDiffusionAgentLoopOutput,
 )
 from verl_omni.agent_loop.utils import derive_rollout_seed
-from verl_omni.pipelines.rollout_media import ARTIFACT_CONTEXT, ARTIFACT_SPECS, PREVIEW_ARTIFACT, PRIMARY_ARTIFACT
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -247,30 +246,14 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                     field[extra_key] = value
 
             # Non-tensor dataset fields forwarded as-is.
-            for non_tensor_key in ["reward_model", "data_source", "extra_info", "raw_prompt"]:
+            for non_tensor_key in ["reward_model", "reward_inputs", "data_source", "extra_info", "raw_prompt"]:
                 if non_tensor_key in kwargs:
                     field[non_tensor_key] = kwargs[non_tensor_key]
 
-            reward_extra_info = extra.get("reward_extra_info")
-            extra_fields_out: dict[str, Any] = {}
-            if "img_shapes" in extra:
-                extra_fields_out["img_shapes"] = extra["img_shapes"]
-            if reward_extra_info is not None:
-                extra_fields_out["reward_extra_info"] = reward_extra_info
-            # Tensor media (for example generated audio) is already carried as a
-            # top-level TQ field above. Preserve its non-tensor declaration/metadata
-            # in the envelope that ``diffusion_tq_batch_to_dataproto`` restores.
-            for media_key in (
-                "media_kind",
-                "audio_sample_rate",
-                ARTIFACT_SPECS,
-                PRIMARY_ARTIFACT,
-                PREVIEW_ARTIFACT,
-                ARTIFACT_CONTEXT,
-            ):
-                media_value = extra.get(media_key)
-                if media_key in extra and not isinstance(media_value, torch.Tensor):
-                    extra_fields_out[media_key] = media_value
+            # Preserve pipeline replay records as well as media declarations.
+            # Tensor fields already travel above; nested/non-tensor metadata uses
+            # the same envelope that diffusion_tq_batch_to_dataproto restores.
+            extra_fields_out = {key: value for key, value in extra.items() if not isinstance(value, torch.Tensor)}
             extra_fields_out["min_global_steps"] = step
             extra_fields_out["max_global_steps"] = step
             field["extra_fields"] = extra_fields_out

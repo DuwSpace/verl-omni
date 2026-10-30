@@ -26,6 +26,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from .cpu_offload import NativeRewardCpuOffload
 from .reward_utils import audio_info_from_batch, get_audio, load_torch_state_dict, resample_audio, video_reward_tensor
 
 _TARGET_VIDEO_FPS = 25.0
@@ -249,7 +250,7 @@ async def compute_score(
     return {"score": float(score)}
 
 
-class DeSyncModel:
+class DeSyncModel(NativeRewardCpuOffload):
     """Raw Synchformer inference adapter owned by a native reward executor."""
 
     def __init__(self, model_path: str, device, source_root: str) -> None:
@@ -258,12 +259,18 @@ class DeSyncModel:
         self.model.to(self.device).eval()
         self.mel.to(self.device)
         self._infer_lock = threading.Lock()
+        self._init_cpu_offload(device)
+
+    def _offload_modules(self):
+        return self.model, self.mel
 
     def close(self) -> None:
-        """Drop model/mel references; reuse requires constructing a new adapter."""
-        self.model = None
-        self.mel = None
-        self.device = None
+        """Release retained weights and processors permanently."""
+        with self._infer_lock:
+            self._offload_closed = True
+            self.model = None
+            self.mel = None
+            self.device = None
 
     def _infer_micro_batch(self, video: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
         """Expand each prepared AV sample into 24 overlapping aligned segments.

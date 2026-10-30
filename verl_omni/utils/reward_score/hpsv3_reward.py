@@ -18,12 +18,20 @@ import math
 import os
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 from PIL import Image
 from transformers import AutoConfig, AutoProcessor, Qwen2VLForConditionalGeneration
 from verl.utils.device import get_device_name
+
+if __package__:
+    from .cpu_offload import NativeRewardCpuOffload
+else:
+    from verl.utils.import_utils import load_module
+
+    NativeRewardCpuOffload = load_module(str(Path(__file__).with_name("cpu_offload.py"))).NativeRewardCpuOffload
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -350,15 +358,19 @@ class _HPSv3Inferencer:
         processor.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
         special_token_ids = processor.tokenizer.convert_tokens_to_ids(special_tokens)
 
-        model = Qwen2VLRewardModelBT(
-            config,
-            output_dim=2,
-            reward_token="special",
-            special_token_ids=special_token_ids,
-            rm_head_type="ranknet",
-            use_sequential_position_ids=use_sequential_position_ids,
-        )
-        model.resize_token_embeddings(len(processor.tokenizer))
+        from transformers.initialization import no_init_weights
+
+        # Every parameter is restored by the strict checkpoint load below.
+        with no_init_weights():
+            model = Qwen2VLRewardModelBT(
+                config,
+                output_dim=2,
+                reward_token="special",
+                special_token_ids=special_token_ids,
+                rm_head_type="ranknet",
+                use_sequential_position_ids=use_sequential_position_ids,
+            )
+            model.resize_token_embeddings(len(processor.tokenizer), mean_resizing=False)
         model.to(torch.bfloat16)
         model.rm_head.to(torch.float32)
         model.config.tokenizer_padding_side = processor.tokenizer.padding_side
@@ -708,7 +720,7 @@ def _frame_to_pil(frame: torch.Tensor) -> Image.Image:
     return Image.fromarray(frame.permute(1, 2, 0).numpy(), mode="RGB")
 
 
-class HPSv3Model:
+class HPSv3Model(NativeRewardCpuOffload):
     """Executor-owned HPSv3 inference using the shared loader and preprocessing."""
 
     def __init__(
@@ -721,10 +733,20 @@ class HPSv3Model:
             use_sequential_position_ids=use_sequential_position_ids,
         )
         self._infer_lock = threading.Lock()
+        self._init_cpu_offload(device)
+
+    def _offload_modules(self):
+        return (self._inferencer.model,)
+
+    def _move_reward_model(self, device):
+        super()._move_reward_model(device)
+        self._inferencer.device = device
 
     def close(self) -> None:
-        """Release the inferencer; reuse requires a new adapter."""
-        self._inferencer = None
+        """Release retained weights and processors permanently."""
+        with self._infer_lock:
+            self._offload_closed = True
+            self._inferencer = None
 
     @torch.inference_mode()
     def infer(self, images: list[Image.Image], prompts: list[str]) -> torch.Tensor:
