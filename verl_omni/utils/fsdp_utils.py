@@ -126,9 +126,13 @@ def apply_fsdp2(model, fsdp_kwargs, config, ignored_names: Sequence[str] = ()):
         _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap), model, ignored_names
     )
 
+    precision_policy = getattr(model, "fsdp2_mixed_precision_policy", None)
     for idx, module in enumerate(modules):
+        module_kwargs = dict(fsdp_kwargs)
+        if precision_policy is not None:
+            module_kwargs["mp_policy"] = precision_policy(module, fsdp_kwargs["mp_policy"])
         with maybe_patch_fsdp_module(module):
-            fully_shard(module, **fsdp_kwargs)
+            fully_shard(module, **module_kwargs)
 
     with maybe_patch_fsdp_module(model):
         # DIFF vs upstream: only the root call carries ignored_params

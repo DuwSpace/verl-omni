@@ -23,6 +23,8 @@ from verl_omni.workers.config.diffusion.actor import DiffusionLossConfig
 
 @dataclass
 class LTXJointPipelineConfig(LTXDiffusionPipelineConfig):
+    # Frozen weights remain BF16; float32 preserves Gemma activations for AR consistency.
+    gemma_compute_dtype: str = "bfloat16"
     # Prompt template used for audiovisual recaptioning.
     recaption_prompt: str = "ltx_t2av"
     # Temperature-only sampling; no top-k or top-p truncation.
@@ -41,6 +43,8 @@ class LTXJointPipelineConfig(LTXDiffusionPipelineConfig):
     text_ema_enabled: bool = False
 
     def __post_init__(self):
+        if self.gemma_compute_dtype not in {"bfloat16", "float32"}:
+            raise ValueError("gemma_compute_dtype must be bfloat16 or float32")
         if self.recaption_prompt != "ltx_t2av":
             raise ValueError("recaption_prompt must be ltx_t2av")
         if self.update_mode not in {"joint", "ar_only", "av_only"}:

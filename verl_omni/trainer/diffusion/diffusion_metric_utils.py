@@ -172,18 +172,31 @@ def compute_throughput_metrics_diffusion(batch: DataProto, timing_raw: dict[str,
     }
 
 
-def compute_reward_extra_metrics_diffusion(reward_extra_infos_dict: dict) -> dict[str, Any]:
-    """Computes per-sub-reward mean metrics for multi-reward tracking."""
+def compute_reward_extra_metrics_diffusion(
+    reward_extra_infos_dict: dict, *, include_second_moment: bool = False
+) -> dict[str, Any]:
+    """Compute per-reward means and population stds; optionally retain merge moments."""
     metrics = {}
-    if not reward_extra_infos_dict:
-        return metrics
     for key, values in reward_extra_infos_dict.items():
-        if isinstance(values, np.ndarray):
-            if not np.issubdtype(values.dtype, np.number):
-                continue
-            metrics[f"critic/{key}/mean"] = float(values.mean())
-        elif isinstance(values, list) and len(values) > 0:
-            if not isinstance(values[0], int | float):
-                continue
-            metrics[f"critic/{key}/mean"] = float(np.mean(values))
+        if not isinstance(values, list | np.ndarray) or len(values) == 0:
+            continue
+        values = np.asarray(values)
+        if not np.issubdtype(values.dtype, np.number):
+            continue
+        values = values.astype(np.float64)
+        prefix = f"critic/{key}"
+        metrics[f"{prefix}/mean"] = float(values.mean())
+        metrics[f"{prefix}/std"] = float(values.std(ddof=0))
+        if include_second_moment:
+            metrics[f"{prefix}/_second_moment"] = float(np.square(values).mean())
     return metrics
+
+
+def finalize_reward_extra_metrics_diffusion(metrics: dict) -> None:
+    """Recover full-step population stds from sample-weighted first/second moments."""
+    for key in list(metrics):
+        if key.startswith("critic/") and key.endswith("/_second_moment"):
+            prefix = key.removesuffix("/_second_moment")
+            second_moment = metrics.pop(key)
+            variance = second_moment - metrics[f"{prefix}/mean"] ** 2
+            metrics[f"{prefix}/std"] = float(np.sqrt(max(0.0, variance)))

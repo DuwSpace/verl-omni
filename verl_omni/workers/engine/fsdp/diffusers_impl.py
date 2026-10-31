@@ -92,7 +92,20 @@ def _cast_loaded_diffusers_module(
             keep_in_fp32,
         )
         return
+    # Some composite models have FP32 buffers (e.g. RoPE frequencies) without
+    # FP32 parameter islands. Keep their original values, not a rounded tensor
+    # converted back to FP32 after the whole-model cast.
+    buffer_prefixes = getattr(module, "_keep_in_fp32_buffers", ()) if preserve_fp32_modules else ()
+    preserved_buffers = {
+        name: buffer
+        for name, buffer in module.named_buffers()
+        if buffer.dtype == torch.float32
+        and any(name == prefix or name.startswith(prefix + ".") for prefix in buffer_prefixes)
+    }
     module.to(torch_dtype)
+    for name, buffer in preserved_buffers.items():
+        parent, _, leaf = name.rpartition(".")
+        setattr(module.get_submodule(parent), leaf, buffer)
 
 
 def _fsdp_param_dtype(

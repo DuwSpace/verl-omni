@@ -30,14 +30,25 @@ class ChunkedLogprobHead(torch.nn.Module):
         self.in_features = head.in_features
         self.out_features = head.out_features
         self.chunk_size = chunk_size
+        self.compute_dtype = getattr(head, "compute_dtype", None)
+
+    def _project(self, hidden_states):
+        if self.compute_dtype is None:
+            return F.linear(hidden_states, self.weight, self.bias)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            return F.linear(
+                hidden_states.to(self.compute_dtype),
+                self.weight.to(self.compute_dtype),
+                None if self.bias is None else self.bias.to(self.compute_dtype),
+            )
 
     def forward(self, hidden_states, *, targets=None, temperature=1.0):
         """Return ordinary logits or selected-token FP32 log probabilities."""
         if targets is None:
-            return F.linear(hidden_states, self.weight, self.bias)
+            return self._project(hidden_states)
 
         def project(hidden, target):
-            logits = F.linear(hidden, self.weight, self.bias).float() / temperature
+            logits = self._project(hidden).float() / temperature
             if logits.device.type == "npu":
                 return logprobs_from_logits_torch_npu(logits, target)
             return logits.gather(-1, target[:, None]).squeeze(-1) - logits.logsumexp(-1)

@@ -33,6 +33,8 @@ actor_rollout_ref:
     tokenizer_path: ${oc.env:LTX_MODEL_PATH}/tokenizer
     pipeline:
       _target_: verl_omni.pipelines.ltx2_unigrpo_nft.config.LTXJointPipelineConfig
+      # FP32 Gemma computation/activations, BF16 frozen storage; DiT stays BF16.
+      gemma_compute_dtype: float32
       update_mode: joint
       text_ema_enabled: false
       recaption_prompt: ltx_t2av
@@ -104,6 +106,7 @@ actor_rollout_ref:
     engine_kwargs:
       vllm_omni:
         additional_config:
+          gemma_compute_dtype: ${actor_rollout_ref.model.pipeline.gemma_compute_dtype}
           rl_config:
             enabled: true
         enable_cpu_offload: true
@@ -117,7 +120,9 @@ actor_rollout_ref:
     pipeline:
       _target_: verl_omni.pipelines.ltx2_unigrpo_nft.config.LTXJointPipelineConfig
       recaption_prompt: ltx_t2av
-      recaption_batch_size: 32
+      gemma_compute_dtype: ${actor_rollout_ref.model.pipeline.gemma_compute_dtype}
+      # FP32 Gemma activations require a smaller AR batch than the BF16 path.
+      recaption_batch_size: 16
       stage_timeout_s: 3600
       recaption_temperature: 1.0
       recaption_max_new_tokens: 4096
@@ -139,6 +144,7 @@ actor_rollout_ref:
       n: 1
       pipeline:
         _target_: verl_omni.pipelines.ltx2_unigrpo_nft.config.LTXJointPipelineConfig
+        gemma_compute_dtype: ${actor_rollout_ref.model.pipeline.gemma_compute_dtype}
         recaption_prompt: ${actor_rollout_ref.rollout.pipeline.recaption_prompt}
         recaption_batch_size: ${actor_rollout_ref.rollout.pipeline.recaption_batch_size}
         recaption_temperature: ${actor_rollout_ref.rollout.pipeline.recaption_temperature}

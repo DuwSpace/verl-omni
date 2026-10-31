@@ -16,6 +16,7 @@
 import os
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from hydra import compose, initialize_config_dir
@@ -167,3 +168,70 @@ def test_colocate_reward_wakes_rollout_mid_cycle_in_async_mode(monkeypatch):
         trainer._train_sampled_batch({}, {}, object())
 
     assert calls == ["sleep", "reward", "update_weights", "balance"]
+
+
+@pytest.mark.parametrize("direct_preference", [False, True])
+def test_colocate_reward_logs_component_means_before_actor_preparation(monkeypatch, direct_preference):
+    from verl_omni.trainer.diffusion.v1.trainer_sync import PolicyGradientDiffusionTrainerV1Sync
+
+    trainer = PolicyGradientDiffusionTrainerV1Sync(compose_cfg(["reward.reward_model.enable=true"]))
+    trainer._is_direct_preference = direct_preference
+    trainer.reward_loop_manager = SimpleNamespace(reward_loop_worker_handles=None)
+    data = DataProto.from_dict(tensors={"all_timesteps": torch.zeros(2, 4)})
+    components = {
+        "reward/video_align": np.array([1.0, 3.0]),
+        "reward/hpsv3": np.array([6.0, 8.0]),
+        "reward/audiobox": np.array([0.1, 0.3]),
+        "reward/clap": np.array([0.5, 0.7]),
+        "reward/desync": np.array([0.7, 0.9]),
+    }
+    reward = DataProto.from_dict(
+        tensors={"rm_scores": torch.ones(2, 5)},
+        non_tensors=components,
+        meta_info={"reward_extra_keys": list(components)},
+    )
+    monkeypatch.setattr(trainer, "_compute_reward_colocate", lambda data: reward)
+
+    def stop(*args, **kwargs):
+        raise _Stop
+
+    monkeypatch.setattr(trainer, "_balance_batch", stop)
+    monkeypatch.setattr(trainer, "_train_direct_preference_batch", stop)
+    metrics = {}
+    with pytest.raises(_Stop):
+        trainer._train_sampled_batch(metrics, {}, object(), data=data)
+    for name, values in components.items():
+        assert metrics[f"critic/{name}/mean"] == pytest.approx(values.mean())
+        assert metrics[f"critic/{name}/std"] == pytest.approx(values.std(ddof=0))
+
+
+def test_reward_std_combines_local_batches_by_sample_count():
+    from verl.trainer.ppo.v1.utils import MetricsAggregator
+
+    from verl_omni.trainer.diffusion.diffusion_metric_utils import (
+        compute_reward_extra_metrics_diffusion,
+        finalize_reward_extra_metrics_diffusion,
+    )
+
+    aggregator = MetricsAggregator()
+    chunks = [np.array([1.0, 3.0]), np.array([9.0])]
+    for values in chunks:
+        aggregator.add_step_metrics(
+            compute_reward_extra_metrics_diffusion({"reward/quality": values}, include_second_moment=True),
+            sample_count=len(values),
+        )
+    metrics = aggregator.get_aggregated_metrics()
+    finalize_reward_extra_metrics_diffusion(metrics)
+    values = np.concatenate(chunks)
+    assert metrics["critic/reward/quality/mean"] == pytest.approx(values.mean())
+    assert metrics["critic/reward/quality/std"] == pytest.approx(values.std(ddof=0))
+    assert not any("_second_moment" in key for key in metrics)
+
+
+def test_reward_stats_skip_metadata_and_handle_singleton():
+    from verl_omni.trainer.diffusion.diffusion_metric_utils import compute_reward_extra_metrics_diffusion
+
+    metrics = compute_reward_extra_metrics_diffusion(
+        {"reward/quality": [np.float32(2.0)], "metadata": ["text"], "empty": []}
+    )
+    assert metrics == {"critic/reward/quality/mean": 2.0, "critic/reward/quality/std": 0.0}

@@ -73,6 +73,8 @@ class LTXJointModel(NonDiffusersModelBase):
 
     _no_split_modules = ["Gemma3DecoderLayer", "LTX2VideoTransformerBlock"]
     _supports_gradient_checkpointing = True
+    # Match Transformers' from_pretrained buffer precision on the rollout side.
+    _keep_in_fp32_buffers = ("gemma.model.language_model.rotary_emb",)
     # PEFT/Transformers scope nested Gemma checkpoint conversions from this
     # composite root; there is no additional wrapper prefix to remove.
     base_model_prefix = ""
@@ -81,6 +83,7 @@ class LTXJointModel(NonDiffusersModelBase):
         from .attention import install_native_connector_attention, install_native_dit_attention
 
         super().__init__()
+        self.gemma_compute_dtype = "bfloat16"
         self.gemma = gemma
         self.gemma.lm_head = ChunkedLogprobHead(gemma.lm_head)
         self.transformer = transformer
@@ -132,6 +135,18 @@ class LTXJointModel(NonDiffusersModelBase):
         if not all(any(name.startswith(prefix) for name in selected) for prefix in ("gemma.", "transformer.")):
             raise ValueError("Joint LoRA must contain both Gemma and DiT parameters")
         self.set_adapter(adapter_name)
+        if self.gemma_compute_dtype == "float32":
+            from ..text.precision import install_fp32_gemma_compute
+
+            install_fp32_gemma_compute(self.gemma)
+
+    def fsdp2_mixed_precision_policy(self, module, default_policy):
+        """Preserve Gemma activations and LoRA precision without changing DiT."""
+        if self.gemma_compute_dtype == "float32" and any(module is child for child in self.gemma.modules()):
+            from dataclasses import replace
+
+            return replace(default_policy, param_dtype=None, cast_forward_inputs=False)
+        return default_policy
 
     def set_adapter(self, adapter_name):
         """Select leaf adapters without invoking unrelated Transformers/Diffusers PEFT wrappers."""

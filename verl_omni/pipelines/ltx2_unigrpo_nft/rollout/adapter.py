@@ -76,6 +76,13 @@ class LTXJointPipeline(LTX23OmniNFTPipeline):
         self.text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
             od_config.model, subfolder="text_encoder", torch_dtype=torch.bfloat16, attn_implementation="sdpa"
         )
+        self._gemma_compute_dtype = (od_config.additional_config or {}).get("gemma_compute_dtype", "bfloat16")
+        if self._gemma_compute_dtype not in {"bfloat16", "float32"}:
+            raise ValueError("gemma_compute_dtype must be bfloat16 or float32")
+        if self._gemma_compute_dtype == "float32":
+            from ..text.precision import install_fp32_gemma_compute
+
+            install_fp32_gemma_compute(self.text_encoder)
         for name in JointRolloutOffload.component_names:
             getattr(self, name).requires_grad_(False)
         self._joint_offload = None
@@ -110,6 +117,10 @@ class LTXJointPipeline(LTX23OmniNFTPipeline):
             self._joint_offload.release()
         if self._gemma_config is None:
             inject_adapter_in_model(LoraConfig(**config), self.text_encoder, adapter_name="joint")
+            if self._gemma_compute_dtype == "float32":
+                from ..text.precision import install_fp32_gemma_compute
+
+                install_fp32_gemma_compute(self.text_encoder)
             self._gemma_config = config
         elif config != self._gemma_config:
             raise ValueError("Cannot change joint adapter layout during a run")
@@ -133,6 +144,8 @@ class LTXJointPipeline(LTX23OmniNFTPipeline):
         prompts = []
         for request in requests:
             local = request.sampling_params.extra_args or {}
+            if local.get("gemma_compute_dtype", "bfloat16") != getattr(self, "_gemma_compute_dtype", "bfloat16"):
+                raise ValueError("Request and rollout engine Gemma compute precision must match")
             if (
                 tuple(local[key] for key in ("recaption_temperature", "recaption_max_new_tokens", "recaption_prompt"))
                 != settings

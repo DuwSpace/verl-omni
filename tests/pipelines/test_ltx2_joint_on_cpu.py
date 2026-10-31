@@ -89,6 +89,25 @@ def model():
     return joint
 
 
+def test_registry_loader_preserves_gemma_rotary_buffers(model, monkeypatch):
+    from verl_omni.pipelines.model_base import DiffusionModelBase
+    from verl_omni.workers.engine.fsdp.diffusers_impl import DiffusersFSDPEngine, _fsdp_param_dtype
+
+    rotary = model.gemma.model.language_model.rotary_emb
+    before = {name: buffer.clone() for name, buffer in rotary.named_buffers()}
+    assert before
+    adapter = SimpleNamespace(build_module=lambda *args: model, preserve_fp32_modules=lambda: True)
+    monkeypatch.setattr(DiffusionModelBase, "get_class", lambda config: adapter)
+    engine = SimpleNamespace(model_config=SimpleNamespace(enable_gradient_checkpointing=False))
+    actual = DiffusersFSDPEngine._build_module_from_registry(engine, torch.bfloat16)
+    for name, buffer in actual.gemma.model.language_model.rotary_emb.named_buffers():
+        assert buffer.dtype == torch.float32
+        torch.testing.assert_close(buffer, before[name], atol=0, rtol=0)
+    assert actual.gemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16
+    assert actual.transformer.proj.weight.dtype == torch.bfloat16
+    assert _fsdp_param_dtype(actual, torch.bfloat16) == torch.bfloat16
+
+
 def test_teacher_forcing_matches_real_gemma_logits_and_masks(model):
     ids = torch.tensor([[0, 2, 3, 4, 1], [2, 3, 5, 1, 0]])
     attention = ids != 0
@@ -111,6 +130,28 @@ def test_teacher_forcing_matches_real_gemma_logits_and_masks(model):
         layer = getattr(model.gemma.model.language_model.layers[0].mlp, name)
         grad = layer.lora_B["default"].weight.grad
         assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
+
+
+def test_fp32_gemma_preserves_hidden_states_for_video_conditioning(model):
+    from verl_omni.pipelines.ltx2_unigrpo_nft.text.precision import install_fp32_gemma_compute
+
+    gemma = model.gemma.to(torch.bfloat16)
+    install_fp32_gemma_compute(gemma)
+    install_fp32_gemma_compute(gemma)
+    ids = torch.tensor([[0, 2, 3, 4, 1], [2, 3, 5, 1, 0]])
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        output = gemma(input_ids=ids, attention_mask=ids != 0, output_hidden_states=True, use_cache=False)
+        direct = gemma.model.language_model(
+            input_ids=ids, attention_mask=ids != 0, output_hidden_states=True, use_cache=False
+        )
+    assert isinstance(output.hidden_states, tuple)
+    assert len(output.hidden_states) == gemma.config.text_config.num_hidden_layers + 1
+    assert all(hidden.dtype == torch.float32 for hidden in output.hidden_states)
+    # This is the operation used by vLLM-Omni's LTX dummy run and prompt encoder.
+    embeddings = torch.stack(output.hidden_states, dim=-1).flatten(2, 3)
+    assert embeddings.shape == (2, 5, 32)
+    assert torch.isfinite(embeddings).all()
+    torch.testing.assert_close(output.hidden_states, direct.hidden_states)
 
 
 def test_av_trains_only_dit_with_frozen_base_condition(model):
@@ -402,7 +443,8 @@ def test_sampler_preserves_independent_request_rng_and_true_logprob():
     assert torch.equal(torch.random.get_rng_state(), before)
 
 
-def test_paired_lora_mapper_updates_gemma_and_routes_dit(model):
+@pytest.mark.parametrize("compute_dtype", ["bfloat16", "float32"])
+def test_paired_lora_mapper_updates_gemma_and_routes_dit(model, compute_dtype):
     from peft import get_peft_model_state_dict
 
     from verl_omni.pipelines.ltx2_unigrpo_nft.rollout.adapter import LTXJointPipeline
@@ -410,11 +452,14 @@ def test_paired_lora_mapper_updates_gemma_and_routes_dit(model):
     pipeline = object.__new__(LTXJointPipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.text_encoder = Gemma3ForConditionalGeneration(model.gemma.config)
+    pipeline._gemma_compute_dtype = compute_dtype
+    if compute_dtype == "float32":
+        pipeline.text_encoder.to(torch.bfloat16)
     pipeline._joint_offload = None
     pipeline._gemma_config = None
     pipeline._prepared_text = {}
     weights = get_peft_model_state_dict(model, adapter_name="default")
-    weights = {key: torch.full_like(value, 0.25) for key, value in weights.items()}
+    weights = {key: torch.full_like(value, 0.2501) for key, value in weights.items()}
     dit, config = pipeline.map_lora_update_to_engine(weights, model.peft_config["default"].to_dict())
     assert pipeline._pending_dit and pipeline._joint_sync_in_progress
     assert all(key.startswith("base_model.model.transformer.") for key in dit)
@@ -422,7 +467,9 @@ def test_paired_lora_mapper_updates_gemma_and_routes_dit(model):
     actual = get_peft_model_state_dict(pipeline.text_encoder, adapter_name="joint")
     assert set(actual) == {key.removeprefix("gemma.") for key in weights if key.startswith("gemma.")}
     for value in actual.values():
-        torch.testing.assert_close(value, torch.full_like(value, 0.25))
+        if compute_dtype == "float32":
+            assert value.dtype == torch.float32
+        torch.testing.assert_close(value, torch.full_like(value, 0.2501))
 
 
 def test_joint_lora_routes_real_diffusion_engine_export(model):

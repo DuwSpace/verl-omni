@@ -73,6 +73,7 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_reward_extra_metrics_diffusion,
     compute_throughput_metrics_diffusion,
     compute_timing_metrics_diffusion,
+    finalize_reward_extra_metrics_diffusion,
 )
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
     old_policy_decay,
@@ -492,6 +493,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             combined_partition_id = batch.partition_id
 
         metrics.update(metrics_aggregator.get_aggregated_metrics())
+        finalize_reward_extra_metrics_diffusion(metrics)
         return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
 
     def prepare_step(self) -> dict:
@@ -566,6 +568,16 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 # (~55GB for Qwen-Image at rollout TP=1) and the actor update
                 # would OOM next to them. on_step_end wakes and weight-syncs
                 # for the next rollout.
+
+        # Colocated reward extras live on this DataProto, not in the original
+        # TQ rows read by _compute_metrics. Collect before pairing/padding, and
+        # let the step aggregator weight local-update means by sample count.
+        reward_extra_infos = {
+            key: data.non_tensor_batch[key]
+            for key in data.meta_info.get("reward_extra_keys", [])
+            if key in data.non_tensor_batch
+        }
+        metrics.update(compute_reward_extra_metrics_diffusion(reward_extra_infos, include_second_moment=True))
 
         if self._is_direct_preference:
             return self._train_direct_preference_batch(metrics, timing_raw, batch_meta, data)
