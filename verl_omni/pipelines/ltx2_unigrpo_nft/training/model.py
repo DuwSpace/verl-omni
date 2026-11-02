@@ -105,11 +105,12 @@ class LTXJointModel(NonDiffusersModelBase):
         from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
         from transformers import Gemma3ForConditionalGeneration
 
+        gemma_weight_dtype = kwargs.pop("gemma_weight_dtype", torch_dtype)
         gemma_kwargs = dict(kwargs)
         # Match the rollout's explicit Transformers SDPA backend.
         gemma_kwargs.setdefault("attn_implementation", "sdpa")
         gemma = Gemma3ForConditionalGeneration.from_pretrained(
-            model_path, subfolder="text_encoder", torch_dtype=torch_dtype, **gemma_kwargs
+            model_path, subfolder="text_encoder", torch_dtype=gemma_weight_dtype, **gemma_kwargs
         )
         transformer = LTX2VideoTransformer3DModel.from_pretrained(
             model_path, subfolder="transformer", torch_dtype=torch_dtype, **kwargs

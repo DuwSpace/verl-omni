@@ -24,6 +24,7 @@ from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_class_from_fqn
 
 from verl_omni.utils.config import validate_config
+from verl_omni.utils.determinism import rollout_determinism_env
 from verl_omni.utils.diffusion_attention import validate_attention_consistency
 from verl_omni.utils.rl_insight import enable_rl_insight
 
@@ -75,6 +76,11 @@ def run_diffusion_v1(config, task_runner_class=None) -> None:
         # Merge into a fresh config: user-provided `env_vars` arrive in struct mode and
         # reject new keys, so writing into them would crash any override such as OMP_NUM_THREADS.
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
+        determinism_env = rollout_determinism_env(
+            OmegaConf.select(config, "actor_rollout_ref.rollout.full_determinism", default=False)
+        )
+        if determinism_env:
+            runtime_env = OmegaConf.merge(runtime_env, {"env_vars": determinism_env})
         if config.transfer_queue.enable:
             runtime_env = OmegaConf.merge(runtime_env, {"env_vars": {"TRANSFER_QUEUE_ENABLE": "1"}})
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})

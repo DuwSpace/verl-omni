@@ -27,11 +27,13 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from verl_omni.pipelines.ltx2_omni_nft.vllm_omni_rollout_adapter import LTX23OmniNFTPipeline
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
+from verl_omni.utils.determinism import configure_rollout_determinism
 
 from ..replay import LTXJointReplay
 from ..text.policy import base_encoder
 from ..text.prompt import direct_recaption
 from ..text.sampling import generate_recaptions
+from ..tree_rollout.preparation import prepare_recaption_tree
 from .cpu_weights import FrozenCpuWeights
 from .offload import AdapterCpuWeights, JointRolloutOffload
 
@@ -70,11 +72,13 @@ class LTXJointPipeline(LTX23OmniNFTPipeline):
     support_image_input = False
 
     def __init__(self, *, od_config, prefix=""):
+        configure_rollout_determinism()
         super().__init__(od_config=od_config, prefix=prefix)
         # Load the causal LM used for recaptioning in the same BF16 dtype as the actor.
+        weight_dtype = getattr(torch, (od_config.additional_config or {}).get("gemma_weight_dtype", "bfloat16"))
         del self.text_encoder
         self.text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
-            od_config.model, subfolder="text_encoder", torch_dtype=torch.bfloat16, attn_implementation="sdpa"
+            od_config.model, subfolder="text_encoder", torch_dtype=weight_dtype, attn_implementation="sdpa"
         )
         self._gemma_compute_dtype = (od_config.additional_config or {}).get("gemma_compute_dtype", "bfloat16")
         if self._gemma_compute_dtype not in {"bfloat16", "float32"}:
@@ -138,6 +142,7 @@ class LTXJointPipeline(LTX23OmniNFTPipeline):
             return super().encode_prompt(*args, **kwargs)
 
     def _prepare_text(self, requests):
+        configure_rollout_determinism()
         first = requests[0].sampling_params
         extra = first.extra_args or {}
         settings = (extra["recaption_temperature"], extra["recaption_max_new_tokens"], extra["recaption_prompt"])
@@ -170,6 +175,7 @@ class LTXJointPipeline(LTX23OmniNFTPipeline):
             temperature=settings[0],
             max_new_tokens=settings[1],
             preset=settings[2],
+            sampling_mode=extra.get("recaption_sampling_mode", "seeded_batch"),
             duration_seconds=(first.num_frames - 1) / first.frame_rate,
         )
         prepared, negatives = [], {}
@@ -259,10 +265,7 @@ class LTXJointPipeline(LTX23OmniNFTPipeline):
             raise ValueError("Duplicate staged request IDs")
         try:
             batch_size = requests[0].sampling_params.extra_args["recaption_batch_size"]
-            for start in range(0, len(requests), batch_size):
-                for prepared in self._prepare_text(requests[start : start + batch_size]):
-                    key = prepared[0].sampling_params.extra_args["prepared_request_id"]
-                    self._prepared_text[key] = prepared
+            self._prepared_text.update(prepare_recaption_tree(requests, batch_size, self._prepare_text))
         except BaseException:
             self._prepared_text.clear()
             raise
@@ -277,6 +280,7 @@ class LTXJointPipeline(LTX23OmniNFTPipeline):
 
     @torch.no_grad()
     def forward(self, req):
+        configure_rollout_determinism()
         if any(OmniDiffusionRequest.is_dummy_run_request_id(request.request_id) for request in req.requests):
             return super().forward(req)
         self._admit_policy(req.requests)

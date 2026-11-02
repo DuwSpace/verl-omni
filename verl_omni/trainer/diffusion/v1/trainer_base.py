@@ -750,6 +750,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 fields=diffusion_persisted_tq_fields("direct_preference"),
             )
             data = self._prepare_actor_batch(data, reward_tensor)
+            metrics.update(data.meta_info.pop("actor_batch_metrics", {}))
             data.batch["sample_level_rewards"] = data.batch["sample_level_scores"]
 
         if self.use_reference_policy:
@@ -1539,11 +1540,13 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         data_sources: list = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
+        validation_offset = 0
         for batch_dict in self.val_dataloader:
             batch_dict["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
             )
-            batch_dict["index"] = np.arange(len(batch_dict["raw_prompt"]))
+            batch_dict["index"] = validation_offset + np.arange(len(batch_dict["raw_prompt"]))
+            validation_offset += len(batch_dict["raw_prompt"])
             batch_dict["gen_batch_seq"] = np.full(len(batch_dict["raw_prompt"]), self._gen_batch_seq)
             self._gen_batch_seq += 1
             batch = tu.get_tensordict(batch_dict)

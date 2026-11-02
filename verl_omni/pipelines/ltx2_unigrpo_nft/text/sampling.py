@@ -48,7 +48,18 @@ class SeededSampler(LogitsProcessor):
 
 
 @torch.no_grad()
-def generate_recaptions(model, tokenizer, prompts, seeds, *, temperature, max_new_tokens, duration_seconds, preset):
+def generate_recaptions(
+    model,
+    tokenizer,
+    prompts,
+    seeds,
+    *,
+    temperature,
+    max_new_tokens,
+    duration_seconds,
+    preset,
+    sampling_mode="seeded_batch",
+):
     if not prompts or len(prompts) != len(seeds):
         raise ValueError("Batched recaption needs one seed per nonempty prompt batch")
     if type(max_new_tokens) is not int or max_new_tokens <= 0:
@@ -65,6 +76,13 @@ def generate_recaptions(model, tokenizer, prompts, seeds, *, temperature, max_ne
         )[0]
         for prompt in prompts
     ]
+    if sampling_mode == "legacy":
+        return [
+            _legacy_recaption(model, tokenizer, ids, seed, temperature, max_new_tokens)
+            for ids, seed in zip(prompt_ids, seeds, strict=True)
+        ]
+    if sampling_mode != "seeded_batch":
+        raise ValueError("Unknown recaption_sampling_mode")
     eos = model.generation_config.eos_token_id
     eos = (eos,) if isinstance(eos, int) else tuple(eos)
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos[0]
@@ -104,3 +122,41 @@ def generate_recaptions(model, tokenizer, prompts, seeds, *, temperature, max_ne
             raise RuntimeError("Gemma generated an empty recaption")
         results.append((text, prompt_ids[row].cpu(), response, logprobs[row, :length].clone(), eos))
     return results
+
+
+@torch.no_grad()
+def _legacy_recaption(model, tokenizer, prompt_ids, seed, temperature, max_new_tokens):
+    """Reproduce the original single-response Transformers RNG and sampling path."""
+    device = torch.device(model.device)
+    eos = model.generation_config.eos_token_id
+    eos = (eos,) if isinstance(eos, int) else tuple(eos)
+    config = GenerationConfig(
+        do_sample=True,
+        temperature=temperature,
+        top_k=0,
+        top_p=1.0,
+        typical_p=1.0,
+        repetition_penalty=1.0,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=list(eos),
+        pad_token_id=tokenizer.pad_token_id,
+        use_cache=True,
+        return_dict_in_generate=True,
+        output_scores=True,
+    )
+    ids = prompt_ids.unsqueeze(0).to(device)
+    rng_kwargs = {} if device.type == "cpu" else {"device_type": device.type}
+    devices = [] if device.type == "cpu" else [device.index or 0]
+    with torch.random.fork_rng(devices=devices, **rng_kwargs):
+        torch.manual_seed(int(seed))
+        if device.type != "cpu":
+            torch.get_device_module(device).manual_seed(int(seed))
+        output = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), generation_config=config)
+    response = output.sequences[0, ids.shape[1] :]
+    if len(output.scores) != response.numel() or not response.numel():
+        raise RuntimeError("Legacy recaption lost sampled-token scores")
+    logprobs = torch.stack(
+        [score[0].float().log_softmax(-1)[token] for score, token in zip(output.scores, response, strict=True)]
+    )
+    text = tokenizer.decode(response, skip_special_tokens=True).strip()
+    return text, prompt_ids.cpu(), response.cpu(), logprobs.cpu(), eos

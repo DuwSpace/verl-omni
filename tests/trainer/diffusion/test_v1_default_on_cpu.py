@@ -80,10 +80,13 @@ def test_offline_dpo_v0_launch_stays_silent():
     [[], ["+ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS='8'"]],
     ids=["default", "user_env_vars"],
 )
-def test_run_diffusion_v1_force_enables_transfer_queue_before_ray_init(monkeypatch, overrides):
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_run_diffusion_v1_force_enables_transfer_queue_before_ray_init(monkeypatch, overrides, deterministic):
     import verl_omni.trainer.main_diffusion_v1 as main_v1
 
-    config = compose_diffusion_config(overrides)
+    config = compose_diffusion_config(
+        overrides + [f"actor_rollout_ref.rollout.full_determinism={str(deterministic).lower()}"]
+    )
     assert config.transfer_queue.enable is False
 
     captured = {}
@@ -117,3 +120,10 @@ def test_run_diffusion_v1_force_enables_transfer_queue_before_ray_init(monkeypat
     assert env_vars.get("TRANSFER_QUEUE_ENABLE") == "1"
     if overrides:
         assert env_vars.get("OMP_NUM_THREADS") == "8"
+    if deterministic:
+        assert env_vars["VERL_OMNI_FULL_DETERMINISM"] == "1"
+        assert env_vars["HCCL_DETERMINISTIC"] == "strict"
+        assert env_vars["LCCL_DETERMINISTIC"] == "1"
+        assert env_vars["CLOSE_MATMUL_K_SHIFT"] == "1"
+    else:
+        assert "VERL_OMNI_FULL_DETERMINISM" not in env_vars

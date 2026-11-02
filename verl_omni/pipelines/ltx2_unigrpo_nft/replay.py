@@ -47,6 +47,11 @@ class LTXJointReplay:
     logprob_kind: str = "temperature_scaled"
     response_text: str | None = None
     response_format: str = "caption"
+    # Siblings share AR replay but keep independent AV seeds and rewards.
+    recaption_group_id: str | None = None
+    recaption_seed: int | None = None
+    recaption_video_index: int = 0
+    videos_per_recaption: int = 1
 
     def validate(self):
         if not self.original_prompt.strip() or not self.recaption.strip():

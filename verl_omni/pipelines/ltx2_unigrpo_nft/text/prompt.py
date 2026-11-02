@@ -19,8 +19,11 @@ from pathlib import Path
 
 def recaption_messages(prompt, duration_seconds=None, *, preset="ltx_t2av"):
     """Use the official LTX caption template for audiovisual requests."""
-    if preset != "ltx_t2av" or not isinstance(prompt, str) or not prompt.strip():
+    if preset not in {"ltx_t2av", "planner"} or not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("Expected a nonempty prompt and the ltx_t2av template")
+    if preset == "planner":
+        instruction = (Path(__file__).parent / "prompts/planner.txt").read_text(encoding="utf-8")
+        return [{"role": "user", "content": instruction + prompt}]
     system = (Path(__file__).parent / "prompts/gemma_t2v_system_prompt.txt").read_text(encoding="utf-8")
     return [{"role": "system", "content": system}, {"role": "user", "content": f"user prompt: {prompt}"}]
 

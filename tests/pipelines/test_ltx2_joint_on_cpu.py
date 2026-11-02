@@ -267,6 +267,10 @@ def test_ablation_updates_only_selected_branch_even_with_optimizer_momentum(mode
     update = JointUpdate(model, engine.model_config, engine.use_adapter)
     monkeypatch.setattr(update, "_device", lambda: torch.device("cpu"))
     result = update.run(data, partial(lambda **kwargs: None, config=config), False)
+    for prefix, key in (("gemma.", "text/grad_norm"), ("transformer.", "dit/grad_norm")):
+        grads = [p.grad.flatten() for n, p in model.named_parameters() if n.startswith(prefix) and p.grad is not None]
+        expected = torch.cat(grads).norm().item() if grads else 0.0
+        assert result["metrics"][key][0] == pytest.approx(expected, rel=1e-5, abs=1e-8)
     optimizer.step()
     for key in ("logprob_diff_mean", "logprob_diff_abs_mean", "logprob_diff_abs_max"):
         name = "text/" + key
@@ -327,7 +331,7 @@ def test_recipe_modes_and_prompt_default(monkeypatch, model):
         assert actor.recaption_prompt == rollout.recaption_prompt == validation.recaption_prompt == "ltx_t2av"
         assert loss.text_advantage_source == "component_advantage_mean"
         optim = omega_conf_to_dataclass(cfg.actor_rollout_ref.actor.optim)
-        assert cfg.actor_rollout_ref.model.lora_dtype is None
+        assert cfg.actor_rollout_ref.model.lora_dtype == "fp32"
         assert cfg.actor_rollout_ref.actor.fsdp_config.model_dtype == "bfloat16"
         assert optim.lr == 3e-5
         assert optim.param_group_lrs == {"gemma": 1e-6}
@@ -391,13 +395,18 @@ def test_batch_four_recipe_delivers_one_microbatch_per_rank(monkeypatch):
     assert len(list(tu.make_iterator(rank_batch, mini_batch_size=4, epochs=1))) == 1
 
 
-def test_component_advantage_mean_is_not_renormalized(model):
+def test_component_advantage_mean_is_not_renormalized(model, monkeypatch):
     import numpy as np
     from omegaconf import OmegaConf
     from verl import DataProto
 
     from verl_omni.pipelines.ltx2_unigrpo_nft.training.loss import LTXJointLoss
 
+    def reject_tree_path(*args, **kwargs):
+        raise AssertionError("Flat rollout must not use tree reward statistics")
+
+    monkeypatch.setattr("verl_omni.pipelines.ltx2_unigrpo_nft.training.loss.compute_text_advantages", reject_tree_path)
+    monkeypatch.setattr("verl_omni.pipelines.ltx2_unigrpo_nft.training.loss.av_reward_group_ids", reject_tree_path)
     data, records = _joint_batch(model)
     data.pop("ltx_joint_replay")
     data["rm_scores"] = torch.tensor([[1.0, 3.0, 5.0], [3.0, 1.0, 5.0]])
@@ -420,6 +429,7 @@ def test_component_advantage_mean_is_not_renormalized(model):
     )
     result = LTXJointLoss.prepare_actor_batch(batch, data["rm_scores"], cfg)
     torch.testing.assert_close(result.batch["text_advantages"], torch.zeros(2), rtol=0, atol=0)
+    assert "actor_batch_metrics" not in result.meta_info
     # Constant reward retains its equal share, reducing the mean to 2/3.
     data["rm_scores"] = torch.tensor([[1.0, 1.0, 5.0], [3.0, 3.0, 5.0]])
     result = LTXJointLoss.prepare_actor_batch(batch, data["rm_scores"], cfg)
@@ -497,7 +507,8 @@ def test_joint_lora_routes_real_diffusion_engine_export(model):
 
 
 @pytest.mark.parametrize("count", [2, 4])
-def test_stage_prepares_text_before_av_and_keeps_replay(model, monkeypatch, count):
+@pytest.mark.parametrize("width", [1, 2])
+def test_stage_prepares_text_before_av_and_keeps_replay(model, monkeypatch, count, width):
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
@@ -521,8 +532,18 @@ def test_stage_prepares_text_before_av_and_keeps_replay(model, monkeypatch, coun
             request_id=f"sample-{i}",
             sampling_params=SimpleNamespace(
                 lora_request=SimpleNamespace(lora_int_id=1),
-                seed=42,
-                extra_args={"recaption_batch_size": 2, "prepared_request_id": f"sample-{i}"},
+                seed=42 + i,
+                extra_args={
+                    "recaption_batch_size": 2,
+                    "prepared_request_id": f"sample-{i}",
+                    "rollout_mode": "tree" if width > 1 else "flat",
+                    "videos_per_recaption": width,
+                    **(
+                        {"recaption_group_id": f"caption-{i // width}", "recaption_video_index": i % width}
+                        if width > 1
+                        else {}
+                    ),
+                },
             ),
         )
         for i in range(count)
@@ -545,17 +566,28 @@ def test_stage_prepares_text_before_av_and_keeps_replay(model, monkeypatch, coun
 
     monkeypatch.setattr(pipeline, "_prepare_text", prepare)
     monkeypatch.setattr(LTX23OmniNFTPipeline, "forward", native)
-    pipeline.prepare_rollout_requests(requests)
-    assert events == ["text_batch"] * (count // 2)
+    pipeline.prepare_rollout_requests(list(reversed(requests)) if width > 1 else requests)
+    text_batches = (count // width + 1) // 2
+    assert events == ["text_batch"] * text_batches
+    if width > 1:
+        for i in range(0, count, width):
+            a, b = [pipeline._prepared_text[f"sample-{j}"] for j in (i, i + 1)]
+            assert a[2] is b[2]  # one CPU condition allocation per recaption
+            assert a[1].response_token_ids is b[1].response_token_ids
+            assert a[1].rollout_logprobs is b[1].rollout_logprobs
+            assert a[1].seed != b[1].seed
+            assert a[1].recaption_seed == b[1].recaption_seed == 42 + i
     assert len(releases) == 1
     outputs = [pipeline.forward(DiffusionRequestBatch(requests=[request])) for request in requests]
     assert not pipeline._prepared_text
     with pytest.raises(RuntimeError, match="requires prepared text"):
         pipeline.forward(DiffusionRequestBatch(requests=requests))
-    assert events == ["text_batch"] * (count // 2) + [f"sample-{i}" for i in range(count)]
+    assert events == ["text_batch"] * text_batches + [f"sample-{i}" for i in range(count)]
     for output, record in zip(outputs, records, strict=True):
         replay = output.output["metadata"]["rl"]["ltx_joint_replay"]
-        assert replay["recaption"] == record.recaption
+        if width == 1:
+            assert replay["recaption"] == record.recaption
+        assert replay["videos_per_recaption"] == width
         assert "video_latents_clean" in output.output["metadata"]["rl"]
 
 
@@ -660,3 +692,107 @@ def test_chunked_head_matches_dense_values_gradients_and_one_module_call(count):
     torch.testing.assert_close(hidden.grad, reference.grad)
     assert calls == [True]
     hook.remove()
+
+
+def test_tree_text_uses_parent_rewards_and_av_centers_within_siblings(model):
+    from dataclasses import replace
+
+    import numpy as np
+    from omegaconf import OmegaConf
+    from verl import DataProto
+
+    from verl_omni.pipelines.ltx2_unigrpo_nft.training.loss import LTXJointLoss
+
+    data, parents = _joint_batch(model)
+    data.pop("ltx_joint_replay")
+    data = data[torch.tensor([0, 1, 0, 1])]
+    records = [
+        replace(
+            parents[i % 2],
+            recaption_group_id=f"g{i % 2}",
+            recaption_video_index=i // 2,
+            videos_per_recaption=2,
+            seed=100 + i,
+        )
+        for i in range(4)
+    ]
+    scores = torch.tensor([[1.0], [2.0], [5.0], [12.0]])
+    data["rm_scores"] = scores.clone()
+    batch = DataProto(
+        batch=data,
+        non_tensor_batch={
+            "uid": np.array(["prompt"] * 4),
+            "ltx_joint_replay": np.array(records, dtype=object),
+        },
+        meta_info={"reward_names": ["x"]},
+    )
+    cfg = OmegaConf.create(
+        {
+            "algorithm": {
+                "norm_adv_by_std_in_grpo": True,
+                "global_std": True,
+                "adv_mode": "continuous",
+                "timestep_fraction": 1.0,
+            },
+            "actor_rollout_ref": {"actor": {"data_loader_seed": 0, "diffusion_loss": dict(LTXJointLossConfig())}},
+            "reward": {"reward_functions": {"x": {"routing_weights": {"video": 1.0, "audio": 1.0}}}},
+        }
+    )
+    result = LTXJointLoss.prepare_actor_batch(batch, scores, cfg)
+    # Parent means are 3 and 7: mean=5, population std=2 (not the leaf std).
+    expected = torch.tensor([-2.0, 2.0, -2.0, 2.0]) / (2.0 + 1e-6)
+    torch.testing.assert_close(result.batch["text_advantages"], expected)
+    torch.testing.assert_close(result.batch["rm_scores"], scores)
+    assert result.non_tensor_batch["uid"].tolist() == ["prompt"] * 4
+    metrics = result.meta_info["actor_batch_metrics"]
+    assert metrics["critic/tree/recaption/x/mean"] == pytest.approx(5.0)
+    assert metrics["critic/tree/recaption/x/std"] == pytest.approx(2.0)
+    assert metrics["critic/tree/within_recaption/x/std_mean"] == pytest.approx(3.5)
+    # AV means are also 3 and 7, but each video keeps its own residual.
+    av_expected = torch.tensor([-2.0, -5.0, 2.0, 5.0]) / (scores.std(unbiased=False) + 1e-4)
+    torch.testing.assert_close(result.batch["advantages"][:, 0], av_expected)
+    assert not torch.equal(result.batch["video_forward_noise"][0], result.batch["video_forward_noise"][2])
+    with pytest.raises(ValueError, match="incomplete recaption tree"):
+        LTXJointLoss.prepare_actor_batch(batch[:3], scores[:3], cfg)
+
+
+def test_legacy_sampling_is_independent_and_restores_rng(model):
+    from verl_omni.pipelines.ltx2_unigrpo_nft.text.sampling import _legacy_recaption
+
+    model.eval()
+    model.gemma.generation_config.eos_token_id = 1
+    tokenizer = SimpleNamespace(pad_token_id=0, decode=lambda ids, **kw: str(ids.tolist()))
+    ids = torch.tensor([2, 3])
+    state = torch.random.get_rng_state().clone()
+    first = _legacy_recaption(model.gemma, tokenizer, ids, 42, 1.0, 4)
+    _legacy_recaption(model.gemma, tokenizer, ids, 99, 1.0, 4)
+    repeated = _legacy_recaption(model.gemma, tokenizer, ids, 42, 1.0, 4)
+    assert torch.equal(state, torch.random.get_rng_state())
+    assert torch.equal(first[2], repeated[2])
+    torch.testing.assert_close(first[3], repeated[3])
+
+
+def test_legacy_baseline_recipe(monkeypatch):
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    for name in ("MODEL_PATH", "REWARD_ROOT", "OUTPUT_DIR"):
+        monkeypatch.setenv("LTX_" + name, "/tmp/test")
+    root = Path(__file__).resolve().parents[2]
+    with initialize_config_dir(config_dir=str(root / "examples/unigrpo_nft_trainer/ltx2"), version_base=None):
+        cfg = compose(config_name="joint_train", overrides=["ablation=joint_legacy_baseline"])
+    assert cfg.actor_rollout_ref.model.lora_dtype == "fp32"
+    assert cfg.actor_rollout_ref.model.pipeline.gemma_weight_dtype == "float32"
+    for pipeline in (cfg.actor_rollout_ref.rollout.pipeline, cfg.actor_rollout_ref.rollout.val_kwargs.pipeline):
+        assert pipeline.recaption_prompt == "planner"
+        assert pipeline.recaption_sampling_mode == "legacy"
+        assert pipeline.recaption_batch_size == 1
+    assert cfg.actor_rollout_ref.rollout.val_kwargs.seed_offset_by_index
+    assert cfg.actor_rollout_ref.rollout.val_kwargs.seed == 42
+    assert cfg.data.train_batch_size == cfg.actor_rollout_ref.actor.ppo_mini_batch_size == 32
+    assert cfg.actor_rollout_ref.rollout.n == 8
+    assert all(v.executor.max_batch_size is None for v in cfg.reward.models.values())
+    assert cfg.reward.reward_functions.hpsv3.max_batch_size == 5
+    OmegaConf.to_container(cfg, resolve=True)

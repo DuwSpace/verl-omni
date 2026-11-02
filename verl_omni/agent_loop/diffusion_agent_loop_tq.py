@@ -136,14 +136,31 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         try:
             config = self.rollout_config
             n = config.val_kwargs.n if trajectory["validate"] else config.n
+            tree = sampling_params.get("rollout_mode") == "tree"
+            if tree:
+                from verl_omni.pipelines.ltx2_unigrpo_nft.tree_rollout.requests import tree_sampling_params
+
             for session_id in range(n):
                 run_sampling_params = dict(sampling_params)
+                if trajectory["validate"] and getattr(config.val_kwargs, "seed_offset_by_index", False):
+                    run_sampling_params["seed"] = int(config.val_kwargs.seed) + prompt_index * n + session_id
                 if rollout_base_seed is not None and not trajectory["validate"]:
                     # Seed from the position within the generation batch (v0
                     # semantics): each worker only sees a chunk of the batch, so
                     # a chunk-local position would reuse the same seed offsets
                     # in every worker and roll out duplicated noise.
                     run_sampling_params["seed"] = derive_rollout_seed(rollout_base_seed, prompt_index * n + session_id)
+                if tree:
+                    run_sampling_params.update(
+                        tree_sampling_params(
+                            sampling_params,
+                            uid=uid,
+                            session_id=session_id,
+                            total=n,
+                            prompt_index=prompt_index,
+                            base_seed=rollout_base_seed,
+                        )
+                    )
                 task = asyncio.create_task(
                     self._run_agent_loop(
                         run_sampling_params,

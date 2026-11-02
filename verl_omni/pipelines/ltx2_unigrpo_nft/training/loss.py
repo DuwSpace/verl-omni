@@ -19,6 +19,8 @@ import torch
 from verl_omni.trainer.diffusion.diffusion_algos import OmniNFTLoss, register_diffusion_loss
 
 from ..replay import LTXJointReplay
+from ..tree_rollout.advantages import av_reward_group_ids, compute_text_advantages
+from ..tree_rollout.metrics import compute_tree_reward_metrics
 
 
 @register_diffusion_loss("ltx2_unigrpo_nft")
@@ -33,18 +35,42 @@ class LTXJointLoss(OmniNFTLoss):
             record.validate()
         if len({record.policy_version for record in records}) != 1:
             raise ValueError("Joint actor batch mixes rollout policy versions")
-        batch = super().prepare_actor_batch(batch, reward_tensor, config)
         loss_config = config.actor_rollout_ref.actor.diffusion_loss
         if loss_config.text_advantage_source != "component_advantage_mean":
             raise ValueError("Only component_advantage_mean is supported")
-        components = cls._compute_component_advantages(
-            scores=batch.batch["rm_scores"].detach().float(),
-            uid=batch.non_tensor_batch["uid"],
-            norm_by_std=True,
-            global_std=loss_config.text_global_std,
-            epsilon=loss_config.text_advantage_epsilon,
-        )
-        batch.batch["text_advantages"] = components.mean(dim=-1)
+        if any(record.recaption_group_id is not None for record in records):
+            prompt_uid = batch.non_tensor_batch["uid"]
+            text_advantages = compute_text_advantages(
+                batch.batch["rm_scores"],
+                prompt_uid,
+                records,
+                cls._compute_component_advantages,
+                global_std=loss_config.text_global_std,
+                epsilon=loss_config.text_advantage_epsilon,
+            )
+            # Only tree AV rewards use recaption groups. Keep original prompt
+            # identities for text grouping, replay and downstream consumers.
+            batch.non_tensor_batch["uid"] = av_reward_group_ids(prompt_uid, records)
+            try:
+                batch = super().prepare_actor_batch(batch, reward_tensor, config)
+            finally:
+                batch.non_tensor_batch["uid"] = prompt_uid
+            batch.meta_info.setdefault("actor_batch_metrics", {}).update(
+                compute_tree_reward_metrics(
+                    batch.batch["rm_scores"], prompt_uid, records, batch.meta_info["reward_names"]
+                )
+            )
+        else:
+            batch = super().prepare_actor_batch(batch, reward_tensor, config)
+            components = cls._compute_component_advantages(
+                scores=batch.batch["rm_scores"].detach().float(),
+                uid=batch.non_tensor_batch["uid"],
+                norm_by_std=True,
+                global_std=loss_config.text_global_std,
+                epsilon=loss_config.text_advantage_epsilon,
+            )
+            text_advantages = components.mean(dim=-1)
+        batch.batch["text_advantages"] = text_advantages
         for modality, salt in (("video", 0x564944), ("audio", 0x415544)):
             clean = batch.batch[f"{modality}_latents_clean"]
             steps = batch.batch["train_timesteps"].shape[1]

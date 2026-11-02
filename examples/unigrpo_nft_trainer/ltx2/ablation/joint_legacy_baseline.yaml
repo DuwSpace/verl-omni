@@ -1,0 +1,59 @@
+# @package _global_
+# Reproduce the legacy joint evaluation inputs and arithmetic on the current stack.
+data:
+  train_batch_size: 32
+
+actor_rollout_ref:
+  model:
+    lora_dtype: fp32
+    pipeline:
+      gemma_weight_dtype: float32
+      gemma_compute_dtype: float32
+      recaption_prompt: planner
+  actor:
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size_per_gpu: 8
+  rollout:
+    full_determinism: true
+    n: 8
+    engine_kwargs:
+      vllm_omni:
+        additional_config:
+          gemma_weight_dtype: ${actor_rollout_ref.model.pipeline.gemma_weight_dtype}
+    pipeline:
+      gemma_weight_dtype: ${actor_rollout_ref.model.pipeline.gemma_weight_dtype}
+      recaption_prompt: planner
+      recaption_sampling_mode: legacy
+      recaption_batch_size: 1
+      rollout_mode: flat
+      videos_per_recaption: 1
+    val_kwargs:
+      seed: ${actor_rollout_ref.rollout.seed}
+      seed_offset_by_index: true
+      pipeline:
+        gemma_weight_dtype: ${actor_rollout_ref.model.pipeline.gemma_weight_dtype}
+        recaption_sampling_mode: legacy
+
+reward:
+  models:
+    video_align:
+      executor:
+        max_batch_size: null
+    hpsv3:
+      executor:
+        max_batch_size: null
+    audiobox:
+      executor:
+        max_batch_size: null
+    clap:
+      executor:
+        max_batch_size: null
+    desync:
+      executor:
+        max_batch_size: null
+  reward_functions:
+    hpsv3:
+      max_batch_size: 5
+
+trainer:
+  experiment_name: joint_legacy_baseline

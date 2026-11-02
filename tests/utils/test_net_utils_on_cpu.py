@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU tests for the non-ephemeral MASTER_PORT picker."""
 
+import random
 import socket
 
 import pytest
@@ -32,6 +33,24 @@ def test_returns_bindable_port_below_ephemeral_range():
     assert 1024 <= port < lo
     holder = _bind("127.0.0.1", port)  # raises if the picker handed out a busy port
     holder.close()
+
+
+def test_port_selection_does_not_use_or_advance_model_rng(monkeypatch):
+    original_state = random.getstate()
+
+    def forbid_model_rng(*args, **kwargs):
+        raise AssertionError("Port allocation used the seeded model RNG")
+
+    monkeypatch.setattr(random, "randrange", forbid_model_rng)
+    try:
+        random.seed(42)
+        seeded_state = random.getstate()
+        for _ in range(8):
+            port = net_utils.get_non_ephemeral_free_port("127.0.0.1")
+            assert 1024 <= port < net_utils.ephemeral_port_range()[0]
+            assert random.getstate() == seeded_state
+    finally:
+        random.setstate(original_state)
 
 
 def test_skips_ports_already_bound(monkeypatch):

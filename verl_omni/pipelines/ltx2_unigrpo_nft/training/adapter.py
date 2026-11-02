@@ -27,7 +27,14 @@ class LTXJointTrainingAdapter(LTX23OmniNFT):
     def build_module(cls, model_config, torch_dtype):
         if model_config.lora_rank <= 0 or tuple(model_config.policy_state_adapters) != ("default", "old"):
             raise ValueError("Joint LTX requires LoRA with default and old policy adapters")
-        module = LTXJointModel.from_pretrained(model_config.local_path, torch_dtype=torch_dtype)
+        import torch
+
+        weight_dtype = getattr(torch, model_config.pipeline.gemma_weight_dtype)
+        module = LTXJointModel.from_pretrained(
+            model_config.local_path, torch_dtype=torch_dtype, gemma_weight_dtype=weight_dtype
+        )
+        if weight_dtype == torch.float32:
+            module._keep_in_fp32_modules = ["gemma"]
         module.gemma_compute_dtype = model_config.pipeline.gemma_compute_dtype
         if module.gemma_compute_dtype == "float32":
             from ..text.precision import install_fp32_gemma_compute

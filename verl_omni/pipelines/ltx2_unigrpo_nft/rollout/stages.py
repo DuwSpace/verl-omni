@@ -26,6 +26,9 @@ from verl.workers.rollout.llm_server import LLMServerClient
 
 from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQ
 
+from ..tree_rollout.requests import tree_width
+from ..tree_rollout.routing import RecaptionLeases
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -52,6 +55,7 @@ class RolloutRound:
         self.expected = expected
         self.entries = {}
         self.submitted = set()
+        self.leases = RecaptionLeases(self.client)
         self.preparation_error = None
         self.servers = {}
         self.completed = set()
@@ -67,9 +71,9 @@ class RolloutRound:
         if request_id in self.submitted or len(self.submitted) >= self.expected:
             raise ValueError("Duplicate or excess staged rollout request")
         self.submitted.add(request_id)
-        server_id, server = await self.client._acquire_server(request_id)
+        server_id, server = await self.leases.acquire(request_id, payload)
         if self.finished.is_set():
-            self.client._release_server(server_id)
+            self.leases.release_expired(request_id)
             raise RuntimeError("Staged rollout expired while acquiring a server")
         self.entries[request_id] = (server_id, server, payload)
         self.servers[server_id] = server
@@ -84,7 +88,12 @@ class RolloutRound:
             grouped = defaultdict(list)
             for server_id, _, payload in self.entries.values():
                 grouped[server_id].append(payload)
-            logger.info("Rollout stage 1: preparing %d requests on %d replicas", self.expected, len(grouped))
+            logger.info(
+                "Rollout stage 1: preparing %d recaptions for %d videos on %d replicas",
+                len(self.leases),
+                self.expected,
+                len(grouped),
+            )
             started = perf_counter()
             # Await every worker, including when a peer fails, before clearing CPU caches.
             results = await asyncio.wait_for(
@@ -106,8 +115,7 @@ class RolloutRound:
         except Exception as error:
             self.error = self.preparation_error = error
             await self._clear()
-            for server_id, _, _ in self.entries.values():
-                self.client._release_server(server_id)
+            self.leases.release_all()
             self.finished.set()
         finally:
             self.ready.set()
@@ -124,8 +132,7 @@ class RolloutRound:
             return
         if request_id in self.completed:
             raise ValueError("Duplicate rollout completion")
-        server_id, _, _ = self.entries[request_id]
-        self.client._release_server(server_id)
+        self.leases.complete(request_id)
         self.completed.add(request_id)
         if failed:
             self.error = RuntimeError(f"Video generation failed for {request_id}")
@@ -193,6 +200,8 @@ class LTXStagedAgentLoopManager(AgentLoopManagerTQ):
             validate = validate.data
         config = self.config.actor_rollout_ref.rollout
         count = config.val_kwargs.n if validate else config.n
+        settings = config.val_kwargs.pipeline if validate else config.pipeline
+        tree_width(settings, count)
         ray.get(self.coordinator.begin.remote(len(prompts) * count))
         super().generate_sequences(prompts)
         ray.get(self.coordinator.wait_prepared.remote())

@@ -45,8 +45,8 @@ actor_rollout_ref:
     enable_gradient_checkpointing: true
     lora_rank: 32
     lora_alpha: 32
-    # Match OmniNFT: retain the adapter dtype created by PEFT.
-    lora_dtype: null
+    # FP32 trainable/old LoRA masters and optimizer state; DiT forward stays BF16.
+    lora_dtype: fp32
     policy_state_adapters: [default, old]
     target_modules: '^(gemma\.model\.language_model\.layers\.\d+\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|mlp\.(gate_proj|up_proj|down_proj))|transformer\.transformer_blocks\.\d+\..*\.(to_q|to_k|to_v|to_out\.0))$'
     fsdp_layer_prefixes: [gemma.model.language_model.layers., transformer.transformer_blocks.]
@@ -113,6 +113,7 @@ actor_rollout_ref:
         vae_use_tiling: true
     tensor_model_parallel_size: 1
     max_num_seqs: 1
+    # Final videos per prompt: N recaptions * k videos in tree mode.
     n: 8
     seed: 42
     enforce_eager: true
@@ -123,6 +124,8 @@ actor_rollout_ref:
       gemma_compute_dtype: ${actor_rollout_ref.model.pipeline.gemma_compute_dtype}
       # FP32 Gemma activations require a smaller AR batch than the BF16 path.
       recaption_batch_size: 16
+      rollout_mode: flat
+      videos_per_recaption: 1
       stage_timeout_s: 3600
       recaption_temperature: 1.0
       recaption_max_new_tokens: 4096
@@ -146,6 +149,8 @@ actor_rollout_ref:
         _target_: verl_omni.pipelines.ltx2_unigrpo_nft.config.LTXJointPipelineConfig
         gemma_compute_dtype: ${actor_rollout_ref.model.pipeline.gemma_compute_dtype}
         recaption_prompt: ${actor_rollout_ref.rollout.pipeline.recaption_prompt}
+        rollout_mode: flat
+        videos_per_recaption: 1
         recaption_batch_size: ${actor_rollout_ref.rollout.pipeline.recaption_batch_size}
         recaption_temperature: ${actor_rollout_ref.rollout.pipeline.recaption_temperature}
         recaption_max_new_tokens: ${actor_rollout_ref.rollout.pipeline.recaption_max_new_tokens}
@@ -216,6 +221,8 @@ trainer:
   total_training_steps: 100
   resume_mode: disable
   default_local_dir: ${oc.env:LTX_OUTPUT_DIR}/checkpoints
+  validation_data_dir: ${oc.env:LTX_OUTPUT_DIR}/validation_samples
+  validation_data_max_samples: null
   rollout_data_dir: ${oc.env:LTX_OUTPUT_DIR}/samples
   rollout_data_save_freq: 10000
 

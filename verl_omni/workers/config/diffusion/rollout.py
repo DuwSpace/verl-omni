@@ -108,6 +108,8 @@ class DiffusionSamplingConfig(BaseConfig):
     n: int = 1
     m: int = 1  # Optional. AR stage 1, number of samples per prompt
     seed: int = 42
+    # Give validation sample i seed + i instead of sharing one seed across rows.
+    seed_offset_by_index: bool = False
     pipeline: DiffusionPipelineConfig = field(default_factory=DiffusionPipelineConfig)
     algo: DiffusionRolloutAlgoConfig = field(default_factory=DiffusionRolloutAlgoConfig)
     ar: DiffusionARConfig = field(default_factory=DiffusionARConfig)

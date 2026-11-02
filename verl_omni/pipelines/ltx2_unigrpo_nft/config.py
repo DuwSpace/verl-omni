@@ -25,6 +25,10 @@ from verl_omni.workers.config.diffusion.actor import DiffusionLossConfig
 class LTXJointPipelineConfig(LTXDiffusionPipelineConfig):
     # Frozen weights remain BF16; float32 preserves Gemma activations for AR consistency.
     gemma_compute_dtype: str = "bfloat16"
+    # Preserve original checkpoint precision when reproducing legacy joint runs.
+    gemma_weight_dtype: str = "bfloat16"
+    # Legacy sampling uses one Transformers generation call per response.
+    recaption_sampling_mode: str = "seeded_batch"
     # Prompt template used for audiovisual recaptioning.
     recaption_prompt: str = "ltx_t2av"
     # Temperature-only sampling; no top-k or top-p truncation.
@@ -33,6 +37,9 @@ class LTXJointPipelineConfig(LTXDiffusionPipelineConfig):
     recaption_max_new_tokens: int = 4096
     # Bound the AR KV-cache; CPU conditions are retained for the entire round.
     recaption_batch_size: int = 2
+    # rollout.n remains the final video count N*k; flat preserves one caption per video.
+    rollout_mode: str = "flat"
+    videos_per_recaption: int = 1
     # Deadline for request collection and text preparation, independently.
     stage_timeout_s: int = 3600
     # Maximum token rows in each local vocabulary projection during actor logprob computation.
@@ -43,10 +50,19 @@ class LTXJointPipelineConfig(LTXDiffusionPipelineConfig):
     text_ema_enabled: bool = False
 
     def __post_init__(self):
+        from .tree_rollout.requests import tree_width
+
+        tree_width({"rollout_mode": self.rollout_mode, "videos_per_recaption": self.videos_per_recaption})
         if self.gemma_compute_dtype not in {"bfloat16", "float32"}:
             raise ValueError("gemma_compute_dtype must be bfloat16 or float32")
-        if self.recaption_prompt != "ltx_t2av":
-            raise ValueError("recaption_prompt must be ltx_t2av")
+        if self.gemma_weight_dtype not in {"bfloat16", "float32"}:
+            raise ValueError("gemma_weight_dtype must be bfloat16 or float32")
+        if self.gemma_weight_dtype == "float32" and self.gemma_compute_dtype != "float32":
+            raise ValueError("FP32 Gemma weights require FP32 computation")
+        if self.recaption_sampling_mode not in {"seeded_batch", "legacy"}:
+            raise ValueError("Unknown recaption_sampling_mode")
+        if self.recaption_prompt not in {"ltx_t2av", "planner"}:
+            raise ValueError("recaption_prompt must be ltx_t2av or planner")
         if self.update_mode not in {"joint", "ar_only", "av_only"}:
             raise ValueError("update_mode must be joint, ar_only or av_only")
         if type(self.text_ema_enabled) is not bool:

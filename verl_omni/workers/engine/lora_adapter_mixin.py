@@ -70,7 +70,9 @@ class LoRAAdapterMixin:
 
             target_dtype = PrecisionType.to_dtype(lora_dtype)
             for name, param in module.named_parameters():
-                if param.requires_grad:
+                # Frozen policy adapters need the same master precision for
+                # copy/EMA updates; requires_grad only selects the active one.
+                if param.requires_grad or any(part.startswith("lora_") for part in name.split(".")):
                     orig_dtype = param.dtype
                     param.data = param.data.to(target_dtype)
                     logger.debug("LoRA param %s: %s -> %s", name, orig_dtype, param.dtype)

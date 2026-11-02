@@ -16,6 +16,7 @@
 
 import torch
 from tensordict import TensorDict
+from torch.distributed.tensor import DTensor
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.trainer.diffusion.diffusion_algos import OmniNFTLoss
@@ -23,6 +24,21 @@ from verl_omni.trainer.diffusion.diffusion_algos import OmniNFTLoss
 from ..replay import LTXJointReplay
 from ..text.loss import clipped_recaption_loss, recaption_reference_kl
 from ..text.metrics import recaption_logprob_diff
+
+
+@torch.no_grad()
+def branch_grad_norms(module, device):
+    """Measure global L2 norms of accumulated branch gradients without clipping."""
+    metrics = {}
+    for prefix, key in (("gemma.", "text/grad_norm"), ("transformer.", "dit/grad_norm")):
+        grads = [p.grad for name, p in module.named_parameters() if name.startswith(prefix) and p.grad is not None]
+        norm = torch.nn.utils.get_total_norm(grads, foreach=False)
+        if isinstance(norm, DTensor):
+            # FSDP CPU-offloaded gradients need their scalar reduction on the
+            # mesh's accelerator, as in verl's fsdp2_clip_grad_norm_.
+            norm = norm.to(device).full_tensor()
+        metrics[key] = norm.item()
+    return metrics
 
 
 class JointUpdate:
@@ -128,6 +144,7 @@ class JointUpdate:
         for name, parameter in self.module.named_parameters():
             if (name.startswith("gemma.") and not update_text) or (name.startswith("transformer.") and not update_av):
                 parameter.grad = None
+        metrics.update(branch_grad_norms(self.module, self._device()))
         metrics.update(
             {"joint/total_loss": total, "joint/update_text": float(update_text), "joint/update_av": float(update_av)}
         )

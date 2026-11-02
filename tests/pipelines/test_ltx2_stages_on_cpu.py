@@ -136,3 +136,41 @@ async def test_missing_request_times_out_and_releases_existing_lease():
         await round.submit("only-one", {"request_id": "only-one"})
     assert base.released == ["0"]
     assert "prepare" not in events
+
+
+@pytest.mark.asyncio
+async def test_tree_siblings_share_one_lease_and_wait_for_whole_round():
+    events = []
+    servers = [Server(events), Server(events)]
+    base = Client(servers)
+    round = RolloutRound(base, 5)
+    client = StagedRolloutClient(base, proxy(round))
+    await round.begin(6)
+    outputs = await asyncio.gather(
+        *[
+            client.generate(str(i), prompt_ids=[i // 3], sampling_params={"recaption_group_id": f"group-{i // 3}"})
+            for i in [5, 0, 3, 1, 4, 2]
+        ]
+    )
+    assert len(outputs) == 6
+    assert base.assigned == 2
+    assert sorted(base.released) == ["0", "1"]
+    assert events.count("video") == 6
+    assert events.count("prepare") == 2
+    assert events.index("video") > max(i for i, event in enumerate(events) if event == "prepared")
+    assert round.finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_tree_preparation_failure_releases_each_group_once():
+    base = Client([Server([], failure=True)])
+    round = RolloutRound(base, 5)
+    client = StagedRolloutClient(base, proxy(round))
+    await round.begin(2)
+    results = await asyncio.gather(
+        *[client.generate(str(i), prompt_ids=[1], sampling_params={"recaption_group_id": "shared"}) for i in range(2)],
+        return_exceptions=True,
+    )
+    assert all(isinstance(result, RuntimeError) for result in results)
+    assert base.assigned == 1
+    assert base.released == ["0"]

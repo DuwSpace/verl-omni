@@ -241,7 +241,7 @@ def test_reference_row_padding_rejects_invalid_inputs(value, count, target_lengt
 
 
 @pytest.mark.asyncio
-async def test_tq_writer_preserves_allowlisted_non_tensor_trajectory_metadata(monkeypatch):
+async def test_tq_writer_preserves_replay_and_non_tensor_trajectory_metadata(monkeypatch):
     worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)
     captured = {}
@@ -258,7 +258,7 @@ async def test_tq_writer_preserves_allowlisted_non_tensor_trajectory_metadata(mo
             "media_kind": "video",
             "img_shapes": img_shapes,
             "audio_sample_rate": 32_000,
-            "unrelated_metadata": "do-not-forward",
+            "ltx_joint_replay": {"recaption_group_id": "sample:0", "recaption_video_index": 1},
         },
     )
 
@@ -283,8 +283,9 @@ async def test_tq_writer_preserves_allowlisted_non_tensor_trajectory_metadata(mo
         "audio_sample_rate": 32_000,
         "min_global_steps": 3,
         "max_global_steps": 3,
+        "ltx_joint_replay": {"recaption_group_id": "sample:0", "recaption_video_index": 1},
     }
-    assert "unrelated_metadata" not in field["extra_fields"]
+    assert field["extra_fields"]["ltx_joint_replay"] == internal.extra_fields["ltx_joint_replay"]
     assert field["condition_image_latents"].shape == (4096, 64)
     assert field["audio"].shape == (1, 16)
     assert captured["tags"][0]["response_shape"] == (3, 2, 2)
@@ -457,7 +458,8 @@ async def test_run_prompt_publishes_failure_after_siblings_settle(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_generate_sequences_seeds_from_global_prompt_index(monkeypatch):
+@pytest.mark.parametrize("validate", [False, True])
+async def test_generate_sequences_seeds_from_global_prompt_index(monkeypatch, validate):
     """Per-request rollout seeds must derive from the global batch index (#561).
 
     Each agent worker only sees a chunk of the batch, so seeding from the
@@ -474,7 +476,7 @@ async def test_generate_sequences_seeds_from_global_prompt_index(monkeypatch):
         algo={},
         calculate_log_probs=False,
         agent=SimpleNamespace(default_agent_loop="diffusion_single_turn_agent"),
-        val_kwargs=SimpleNamespace(n=2, seed=0, pipeline={}, algo={}),
+        val_kwargs=SimpleNamespace(n=2, seed=42, seed_offset_by_index=True, pipeline={}, algo={}),
     )
 
     async def fake_kv_put(*, key, partition_id, tag):
@@ -490,12 +492,18 @@ async def test_generate_sequences_seeds_from_global_prompt_index(monkeypatch):
     monkeypatch.setattr(diffusion_agent_loop_tq.tq, "async_kv_put", fake_kv_put)
     worker._run_agent_loop = MethodType(fake_run_agent_loop, worker)
 
+    async def fake_write(self, *args, **kwargs):
+        pass
+
+    worker._write_trajectories_to_tq = MethodType(fake_write, worker)
+
     def make_chunk(global_indices: list[int], uids: list[str]) -> TensorDict:
         return TensorDict(
             {
                 "index": torch.tensor(global_indices),
                 "uid": NonTensorStack(*uids),
                 "rollout_seed": NonTensorData(42),
+                "validate": NonTensorData(validate),
                 "global_steps": NonTensorData(1),
             },
             batch_size=[len(global_indices)],
@@ -509,6 +517,8 @@ async def test_generate_sequences_seeds_from_global_prompt_index(monkeypatch):
 
     assert len(captured_seeds) == 4 * 2  # 4 prompts x rollout.n=2
     assert len(set(captured_seeds)) == 4 * 2  # no duplicated noise across workers
+    if validate:
+        assert sorted(captured_seeds) == list(range(42, 50))
 
 
 @pytest.mark.asyncio
@@ -533,3 +543,39 @@ async def test_async_reward_data_proto_preserves_validate_meta_info(validate: bo
     received_data = reward_loop_worker_handle.compute_score.received_data
     assert received_data is not None
     assert received_data.meta_info == {"validate": validate}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("validate", [False, True])
+async def test_tree_dispatch_keeps_leaf_count_uid_and_independent_seeds(monkeypatch, validate):
+    worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.rollout_config = SimpleNamespace(n=6, val_kwargs=SimpleNamespace(n=6))
+    samples, writes = [], []
+
+    async def run(params, **kwargs):
+        samples.append(params)
+        return SimpleNamespace()
+
+    async def write(outputs, **kwargs):
+        writes.append((outputs, kwargs))
+
+    async def kv_put(**kwargs):
+        pass
+
+    worker._run_agent_loop = run
+    worker._write_trajectories_to_tq = write
+    monkeypatch.setattr(diffusion_agent_loop_tq.tq, "async_kv_put", kv_put)
+    await worker._run_prompt(
+        prompt={"uid": "prompt", "agent_name": "diffusion_single_turn_agent"},
+        sampling_params={"rollout_mode": "tree", "videos_per_recaption": 3, "seed": 42},
+        trajectory={"validate": validate, "step": 1},
+        prompt_index=7,
+        rollout_base_seed=None if validate else 100,
+    )
+    assert len(samples) == 6
+    assert len({sample["seed"] for sample in samples}) == 6
+    assert [sample["recaption_group_id"] for sample in samples] == ["prompt:0"] * 3 + ["prompt:1"] * 3
+    assert [sample["recaption_video_index"] for sample in samples] == [0, 1, 2, 0, 1, 2]
+    assert len(writes) == 1 and len(writes[0][0]) == 6
+    assert writes[0][1]["uid"] == "prompt"

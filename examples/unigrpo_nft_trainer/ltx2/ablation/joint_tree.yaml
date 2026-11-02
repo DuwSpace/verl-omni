@@ -1,0 +1,19 @@
+# @package _global_
+# Four prompts, eight recaptions per prompt, eight videos per recaption.
+data:
+  train_batch_size: 4
+
+actor_rollout_ref:
+  model:
+    pipeline:
+      update_mode: joint
+  actor:
+    ppo_mini_batch_size: 4
+  rollout:
+    n: 64  # 8 recaptions * 8 videos
+    pipeline:
+      rollout_mode: tree
+      videos_per_recaption: 8
+
+trainer:
+  experiment_name: joint_tree

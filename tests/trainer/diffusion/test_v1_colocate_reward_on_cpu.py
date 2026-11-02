@@ -235,3 +235,30 @@ def test_reward_stats_skip_metadata_and_handle_singleton():
         {"reward/quality": [np.float32(2.0)], "metadata": ["text"], "empty": []}
     )
     assert metrics == {"critic/reward/quality/mean": 2.0, "critic/reward/quality/std": 0.0}
+
+
+def test_direct_preference_forwards_actor_batch_metrics_before_actor_update(monkeypatch):
+    from verl_omni.trainer.diffusion.v1.trainer_base import PolicyGradientDiffusionTrainerV1
+
+    data = DataProto.from_tensordict(tu.get_tensordict({"rm_scores": torch.ones(2, 1)}))
+    expected = {"critic/tree/recaption/quality/mean": 3.0}
+
+    def prepare(batch, rewards):
+        batch.meta_info["actor_batch_metrics"] = expected.copy()
+        return batch
+
+    def stop(batch):
+        assert "actor_batch_metrics" not in batch.meta_info
+        raise _Stop
+
+    trainer = SimpleNamespace(_prepare_actor_batch=prepare, _update_actor=stop, use_reference_policy=False)
+    monkeypatch.setattr(
+        "verl_omni.trainer.diffusion.v1.trainer_base.extract_reward", lambda d: (d.batch["rm_scores"], {})
+    )
+    monkeypatch.setattr("verl_omni.trainer.diffusion.v1.trainer_base.put_dataproto_fields_to_tq", lambda *a, **kw: None)
+    metrics = {}
+    with pytest.raises(_Stop):
+        PolicyGradientDiffusionTrainerV1._train_direct_preference_batch(
+            trainer, metrics, {}, SimpleNamespace(keys=["a", "b"]), data
+        )
+    assert metrics == expected
