@@ -14,10 +14,13 @@
 import asyncio
 from typing import Any, Optional
 
+from omegaconf import DictConfig
 from pydantic import BaseModel, ConfigDict, Field
+from ray.actor import ActorHandle
+from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.tracking import RLInsightLogger
-from verl.workers.rollout.llm_server import LLMServerManager
+from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer, LLMServerManager
 from verl.workers.rollout.replica import RolloutReplicaRegistry
 from verl.workers.rollout.utils import update_prometheus_config
 
@@ -47,8 +50,31 @@ class DiffusionOutput(BaseModel):
     """Extra fields for dynamic addition."""
 
 
+class DiffusionRequestLoadBalancer(GlobalRequestLoadBalancer):
+    """Balance in-flight requests independently of computation determinism."""
+
+    def __init__(self, servers: dict[str, ActorHandle], max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE) -> None:
+        super().__init__(servers=servers, max_cache_size=max_cache_size, full_determinism=False)
+
+
 class DiffusionLLMServerManager(LLMServerManager):
     """Include diffusion SP ranks without changing verl's rollout lifecycle."""
+
+    def __init__(
+        self,
+        config: DictConfig,
+        worker_group: RayWorkerGroup | None = None,
+        rollout_resource_pool: RayResourcePool | None = None,
+        start_rank: int = 0,
+        load_balancer_cls: type | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            worker_group=worker_group,
+            rollout_resource_pool=rollout_resource_pool,
+            start_rank=start_rank,
+            load_balancer_cls=load_balancer_cls or DiffusionRequestLoadBalancer,
+        )
 
     async def _initialize_llm_servers(self, start_rank: int | None = None):
         if get_rollout_sequence_parallel_size(self.rollout_config) == 1:

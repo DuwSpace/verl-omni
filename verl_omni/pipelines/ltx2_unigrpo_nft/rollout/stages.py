@@ -28,6 +28,7 @@ from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorke
 
 from ..tree_rollout.requests import tree_width
 from ..tree_rollout.routing import RecaptionLeases
+from .seeds import assign_legacy_rollout_seeds
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -202,6 +203,8 @@ class LTXStagedAgentLoopManager(AgentLoopManagerTQ):
         count = config.val_kwargs.n if validate else config.n
         settings = config.val_kwargs.pipeline if validate else config.pipeline
         tree_width(settings, count)
+        if config.pipeline.rollout_mode == "flat" and settings.rollout_mode == "flat" and config.seed is not None:
+            assign_legacy_rollout_seeds(prompts, base_seed=config.seed, n=count, validate=validate)
         ray.get(self.coordinator.begin.remote(len(prompts) * count))
         super().generate_sequences(prompts)
         ray.get(self.coordinator.wait_prepared.remote())

@@ -177,14 +177,14 @@ reward:
   models:
     video_align:
       placement:
-        devices: [0]
+        devices: [0, 5, 7]
       model_path: ${oc.env:LTX_REWARD_ROOT}/VideoReward/checkpoint-11352/model.pth
       executor:
         kwargs:
           base_model_path: ${oc.env:LTX_REWARD_ROOT}/Qwen2-VL-2B-Instruct
     hpsv3:
       placement:
-        devices: [1]
+        devices: [1, 6]
       model_path: ${oc.env:LTX_REWARD_ROOT}/HPSv3/HPSv3.safetensors
       executor:
         kwargs:

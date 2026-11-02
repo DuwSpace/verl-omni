@@ -129,6 +129,8 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         rollout_base_seed: int | None = None,
     ) -> None:
         """Spawn ``rollout.n`` sessions per prompt and write trajectories to TQ."""
+        prompt = dict(prompt)
+        explicit_seeds = prompt.pop("_rollout_seeds", None)
         uid = prompt["uid"]
         partition_id = "val" if trajectory["validate"] else "train"
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
@@ -136,6 +138,13 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         try:
             config = self.rollout_config
             n = config.val_kwargs.n if trajectory["validate"] else config.n
+            if explicit_seeds is not None:
+                if (
+                    not isinstance(explicit_seeds, torch.Tensor)
+                    or explicit_seeds.shape != (n,)
+                    or explicit_seeds.dtype != torch.int64
+                ):
+                    raise ValueError("_rollout_seeds must be an int64 tensor with one seed per session")
             tree = sampling_params.get("rollout_mode") == "tree"
             if tree:
                 from verl_omni.pipelines.ltx2_unigrpo_nft.tree_rollout.requests import tree_sampling_params
@@ -161,6 +170,8 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                             base_seed=rollout_base_seed,
                         )
                     )
+                if explicit_seeds is not None:
+                    run_sampling_params["seed"] = int(explicit_seeds[session_id])
                 task = asyncio.create_task(
                     self._run_agent_loop(
                         run_sampling_params,

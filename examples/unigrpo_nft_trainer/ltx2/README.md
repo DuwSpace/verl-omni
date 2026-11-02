@@ -20,6 +20,10 @@ actor_rollout_ref:
 Stage one generates/encodes each recaption once. Sibling videos are routed to
 that replica, share the exact AR tokens, rollout logprobs and CPU condition
 embeddings, and use distinct AV seeds. Stage two produces all `N*k` leaf videos.
+New recaptions use the replica with the fewest in-flight recaption leases;
+flat requests use the fewest in-flight requests. This routing remains load-balanced
+when `rollout.full_determinism=true`; computation determinism and sample seeds
+are unchanged. Routing and batch composition may differ between runs.
 Each video's reward remains separate for AV training. Its AV baseline is the
 mean of the k videos generated from the same recaption. `algorithm.global_std`
 continues to select full-batch video std or within-recaption std.
@@ -36,6 +40,17 @@ independent `val_kwargs.n` and `val_kwargs.pipeline` settings (flat by default).
 In tree mode the total count must be divisible by `k`. To retain N=8 while
 increasing k from 1 to 2, increase `rollout.n` from 8 to 16; this doubles AV and
 reward work and the actor trajectory count, while retaining 8 AR generations.
+
+## Standard joint seeds
+
+Flat joint rollout uses the legacy seed schedule. For training step `s` (starting
+at 1), a generation batch with `M = prompts * rollout.n` videos assigns expanded
+row `i` the seed `rollout.seed + (2*s - 1)*M + i`. Validation uses
+`rollout.seed + global_prompt_index * val_kwargs.n + session_id` independently of
+the training step. These seeds are attached before worker splitting, so dispatch
+order cannot change them. They do not control dataset splits or DataLoader order.
+Resuming retains the schedule through the restored training step. Tree runs keep
+their existing seed assignment.
 
 ## Joint tree ablation
 
