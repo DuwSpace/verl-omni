@@ -16,6 +16,9 @@ data:
   train_batch_size: 32
   max_prompt_length: 1024
   dataloader_num_workers: 0
+  # Match legacy joint: null uses the fresh torch.Generator default seed.
+  seed: null
+  shuffle: true
   validation_shuffle: false
 
 algorithm:
@@ -60,6 +63,8 @@ actor_rollout_ref:
     ppo_micro_batch_size_per_gpu: 8
     ppo_epochs: 1
     shuffle: false
+    # Legacy OmniNFT timestep selection uses a separate generator seeded with 42.
+    data_loader_seed: 42
     optim:
       _target_: verl_omni.workers.config.diffusion.FSDPDiffusionOptimizerConfig
       lr: 3.0e-5
@@ -70,6 +75,7 @@ actor_rollout_ref:
       # BF16 model forward; retain the engine default FP32 gradient reduction.
       model_dtype: bfloat16
       full_determinism: true
+      seed: 42
       param_offload: false
       optimizer_offload: false
       offload_policy: true

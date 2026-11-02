@@ -41,16 +41,37 @@ In tree mode the total count must be divisible by `k`. To retain N=8 while
 increasing k from 1 to 2, increase `rollout.n` from 8 to 16; this doubles AV and
 reward work and the actor trajectory count, while retaining 8 AR generations.
 
-## Standard joint seeds
+## Joint random streams
 
-Flat joint rollout uses the legacy seed schedule. For training step `s` (starting
+Flat and tree joint rollout use the legacy Gemma joint seed schedule. For training step `s` (starting
 at 1), a generation batch with `M = prompts * rollout.n` videos assigns expanded
 row `i` the seed `rollout.seed + (2*s - 1)*M + i`. Validation uses
 `rollout.seed + global_prompt_index * val_kwargs.n + session_id` independently of
 the training step. These seeds are attached before worker splitting, so dispatch
 order cannot change them. They do not control dataset splits or DataLoader order.
-Resuming retains the schedule through the restored training step. Tree runs keep
-their existing seed assignment.
+Resuming retains the schedule through the restored training step. In tree mode,
+each recaption uses its first child's seed; all video leaves have distinct seeds.
+AR sampling uses a private generator per recaption, so dispatch and batch order
+do not change its random stream.
+
+Training forward noise matches the legacy implementation: video uses
+`(replay.seed + 0x564944) % 2**63`, audio uses
+`(replay.seed + 0x415544) % 2**63`. Both generate FP32 noise on the clean latent's
+device. Model initialization and training timestep selection each use seed 42.
+The initialization seed also applies when `full_determinism=false`.
+
+Data files define the train/validation split. The recipe retains `data.seed=null`
+and `shuffle=true`, matching the legacy fresh `torch.Generator()` default seed
+(67280421310721 in the current container). Epochs advance the sampler state;
+validation keeps dataset order. Changing `data.seed` to 42 changes that order.
+Resume also needs the saved DataLoader state, not only the restored step.
+
+Matching seeds does not guarantee bitwise-identical model outputs across different
+precision, batch shapes, kernels, or LoRA layouts. The old reward workers did not
+set an explicit RNG seed; the current deterministic reward workers retain seed 0.
+The five native scorers run in evaluation mode, with no explicit random sampling
+in their local scoring paths. Historical reward-worker RNG states cannot be
+reconstructed from the old config.
 
 ## Joint tree ablation
 

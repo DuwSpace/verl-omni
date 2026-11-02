@@ -203,7 +203,7 @@ class LTXStagedAgentLoopManager(AgentLoopManagerTQ):
         count = config.val_kwargs.n if validate else config.n
         settings = config.val_kwargs.pipeline if validate else config.pipeline
         tree_width(settings, count)
-        if config.pipeline.rollout_mode == "flat" and settings.rollout_mode == "flat" and config.seed is not None:
+        if config.seed is not None:
             assign_legacy_rollout_seeds(prompts, base_seed=config.seed, n=count, validate=validate)
         ray.get(self.coordinator.begin.remote(len(prompts) * count))
         super().generate_sequences(prompts)

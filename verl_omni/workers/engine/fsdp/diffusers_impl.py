@@ -28,6 +28,7 @@ from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.tensor import DTensor
+from transformers import set_seed
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -156,6 +157,8 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
         if self.engine_config.full_determinism:
             enable_full_determinism(seed=self.engine_config.seed)
+        else:
+            set_seed(self.engine_config.seed)
 
         # set FSDP offload params
         self._is_offload_param = self.engine_config.param_offload

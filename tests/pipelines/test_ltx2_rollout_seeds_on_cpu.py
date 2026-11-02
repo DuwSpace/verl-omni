@@ -64,12 +64,13 @@ def test_invalid_training_step_rejected(step):
 
 
 @pytest.mark.parametrize("validate", [False, True])
-def test_manager_to_workers_preserves_explicit_seeds_after_chunk_reordering(monkeypatch, validate):
+@pytest.mark.parametrize("mode", ["flat", "tree"])
+def test_manager_to_workers_preserves_explicit_seeds_after_chunk_reordering(monkeypatch, validate, mode):
     captured = []
     rollout = SimpleNamespace(
         seed=42,
         n=8,
-        pipeline=OmegaConf.create({"rollout_mode": "flat", "videos_per_recaption": 1}),
+        pipeline=OmegaConf.create({"rollout_mode": mode, "videos_per_recaption": 2 if mode == "tree" else 1}),
         algo={},
         calculate_log_probs=False,
         agent=SimpleNamespace(default_agent_loop="diffusion_single_turn_agent"),
@@ -108,6 +109,9 @@ def test_manager_to_workers_preserves_explicit_seeds_after_chunk_reordering(monk
 
     async def fake_run(self, sampling_params, *, session_id, uid, **kwargs):
         assert "_rollout_seeds" not in kwargs
+        if mode == "tree" and not validate:
+            assert sampling_params["recaption_group_id"] == f"{uid}:{session_id // 2}"
+            assert sampling_params["recaption_video_index"] == session_id % 2
         actual[(uid, session_id)] = sampling_params["seed"]
 
     async def fake_write(self, *args, **kwargs):
@@ -115,7 +119,7 @@ def test_manager_to_workers_preserves_explicit_seeds_after_chunk_reordering(monk
 
     monkeypatch.setattr(worker_module.tq, "async_kv_put", fake_put)
     monkeypatch.setattr(worker_module, "get_trajectory_info", fake_trajectory)
-    monkeypatch.setattr(worker_module, "_config_to_sampling_dict", lambda config: {})
+    monkeypatch.setattr(worker_module, "_config_to_sampling_dict", lambda config: dict(config))
     worker._run_agent_loop = MethodType(fake_run, worker)
     worker._write_trajectories_to_tq = MethodType(fake_write, worker)
 
@@ -128,23 +132,3 @@ def test_manager_to_workers_preserves_explicit_seeds_after_chunk_reordering(monk
     n = 2 if validate else 8
     start = 42 if validate else 810
     assert actual == {(f"prompt-{i}", j): start + i * n + j for i in range(32) for j in range(n)}
-
-
-def test_tree_manager_does_not_override_existing_seed_assignment(monkeypatch):
-    manager = object.__new__(stages.LTXStagedAgentLoopManager)
-    config = SimpleNamespace(
-        seed=42,
-        n=8,
-        pipeline=OmegaConf.create({"rollout_mode": "tree", "videos_per_recaption": 2}),
-        val_kwargs=SimpleNamespace(n=1, pipeline=OmegaConf.create({"rollout_mode": "flat", "videos_per_recaption": 1})),
-    )
-    manager.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=config))
-    manager.coordinator = SimpleNamespace(
-        begin=SimpleNamespace(remote=lambda count: None), wait_prepared=SimpleNamespace(remote=lambda: None)
-    )
-    monkeypatch.setattr(stages.ray, "get", lambda value: value)
-    captured = []
-    monkeypatch.setattr(stages.AgentLoopManagerTQ, "generate_sequences", lambda self, prompts: captured.append(prompts))
-    for validate in (False, True):
-        manager.generate_sequences(batch(1, [0, 1], validate))
-    assert all("_rollout_seeds" not in prompts for prompts in captured)

@@ -71,13 +71,23 @@ class LTXJointLoss(OmniNFTLoss):
             )
             text_advantages = components.mean(dim=-1)
         batch.batch["text_advantages"] = text_advantages
+        cls._prepare_forward_noise(batch, records)
+        return batch
+
+    @staticmethod
+    def _prepare_forward_noise(batch, records):
+        """Match legacy joint noise on the latent device, independent of row order."""
+        steps = batch.batch["train_timesteps"].shape[1]
         for modality, salt in (("video", 0x564944), ("audio", 0x415544)):
             clean = batch.batch[f"{modality}_latents_clean"]
-            steps = batch.batch["train_timesteps"].shape[1]
             batch.batch[f"{modality}_forward_noise"] = torch.stack(
                 [
-                    torch.randn((steps, *clean.shape[1:]), generator=torch.Generator().manual_seed(record.seed ^ salt))
+                    torch.randn(
+                        (steps, *clean.shape[1:]),
+                        generator=torch.Generator(device=clean.device).manual_seed((int(record.seed) + salt) % (2**63)),
+                        device=clean.device,
+                        dtype=torch.float32,
+                    )
                     for record in records
                 ]
-            ).to(clean.device)
-        return batch
+            )
