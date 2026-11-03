@@ -57,6 +57,14 @@ class PolicyGradientDiffusionTrainerV1Sync(PolicyGradientDiffusionTrainerV1):
         # update weights after loading checkpoint
         self.checkpoint_manager.update_weights(self.global_steps)
 
+    def prepare_step(self):
+        # prepare_step submits generation before on_sample_begin is called.
+        self.reward_loop_manager.prepare_for_rollout()
+        return super().prepare_step()
+
+    def on_validate_begin(self):
+        self.reward_loop_manager.prepare_for_rollout()
+
     def on_step_end(self):
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights from the freshly-trained actor

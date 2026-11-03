@@ -207,7 +207,9 @@ class LTXJointPipeline(LTX23OmniNFTPipeline):
                         negatives[maximum] = tuple(
                             value.cpu()
                             for value in self._get_gemma_prompt_embeds(
-                                prompt="", max_sequence_length=maximum, dtype=next(self.connectors.parameters()).dtype
+                                prompt=self.pipeline_recipe.negative_prompt,
+                                max_sequence_length=maximum,
+                                dtype=next(self.connectors.parameters()).dtype,
                             )
                         )
                 negative = negatives[maximum]

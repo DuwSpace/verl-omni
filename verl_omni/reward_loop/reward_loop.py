@@ -333,6 +333,24 @@ class OmniRewardLoopManager(RewardLoopManager):
             return asyncio.run(self.async_compute_rm_score(data))
         raise RuntimeError("compute_rm_score() cannot run inside an event loop; await async_compute_rm_score() instead")
 
+    def prepare_for_rollout(self):
+        """Wait for offloaded native scorers to release device storage before rollout."""
+        from .reward_model import NativeManagedRewardModel
+
+        async def release():
+            async with self._score_lock:
+                models = [
+                    model
+                    for model in self.multi_reward_model_manager.models.values()
+                    if isinstance(model, NativeManagedRewardModel) and model.offload
+                ]
+                results = await asyncio.gather(*(model.sleep() for model in models), return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+
+        asyncio.run(release())
+
     async def _drain_lifecycle(self, operation):
         """Keep accepted lifecycle work owned until completion, even on cancellation."""
         pending = asyncio.ensure_future(operation)
